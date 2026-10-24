@@ -1,0 +1,57 @@
+# Rust
+host/target/
+
+# ESP-IDF
+firmware/c5/build/
+firmware/c5/managed_components/
+firmware/c5/sdkconfig
+firmware/c5/sdkconfig.old
+firmware/c5/dependencies.lock
+
+# FX2 (the prebuilt image in firmware/fx2/prebuilt/ is kept)
+firmware/fx2/build/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+lab/.venv/
+lab/out/
+
+# Recordings and decoded output. Anything decoded from a real capture
+# (frames, FM strips, reconstructions, video) shows the owner's camera
+# view and must never reach a remote: it stays local.
+recordings/
+*.rx[0-9].bin
+*.rx[0-9][0-9].bin
+*.truth.f32
+*.openvrx.json
+*.events.jsonl
+openvrx-out/
+lab/results/**/*.png
+lab/results/**/*.jpg
+lab/results/**/*.jpeg
+lab/results/**/*.bmp
+lab/results/**/*.gif
+lab/results/**/*.webp
+lab/results/**/*.npy
+lab/results/**/*.npz
+lab/results/R0_*
+*-frame[0-9]*.png
+*-fmstrip.png
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.y4m
+# Golden vectors are small and versioned on purpose.
+!lab/golden/**
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+lab/results/cache/
+lab/results/*.log
