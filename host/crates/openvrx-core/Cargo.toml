@@ -1,0 +1,15 @@
+[package]
+name = "openvrx-core"
+description = "OpenVRX shared types: video standards, lane formats, line and field records, pipeline contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+num-complex = { version = "0.4", features = ["serde", "bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

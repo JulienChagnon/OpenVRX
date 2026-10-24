@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openvrx-core",
+    "crates/openvrx-format",
+    "crates/openvrx-sim",
+    "crates/openvrx-dsp",
+    "crates/openvrx-video",
+    "crates/openvrx-restore",
+    "crates/openvrx-hw",
+    "apps/openvrx",
+    "apps/openvrx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/JulienChagnon/OpenVRX"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+panic = "abort"
+
+# Tests exercise DSP over millions of samples; unoptimized builds are too slow.
+[profile.test]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
