@@ -267,3 +267,184 @@ impl LaneFormat {
         Ok(())
     }
 
+    /// True when samples carry amplitude (I/Q); false for angle-only.
+    pub fn has_magnitude(&self) -> bool {
+        matches!(self.encoding, LaneEncoding::Iq { .. })
+    }
+
+    /// Amplitude assigned to angle-only samples (10-bit ADC units).
+    pub const ANGLE_MAGNITUDE: f32 = 64.0;
+
+    /// Decodes one word to a complex sample in 10-bit ADC units.
+    #[inline]
+    pub fn decode(&self, word: u32) -> Complex32 {
+        match &self.encoding {
+            LaneEncoding::Iq { i, q } => Complex32::new(i.decode(word), q.decode(word)),
+            LaneEncoding::Angle { word_msb, bits } => {
+                let n = *bits as u32;
+                let lsb = *word_msb as u32 + 1 - n;
+                let raw = (word >> lsb) & ((1 << n) - 1);
+                let a = (raw as f32 + 0.5) * std::f32::consts::TAU / (1u32 << n) as f32;
+                Complex32::from_polar(Self::ANGLE_MAGNITUDE, a)
+            }
+        }
+    }
+
+    /// Encodes 10-bit ADC values (or, for angle formats, the angle of the
+    /// pair) into a word. Used by the simulator.
+    #[inline]
+    pub fn encode(&self, i_adc10: i32, q_adc10: i32) -> u32 {
+        match &self.encoding {
+            LaneEncoding::Iq { i, q } => i.encode(i_adc10) | q.encode(q_adc10),
+            LaneEncoding::Angle { word_msb, bits } => {
+                let n = *bits as u32;
+                let lsb = *word_msb as u32 + 1 - n;
+                let a = (q_adc10 as f32).atan2(i_adc10 as f32).rem_euclid(std::f32::consts::TAU);
+                let code = ((a / std::f32::consts::TAU) * (1u32 << n) as f32) as u32 & ((1 << n) - 1);
+                code << lsb
+            }
+        }
+    }
+
+    /// Full decode table indexed by word value (256 or 65536 entries).
+    pub fn build_lut(&self) -> Vec<Complex32> {
+        let n = 1usize << (8 * self.word_bytes as usize);
+        (0..n as u32).map(|w| self.decode(w)).collect()
+    }
+
+    /// Word bits that carry data (others are tied low on the board).
+    pub fn used_word_mask(&self) -> u32 {
+        match &self.encoding {
+            LaneEncoding::Iq { i, q } => i.word_mask() | q.word_mask(),
+            LaneEncoding::Angle { word_msb, bits } => {
+                ((1u32 << *bits) - 1) << (*word_msb as u32 + 1 - *bits as u32)
+            }
+        }
+    }
+
+    /// Largest decodable magnitude per component, 10-bit ADC units.
+    pub fn component_full_scale(&self) -> f32 {
+        match &self.encoding {
+            LaneEncoding::Iq { i, .. } => {
+                (1u32 << (i.adc_lsb() as u32 + i.width() - 1)) as f32
+            }
+            LaneEncoding::Angle { .. } => Self::ANGLE_MAGNITUDE,
+        }
+    }
+}
+
+/// Lane format plus sample clock.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SampleFormat {
+    /// Preset name if the lanes match one (informational).
+    pub preset: Option<LanePreset>,
+    pub lanes: LaneFormat,
+    /// PARLIO TX divider of the 240 MHz PLL that makes the sample clock.
+    pub divider: u32,
+}
+
+impl SampleFormat {
+    pub fn from_preset(preset: LanePreset, divider: u32) -> Self {
+        SampleFormat {
+            preset: Some(preset),
+            lanes: preset.format(),
+            divider,
+        }
+    }
+
+    /// Sample (word) rate in Hz.
+    #[inline]
+    pub fn sample_rate_hz(&self) -> f64 {
+        C5_PLL_HZ / self.divider as f64
+    }
+
+    /// Bytes per second on USB.
+    #[inline]
+    pub fn byte_rate(&self) -> f64 {
+        self.sample_rate_hz() * self.lanes.word_bytes as f64
+    }
+
+    /// True when the clock keeps a whole number of bus samples per tick, so
+    /// it never drifts against MODEM_DIAG.
+    pub fn bus_locked(&self) -> bool {
+        self.divider.is_multiple_of(3)
+    }
+
+    /// Bus samples per sample clock period.
+    pub fn bus_decimation(&self) -> f64 {
+        C5_BUS_HZ / self.sample_rate_hz()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_validate() {
+        for p in LanePreset::ALL {
+            p.format().validate().unwrap();
+            let s: LanePreset = p.name().parse().unwrap();
+            assert_eq!(s, p);
+        }
+        assert_eq!(LanePreset::I7Q7.data_pins(), 14);
+        assert_eq!(LanePreset::I8Q8.data_pins(), 16);
+        assert_eq!(LanePreset::I4Q4Ultra.data_pins(), 8);
+    }
+
+    #[test]
+    fn roundtrip_contiguous() {
+        let f = LanePreset::I8Q8.format();
+        for (i, q) in [(0, 0), (-512, 511), (100, -37), (-3, 2), (255, -256)] {
+            let z = f.decode(f.encode(i, q));
+            assert!((z.re - i as f32).abs() <= 2.0, "{i} -> {}", z.re);
+            assert!((z.im - q as f32).abs() <= 2.0, "{q} -> {}", z.im);
+        }
+        // 7x7: the GND-tied low lanes read as the 2v+1 centring.
+        let f = LanePreset::I7Q7.format();
+        let w = f.encode(8, -8);
+        assert_eq!(w & 0x0101, 0);
+        assert_eq!(f.decode(w), Complex32::new(12.0, -4.0));
+    }
+
+    #[test]
+    fn ultrafine_folds() {
+        let f = LanePreset::I4Q4Ultra.format();
+        // Inside the +-128 window: 16-unit steps.
+        assert_eq!(f.decode(f.encode(40, -40)), Complex32::new(40.0, -40.0));
+        // Bits 8 and 7 are not carried: 168 folds by 128 onto 40.
+        let z = f.decode(f.encode(168, 0));
+        assert_eq!(z.re, 40.0);
+        assert_eq!(f.component_full_scale(), 128.0);
+    }
+
+    #[test]
+    fn lut_matches_decode() {
+        let f = LanePreset::I4Q4Top.format();
+        let lut = f.build_lut();
+        assert_eq!(lut.len(), 256);
+        for w in 0..256u32 {
+            assert_eq!(lut[w as usize], f.decode(w));
+        }
+        // I on the high nibble, Q on the low nibble.
+        let w = f.encode(-512, 0);
+        assert_eq!(w & 0xf0, 0x80);
+    }
+
+    #[test]
+    fn angle_roundtrip() {
+        let f = LanePreset::Angle8.format();
+        let w = f.encode(0, 100);
+        let z = f.decode(w);
+        assert!((z.arg() - std::f32::consts::FRAC_PI_2).abs() < 0.03);
+    }
+
+    #[test]
+    fn rates() {
+        let s = SampleFormat::from_preset(LanePreset::I8Q8, 18);
+        assert!((s.sample_rate_hz() - 13.333_333e6).abs() < 1.0);
+        assert!((s.byte_rate() - 26.666_666e6).abs() < 2.0);
+        assert!(s.bus_locked());
+        assert!((s.bus_decimation() - 6.0).abs() < 1e-9);
+    }
+}
