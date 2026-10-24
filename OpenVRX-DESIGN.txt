@@ -1,0 +1,1090 @@
+OpenVRX: PC-decoded analog 5.8 GHz FPV receiver
+==============================================
+
+Design and implementation context. Written 2026-10-19.
+Owner: Julien (JulienChagnon). Status: idea and plan, nothing built yet.
+
+This file is the context for implementing OpenVRX. It explains what the
+system is, how every layer works, the order to build it in, and what is
+still unknown. Read sections 1-3 first; the rest is reference.
+
+Evidence labels used in this file (same spirit as C5VRX's AGENTS.md: an
+idea is an idea, a simulation is a simulation, a board test is a board
+test):
+
+  [datasheet]   from a manufacturer datasheet or SDK header
+  [zw-board]    measured on hardware by zerowidth in their C5 + P4 build
+  [c5vrx]       from the C5VRX repo (code or docs)
+  [sim]         simulation result
+  [estimate]    reasoned estimate, not measured
+  [idea]        proposal, nothing tested
+  [unverified]  believed true, not confirmed
+
+
+-----------------------------------------------------------------------
+0. CREDITS AND LICENSE (read before reusing anything)
+-----------------------------------------------------------------------
+
+OpenVRX builds directly on two projects:
+
+- C5VRX by Twotoz and the C5VRX contributors.
+  Source: https://github.com/Twotoz/C5VRX
+  Website: https://twotoz.github.io/C5VRX/ (the website carries the
+  project's Discord invite; reference it in the credits).
+  Reused ideas and code: reading the ESP32-C5 radio's I/Q through the
+  MODEM_DIAG debug bus and the GPIO matrix, the receive-chain simulator
+  research/sim.py, the envelope C/N estimate (main/cn_estimate.h), tuning
+  and gain knowledge, the IQ snapshot tool tools/capture_iq_snapshot.py.
+  C5VRX is GPL-3.0. Anything copied or adapted from it must stay
+  GPL-3.0, keep its notices, and say what was changed.
+
+- zerowidth's P4USB receiver (zerowidth/C5VRX, PR #3, "p4usb" and the
+  C5 side "c5rx"). This is the closest existing design: a C5 exports
+  raw I/Q lanes plus a sample clock to a second chip that demodulates.
+  OpenVRX swaps their ESP32-P4 for an FX2LP USB bridge and a PC. Reused
+  knowledge: the 14-lane pin plan, the PARLIO TX sample clock, the
+  sampling-phase "lottery" and its clock-slip fix, the 802.11p setting,
+  the I offset behaviour, the wrap repair, the gain targets.
+  It is a fork of C5VRX, so also GPL-3.0.
+
+Decision: license the whole OpenVRX repo GPL-3.0, with a CREDITS.md that
+names both projects with links, the files adapted, and the source
+commits. Do this in the first commit, not later. (AGENTS.md in C5VRX
+makes missing credit a hard stop for agents.)
+
+OpenVRX is a separate project, not a branch of C5VRX: C5VRX makes the C5 a
+complete receiver with analog output; OpenVRX makes the C5 a radio front
+end and moves all decoding to a PC. The one piece that could go upstream
+is a small "raw I/Q tap" firmware mode for the C5; propose it in a
+C5VRX discussion first and coordinate with zerowidth, who already has
+one (see section 11).
+
+
+
+MORE IDEAS: Getting the best resolution through a 20 MB/s pipe
+Roughly in order of how much they help:
+
+1. Send the angle, not I and Q. This is the biggest win. FM only needs the angle, so have the C5 convert each sample to an angle with a lookup table and send that as one byte. You get 256 angle steps (about 1.4° each), instead of the coarse grid that I4/Q4 gives you. It’s still PC-side demod: the C5 only converts coordinates, and all the real processing (differentiating, filtering, sync, deinterlacing) happens on the PC. The project’s existing lookup table already does nearly this; it would just need to output 8 bits instead of 6. The catch is that you lose signal strength, which diversity needs, though you can estimate quality another way (below).
+
+2. Average instead of skipping. Instead of throwing away 3 of every 4 samples, add the 4 together. This acts as a crude anti-alias filter, so less noise folds into the picture, and averaging 4 samples gains about 1 bit of real precision. It depends on whether the BitScrambler or the CPU can keep up with the additions, and that has to be measured.
+
+3. Use the bits you keep. When you cut 10 bits down to 4 or 5, choose which ones to keep based on the actual signal level. If the signal only uses the bottom half of the range, keeping the top bits wastes them. A simple automatic gain step, where the C5 adjusts a shift amount every so often, makes sure the signal fills the range you transmit.
+
+4. A 16-bit bus at about 40 MB/s (I8/Q8, or a 16-bit angle) as a stretch goal. It’s at the FX2’s ceiling, so treat it as an experiment, not the plan.
+
+Fancier PC-side processing
+All of this becomes possible once the raw signal is on a PC.
+
+Basic chain:
+
+a channel filter before the discriminator, which cleans noise outside the band and pushes back the point where the picture breaks up,
+a polar discriminator to get the video signal,
+de-emphasis, if the VTX applies pre-emphasis,
+a video lowpass at about 5 MHz.
+Time-base correction. This means locking onto every horizontal sync pulse and resampling each line to exactly the right length. It removes wobble and jitter, and it gives the biggest visible quality jump after a clean demod.
+
+Spark/click removal. When the signal is weak, FM produces white and black “sparkles” from impossible phase jumps. You can detect them and patch them from neighboring pixels or the same spot on the previous line.
+
+Deinterlacing. PAL and NTSC send odd and even lines as separate half-frames. Your options:
+
+bob: line-double each field; lowest latency,
+weave: merge the two fields; sharp, but motion causes combing,
+motion-adaptive (yadif-style): the best quality, at the cost of a frame or so of latency.
+Color. The C5 path is monochrome only, but on the PC you can decode PAL/NTSC color. Expect 4-bit quantization noise to hurt color more than brightness, which is another reason to use the angle encoding.
+
+Temporal denoise. Averaging across frames gives a cleaner image but adds lag, so make it optional for recording rather than flying.
+
+Look at ld-decode / vhs-decode before writing all this from scratch. They decode FM-modulated composite video (from LaserDisc and VHS tapes) in software and already implement time-base correction, dropout fixing and color decoding. The problem is very similar to yours.
+
+Line-by-line diversity
+This is a strong idea, and a PC is the right place for it.
+
+Hardware. Use two C5s, each with its own antenna (ideally different polarization or orientation), both tuned to the same channel. Two 20 MB/s streams total 40 MB/s, which is too tight for one FX2. Use two FX2 boards, ideally on separate USB controllers, or drop each stream to 4 bits per sample so both fit in one byte.
+
+Alignment. The two receivers have slightly different clocks. Demodulate both, find the sync pulses, and resample both streams onto a shared line timeline. After time-base correction, line N from receiver A matches line N from B.
+
+Scoring each line:
+
+noise in the blanking interval and back porch, which should be flat, so any wiggle there is noise,
+the sync pulse’s depth and sharpness,
+the count of sparkle clicks,
+the arrow’s length (signal strength), if you send I/Q rather than angle only.
+Combining:
+
+Select: take the better line from each pair. Simple and effective.
+Weighted blend: mix the two lines in proportion to their quality scores. This is smoother and usually better when both lines are mediocre.
+Segment-level: score short pieces within a line, to handle a dropout that hits only part of a line.
+
+-----------------------------------------------------------------------
+1. WHAT OpenVRX IS
+-----------------------------------------------------------------------
+
+One sentence: one or more ESP32-C5 boards each stream raw radio samples
+(I/Q) through a ~C$4 FX2LP USB board into a laptop, which demodulates
+the FM, decodes the analog video, combines the receivers (diversity),
+cleans the picture and shows it on the laptop screen or the Fat Shark
+HD3 goggles over HDMI.
+
+    antenna -> C5 (tuner, I/Q out) -> FX2LP (USB 2.0 bridge) -> laptop
+    antenna -> C5                  -> FX2LP                  -> laptop
+                                                    laptop -> screen / HDMI -> HD3
+
+Why do it:
+- The C5's own demodulator (U85Q) has to fit inside the BitScrambler
+  with 4-bit I/Q. A PC can run an exact or much heavier demodulator on
+  7-8 bit I/Q. [c5vrx] [zw-board]
+- Real combining diversity (line by line, later sample by sample or
+  before demodulation), not just switching. Commercial modules
+  (ImmersionRC RapidFire, TBS Fusion in FUSION mode) do combine, but
+  their methods are not published.
+- Signal-quality numbers per antenna, fast enough to steer a pan/tilt
+  tracker with patch antennas, no GPS needed.
+- Digital cleanup a goggle module cannot do: comb-filter colour decode,
+  motion-adaptive deinterlacing, dropout repair, later ML repair.
+- Raw recordings that can be decoded again later with better code.
+
+What it is not:
+- Not lower latency than analog goggles (<1 ms). Target is 10-30 ms
+  added, glass to glass. [estimate]
+- Not proven to beat a RapidFire or TBS Fusion on range. The C5 is a
+  Wi-Fi chip read through a debug bus; its noise figure for this use is
+  unmeasured. The bench test in section 9 answers this early.
+
+Target hardware owned or planned:
+- Laptop: Dell XPS 15 9530, i7-13700H (14 cores / 20 threads), 16 GB
+  RAM, Intel Arc A370M discrete GPU (plus Iris Xe), Windows 11 Home.
+  USB: Intel USB 3.1 xHCI, Intel USB 3.2 xHCI, USB4 host router.
+  The 9530 has three USB-C ports (two Thunderbolt left, one USB-C
+  right); one Thunderbolt port is suspected broken. Windows reported
+  all USB/Thunderbolt controllers OK on 2026-10-19, so test the port
+  physically (section 10).
+- Goggles: Fat Shark Dominator HD3. Native 800x600 LCD, mini-HDMI input
+  that accepts up to 720p, shown at 800x480 16:9 in HDMI mode.
+  [retailer listings, HD3 manual]
+- Receivers: Seeed XIAO ESP32-C5 (arriving). Recommended additions:
+  Waveshare ESP32-C5-Zero boards (section 4).
+
+
+-----------------------------------------------------------------------
+2. HOW THE C5 PRODUCES RAW I/Q (the physics, briefly)
+-----------------------------------------------------------------------
+
+The quad's analog VTX frequency-modulates a 5.8 GHz carrier with the
+composite video (CVBS) voltage. The C5's Wi-Fi radio mixes the antenna
+signal down to baseband and digitises it as two numbers per sample:
+I (in-phase) and Q (quadrature). The angle of the point (I, Q) turns at
+a rate equal to the frequency offset, and that frequency is the video
+voltage. FM demodulation = measure how fast the angle turns.
+
+Inside the C5, the modem's diagnostic bus MODEM_DIAG carries those
+samples [zw-board]:
+- Q on bus bits 0-9, I on bits 10-19, 10-bit two's complement.
+- The bus takes a new value about every 12.5 ns (80 MS/s), timed by the
+  modem's own 80 MHz clock. With the 802.11p setting on, it may change
+  at 40 MS/s instead (fits the observations, not checked directly).
+- The top 8 bits of each are live (bits 9-2 and 19-12). zerowidth uses
+  the top 7 of each on 14 pads.
+- The GPIO matrix can route any bus bit straight to a pad. No CPU, no
+  register in between: the pads show the bus as it changes.
+- I carries a DC offset that grows with gain (about 20 of +/-127 at
+  gain 64, about 32 at 68, 84-90 on an empty channel at gain 77). Q's
+  is near 0. The PC must estimate and remove it.
+
+The sample clock:
+- The C5's PARLIO TX peripheral, running in loop mode, outputs a clock
+  divided from the 240 MHz PLL (PARLIO_CLK_SRC_PLL_F240M, the default
+  clock source on the C5 [datasheet: ESP-IDF v6.0.2 clk_tree_defs.h]).
+- The modem's 80 MHz bus clock comes from the same PLL, so the sample
+  clock is frequency-locked to the bus: each tick keeps exactly one of
+  every N bus samples with no drift. [zw-board]
+- Usable dividers keep N whole: 240 MHz / (3*N):
+    /6  = 40.00 MHz  (N=2)
+    /9  = 26.67 MHz  (N=3)
+    /12 = 20.00 MHz  (N=4)
+    /18 = 13.33 MHz  (N=6)   <- zerowidth's choice
+- Nothing re-times the data to the clock, so the clock edge can land
+  while the lanes are changing. That is the sampling-phase lottery
+  (section 5.4).
+
+PARLIO TX facts on the C5 [datasheet: ESP-IDF v6.0.2]:
+- Up to 8 data lines, clock output pin, optional "valid" signal (which
+  always occupies the MSB data line), loop transmission supported,
+  TX clock gating supported.
+
+
+-----------------------------------------------------------------------
+3. THE FX2LP (CY7C68013A) AND THE BOARD TO BUY
+-----------------------------------------------------------------------
+
+3.1 What the chip is
+
+Cypress (now Infineon) EZ-USB FX2LP, CY7C68013A. Still in production.
+Inside [datasheet]:
+- USB 2.0 High-Speed transceiver and protocol engine (480 Mbit/s).
+- An enhanced 8051 CPU at up to 48 MHz with 16 KB RAM. It only
+  configures the chip and answers USB setup requests; it is not in the
+  data path.
+- 4 KB of endpoint FIFO memory (EP2/4/6/8), 512-byte packets,
+  double/triple/quad buffered.
+- A slave FIFO port: external logic presents 8 or 16 data bits and the
+  chip latches them on its interface clock (IFCLK) straight into the
+  FIFO. Full buffers become USB packets automatically (AUTOIN).
+- 3.3 V I/O with 5 V tolerant inputs. Supply current no more than 85 mA
+  in any mode (50 typ / 85 max with 8051 running on High-Speed USB).
+- No flash. Firmware lives in RAM. On plug-in the chip enumerates as a
+  bare Cypress device (VID:PID 04b4:8613 is the usual default
+  [unverified, user reports]); the PC uploads firmware with vendor
+  request 0xA0, releases the 8051 reset, and the chip disconnects and
+  reconnects as the new device ("ReNumeration"). A small I2C EEPROM on
+  the board can hold just an ID (small 24C02) or the whole firmware
+  (24C128 or larger).
+
+Same trick as C5VRX: the data moves through hardware (pins -> FIFO ->
+USB) with no CPU touching each sample, like PARLIO + DMA + BitScrambler
+in the C5.
+
+3.2 Slave FIFO synchronous write timing, external IFCLK
+[datasheet: CY7C68013A Rev AD, Table 24]
+
+  IFCLK period         20.83 ns min, 200 ns max  (48 MHz down to 5 MHz)
+  tSFD data setup      3.2 ns min before the IFCLK edge
+  tFDH data hold       4.5 ns min after the IFCLK edge
+  tSWR SLWR setup      12.1 ns min
+  tWRH SLWR hold       3.6 ns min
+  IFCLK rise/fall      900 ps max (as an output; keep the input clean)
+
+The data must be steady for 3.2 + 4.5 = 7.7 ns around each edge. The
+C5's bus holds each value about 12.5 ns at 80 MS/s, so the margin is
+about 4.8 ns minus lane-to-lane skew and clock jitter. That is tight
+but workable with phase calibration (section 5.4). With the 802.11p
+setting (possibly 25 ns per value) it is comfortable. Data is latched
+on every IFCLK edge while SLWR stays asserted, which is what continuous
+streaming uses (Cypress KB: holding SLWR asserted gives one word per
+IFCLK).
+
+Pin mapping, 56-pin package [datasheet]:
+  FD[7:0]   = PB0-PB7  (8-bit mode uses only these)
+  FD[15:8]  = PD0-PD7  (16-bit mode, WORDWIDE=1)
+  IFCLK     = IFCLK pin (input when IFCLKSRC=0)
+  SLWR      = RDY1      SLRD = RDY0
+  FLAGA     = CTL0      FLAGB = CTL1
+  SLOE      = PA2       PKTEND = PA6
+  FIFOADR0  = PA4       FIFOADR1 = PA5   (00 = EP2, 10 = EP6)
+  SLCS#     = PA7 (optional, leave disabled)
+Polarities of SLWR, SLRD, SLOE, PKTEND and the flags are programmable in
+FIFOPINPOLAR. IFCLK can be inverted with IFCONFIG.IFCLKPOL.
+
+3.3 USB throughput reality
+- Theoretical bulk maximum on USB 2.0 High-Speed: 13 x 512 bytes per
+  125 us microframe = about 53 MB/s.
+- Reported sustained for one FX2LP: roughly 27-40 MB/s depending on host
+  controller, transfer size and number of queued transfers. Two FX2s
+  together about 41 MB/s on one link in one report. [Infineon forum]
+- OpenVRX must measure this on the XPS before committing to a sample mode
+  (Phase 1 step 1).
+
+3.4 Is the board you found the right buy? Yes.
+
+"EZ-USB FX2LP CY7C68013A USB Core Board Development Board USB Logic
+Analyzer With I2C Serial SPI Interface Module Mini USB", C$3.87.
+This is the common blue CY7C68013A-56 breakout ("core board"). It
+normally has: the 56-pin chip, 24 MHz crystal, 3.3 V regulator, a small
+I2C EEPROM with an address/enable jumper, a reset button, mini-USB, and
+two long header rows with all port pins (PA, PB, PD, CTL, RDY, IFCLK,
+CLKOUT). "Logic analyzer" means it works with sigrok; "I2C Serial SPI"
+is listing filler.
+
+Buy:
+- 4 boards (2 for diversity, 1 for a third receiver or watch-mode
+  tests, 1 spare). Plain "CY7C68013A" option. Skip any "+ Source Code"
+  option: all needed software is free (libfx2, fx2lafw, Cypress
+  examples).
+- On arrival check: headers labelled IFCLK, PB0-7, PD0-7, RDY0/RDY1,
+  PA4/PA5; the EEPROM jumper; the chip marking CY7C68013A-56PVXC (SSOP)
+  or -56LTXC (QFN).
+- Mini-USB cables: mini-USB to USB-C (direct to laptop) or mini-USB to
+  USB-A (into a hub), short (0.3-0.5 m).
+- Optional: one 24LC128 or 24LC256 EEPROM (about $1) per board if you
+  later want the firmware to boot without the PC uploading it.
+
+Alternatives considered and rejected for now:
+- Raspberry Pi Pico / RP2350: USB full-speed only (12 Mbit/s), too slow.
+- FT232H: High-Speed, but in its fast FIFO mode the FTDI chip generates
+  the clock; the C5's bus cannot follow it.
+- ESP32-P4 (zerowidth hardware): works, but 2 inputs max and much more
+  firmware; good if a self-contained stick is wanted later.
+- Cypress FX3 (USB 3, 32-bit GPIF II): the upgrade path for 4+
+  receivers on one cable, but only with a shared clock (section 12).
+- HackRF One (~$100-150 clone, ~$350 genuine): 8-bit I/Q at 20 MS/s,
+  1 MHz-6 GHz, no hacking. Too expensive per receiver; useful as a
+  "gold standard" reference receiver later.
+- FPGA (Tang Nano 20K etc.): the right tool for many unsynchronised
+  receivers into one link; larger project.
+
+
+-----------------------------------------------------------------------
+4. RECEIVER BOARDS AND WIRING
+-----------------------------------------------------------------------
+
+4.1 Which C5 board
+
+Seeed XIAO ESP32-C5 [Seeed wiki]:
+- Header pins: D0=GPIO1, D1=GPIO0, D2=GPIO25, D3=GPIO7, D4=GPIO23,
+  D5=GPIO24, D6=GPIO11, D7=GPIO12, D8=GPIO8, D9=GPIO9, D10=GPIO10.
+- Back JTAG pads: MTMS=GPIO2, MTDI=GPIO3, MTCK=GPIO4, MTDO=GPIO5.
+- Internal: GPIO6 battery ADC, GPIO26 battery-divider enable, GPIO27
+  user LED, GPIO28 BOOT. USB (GPIO13/14) is not on pads.
+- U.FL antenna connector (antenna included). 21 x 17.8 mm.
+- Usable GPIOs: 11 header + 4 back pads = 15.
+  -> fits 7 I + 7 Q + clock = 15 exactly, with the USB console kept.
+  -> or 4 I + 4 Q + clock = 9 (8-bit mode), front pins only.
+- Note: the back pads are needed for 7+7. Do not solder the XIAO flat to
+  perfboard if it will be used for OpenVRX; use headers or wire the pads
+  first.
+
+Waveshare ESP32-C5-Zero (recommended second receiver type) [zw-board
+plan, Waveshare schematic]:
+- Edge pins 0-14, back pads 23, 24, 25, 28. GPIO13/14 are its USB.
+  GPIO26 is internal antenna select (onboard antenna vs U.FL).
+- Keeping USB for control: 0-12 (13 pins) + 23, 24, 25, 28 = 17 pins.
+  -> fits 8 I + 8 Q + clock = 17: the full 8 live bits, 16-bit FX2 mode.
+- Strapping pins 2, 7, 25 (and 28 with a 10k pull-up): safe as data
+  outputs because the FX2 inputs are high-impedance while the C5 reads
+  its straps at reset. [zw-board]
+- GPIO0/1 are 32 kHz crystal pins with no crystal fitted: plain GPIOs.
+- About $7-10 each [estimate]. 18 x 28 mm.
+
+Recommendation: for the first diversity pair use two identical boards.
+Either 2x C5-Zero (8+8, simplest pads) or the XIAO plus one more XIAO
+(7+7). Mixed boards work but complicate comparisons.
+
+4.2 Sample formats (lanes on the FX2 port)
+
+Mode A (default for development): 16-bit, 8 I + 8 Q (C5-Zero) or
+7 I + 7 Q (XIAO), clock 13.33 MHz.
+  PB0-PB7 = Q bits (LSB..MSB), PD0-PD7 = I bits (LSB..MSB).
+  With 7+7 the unused PB0/PD0 are tied to GND; the PC reads each lane
+  as 2v+1 (append a constant 1 bit, centring the rounding, as zerowidth
+  does by tying a PARLIO line to 1). [zw-board]
+  Data rate 26.67 MB/s. One receiver per USB link.
+Mode B: 8-bit, 4 I + 4 Q, 13.33 MHz. PB0-3 = Q, PB4-7 = I (same layout
+  as C5VRX's PARLIO RX). 13.33 MB/s. Two receivers per USB link.
+Mode C: 8-bit, 4 I + 4 Q, 20 MHz. 20 MB/s. One per link (+ watchers).
+Mode D: 8-bit, 4 I + 4 Q, 26.67 MHz. 26.67 MB/s. One per link.
+Watch mode (any of the above): the FX2 forwards 1 packet in N
+  (section 6.3), e.g. N=16 -> 1.7 MB/s at 16-bit.
+
+Which 4 bits in modes B-D: C5VRX uses ADC bits {9,6,5,4} (its
+"ultrafine lane", accepting folding beyond +/-128 at its gain policy)
+[c5vrx]. The PC can pick any 4 bits through the GPIO matrix; test both
+top-4 and C5VRX's choice.
+
+Trade-offs to settle by simulation first (section 9, experiment S1):
+- 13.33 MS/s wraps the phase difference at +/-6.67 MHz. A transmitter
+  that deviates -5.0 to +4.4 MHz is 1.7 MHz from wrapping at the sync
+  tip; that cost about 2 dB of threshold against 26.67 MS/s.
+  [zw-board, sim on captures]. Wrap repair (despeck) recovers much of
+  it.
+- So: 8+8 at 13.33 MS/s vs 4+4 at 26.67 MS/s, both 26.67 MB/s. Unknown
+  which gives the better picture at the edge of range. Capture in
+  Mode A first: dropping bits in software emulates 4+4, so one
+  recording answers part of the question.
+
+4.3 Wiring one receiver (C5 -> FX2 board)
+
+  C5 lane pins (14 or 16)  -> FX2 PB0-7 / PD0-7 (or PB only in 8-bit)
+  C5 PARLIO TX clock pin   -> FX2 IFCLK
+  GND                      -> GND, at least two wires, one beside the
+                              clock wire
+  FX2 board 5V (USB VBUS)  -> C5 5V pin (optional: one-cable receiver;
+                              see 4.4)
+  FX2 SLWR (RDY1)          -> tie active permanently (default polarity
+                              is active-low: tie to GND), or drive from
+                              a C5 PARLIO TX data bit for gating
+                              (section 6.3 option B)
+  FX2 FIFOADR0/1 (PA4/PA5) -> GND (selects EP2)
+  FX2 SLRD (RDY0), SLOE (PA2), PKTEND (PA6) -> inactive (3.3 V for
+                              active-low defaults)
+
+Practice [zw-board]:
+- 30 AWG wire (Kynar wire-wrap), signal wires 3-5 cm. At these lengths
+  wires are plain wires; length matching is irrelevant (2 cm ~ 0.1 ns).
+- Keep each bundle with its ground alongside; minimise loop area.
+- Low drive strength on the C5 data and clock pins; if errors, 22-33 ohm
+  series resistors at the C5 end. Choose drive from the edge check
+  (5.4), not by defaulting to the weakest.
+- Short, direct, no breadboard for the final build (breadboard OK for
+  first light at low risk).
+
+4.4 Power and cables
+
+- FX2 board: <=85 mA. C5 receiving: roughly 100-150 mA [zw estimate].
+  Both fit one USB 2.0 port (500 mA). [estimate]
+- v1 (simplest): two cables per receiver. The C5's own USB-C gives it
+  power plus the control console; the FX2's mini-USB carries data.
+  Do not also feed the C5 from the FX2's 5V in this mode.
+- v2 (tidy): one cable. The FX2 board's 5V feeds the C5's 5V pin; C5
+  control goes through the FX2: PC -> FX2 vendor request -> FX2 UART
+  (the FX2LP has two UARTs) -> C5 UART RX. Needs 2 more C5 pins (TX/RX),
+  which the C5-Zero has only in 7+7 mode; or use the C5's USB pins.
+  Decide after v1 works.
+- Common ground: all receivers end up grounded through the laptop's USB.
+  Fine on a laptop. Do not mix a laptop charger ground and a separately
+  powered tracker supply without a common ground point.
+
+
+-----------------------------------------------------------------------
+5. C5 FIRMWARE ("radio head")
+-----------------------------------------------------------------------
+
+Start from zerowidth's c5rx (the C5 side of P4USB) rather than from
+C5VRX-5, because it already exports lanes and a clock. Credit both.
+ESP-IDF v6.x (installed at D:\ESP-IDF\v6.0.2\esp-idf).
+
+5.1 Responsibilities
+- Tune: band/channel or raw MHz (R8 5917 MHz and above work via
+  phy_set_freq [zw-board]).
+- Gain: set a fixed gain index on command. The PC runs the gain loop.
+- Export lanes: route MODEM_DIAG bits to pads through the GPIO matrix.
+- Sample clock: PARLIO TX in loop mode, PLL_F240M source, divider from
+  the PC (6/9/12/18), output on one pin.
+- Clock slip: "clk slip US" raises the divider by one for about US
+  microseconds, moving the edge against the bus by 240 MHz ticks
+  (4.17 ns). The bus repeats every 3 ticks at 80 MS/s. [zw-board]
+- 802.11p setting: phy_11p_set(1, 0) on every channel. Narrows the
+  receive filter from about +/-9.5 to +/-6 MHz, lowered sync-tip noise
+  on R8 (102-105 -> 87-91 kHz), and made the clock phase keep across
+  retunes. Not understood beyond that. [zw-board]
+- Lane self-test: a mode that drives the lane pins as plain GPIOs with a
+  walking-ones pattern and a counter, so the PC can name any miswired
+  or shorted lane ("Q5 reads on PB3").
+- Status: firmware version, channel, gain, divider, 11p state, uptime.
+- No DAC, no PARLIO RX, no BitScrambler, no video logic.
+
+5.2 Control protocol (USB Serial/JTAG console, v1)
+Line-based ASCII, one command per line, replies "OK ..." or "ERR ...".
+Proposed:
+  ver                     -> OK openvrx-c5 <version> board=<xiao|zero>
+  tune <MHz>              -> OK tune 5732
+  gain <index>            -> OK gain 64
+  clk <divider>           -> OK clk 18 (13.33 MHz)
+  clk slip <us>           -> OK slip
+  lanes <map name>        -> OK lanes 8x8 | 7x7 | 4x4top | 4x4c5vrx
+  selftest on|off         -> OK
+  p11 on|off              -> OK
+  status                  -> OK ch=5732 gain=64 clk=18 p11=1 up=123s
+Keep the PC as the owner of all settings: on connect it pushes the full
+state, so a C5 reset is harmless.
+
+5.3 Timing of changes
+A gain or tune change takes effect at some sample the PC does not know
+exactly. The PC timestamps the command, then finds the step in the
+stream (amplitude jump for gain, carrier jump for tune) and logs the
+sample index. zerowidth found the I offset moves about half a unit per
+gain step, so offset tracking must reset or jump on gain steps.
+
+5.4 The sampling-phase lottery and how OpenVRX handles it
+Problem: about 3 starts in 10 the clock edge lands while the lanes
+change; some lanes hold the old bit, some the new. Near zero crossings
+every upper bit flips at once, so mixed reads are garbage (Q read -19,
+-113, 45 in a row). Cost about 18 dB of noise. [zw-board]
+Fix in OpenVRX:
+1. At start, PC asks for clk 6 (40 MS/s) briefly. The FX2 FIFO will
+   overflow at 80 MB/s (16-bit), but a 2-4 KB burst is enough.
+2. PC computes the probe: power passed by the fourth difference
+   (1 -4 6 -4 1) over total power, each less its rounding share. Clean
+   reads give near 0 (carrier 0.02-0.05, noise -0.2 to 6); mixed give
+   19-80. Threshold 12. [zw-board]
+3. If mixed: "clk slip 1", probe again, up to N tries. Three positions
+   exist, one bad; one slip always leaves the bad one. [zw-board]
+4. Then set the working divider. The phase position survives divider
+   changes (14 of 14 positions read the same at 40 and 13.33 MS/s)
+   [zw-board] and retunes with 11p on.
+5. Re-check periodically on the live stream (glitch count far off the
+   carrier ring) and after any C5 reset.
+FX2-specific: the FX2 needs 7.7 ns of steady data per edge (3.2).
+Whether one of the three positions always satisfies it at 80 MS/s is
+unknown. If not, the 802.11p setting (if the bus really drops to 40 MS/s)
+or IFCLKPOL inversion will not help at /18 (half a 75 ns period is
+exactly 3 bus samples), so the fallback is fine tuning drive strength
+and series resistors, then an oscilloscope look (the open zerowidth
+item "look at the clock against a Q lane").
+
+
+-----------------------------------------------------------------------
+6. FX2 FIRMWARE
+-----------------------------------------------------------------------
+
+Toolchain: SDCC (8051 C compiler) + libfx2 (whitequark; chip support
+package for FX2, with a Python "fx2" library and "fx2tool" to load and
+debug; 0BSD license [package listing, confirm in repo]). Alternative:
+fx2lib (LGPL). Use libfx2.
+
+6.1 First light without custom firmware
+sigrok's fx2lafw firmware + PulseView: samples 8 channels on the FX2's
+internal clock (up to 24 MHz on 8-channel hardware). Use it once to
+check the board, the driver, and that the lanes toggle. Not for real
+capture: no external clock.
+
+6.2 OpenVRX firmware, streaming mode
+- IFCONFIG: IFCLKSRC=0 (external IFCLK), ASYNC=0 (synchronous),
+  IFCFG=11 (slave FIFO). IFCLKPOL configurable by vendor request.
+- EP2: IN, bulk, 512-byte packets, quad buffered (4 x 512 = 2 KB).
+  EP2FIFOCFG: AUTOIN=1, WORDWIDE=1 for 16-bit or 0 for 8-bit.
+  AUTOINLENH/L = 512.
+- FIFOPINPOLAR: default (active-low SLWR) or active-high if driven.
+- EP1 IN interrupt endpoint: status block every ~10 ms: firmware
+  version, mode, packets sent, packets skipped, FIFO-full events
+  (count of times the EP2 full flag was seen set while data was
+  arriving = lost samples), IFCLK present flag.
+- Vendor requests: start/stop, set width 8/16, set watch ratio N, set
+  IFCLK polarity, read status, reset counters, UART relay (v2).
+- Descriptors: own VID:PID. For a hobby project use a pid.codes test ID
+  or apply for a free pid.codes PID; include Microsoft OS 2.0 (WCID)
+  descriptors so Windows binds WinUSB automatically after renumeration.
+- The blank chip (before firmware) still needs WinUSB bound once with
+  Zadig so the PC can upload firmware.
+- The PC host uploads firmware automatically on plug-in (vendor request
+  0xA0 to RAM, then release CPUCS reset). No EEPROM programming needed.
+
+6.3 Watch mode (sending less from a receiver)
+Purpose: run 3+ receivers when only 2 get full streams (section 7.4).
+Option A (preferred, FX2-only): switch EP2 from AUTOIN to manual
+  (AUTOIN=0) and commit 1 packet in N, skipping the others (Infineon
+  support describes switching to manual mode on a vendor command to skip
+  packets). Each committed 512-byte packet is a contiguous burst: 256
+  samples in 16-bit mode (19 us, about a third of a video line) or 512
+  samples in 8-bit mode (38 us). The 8051 must handle about 52,000
+  packets a second at 16-bit, 13.33 MS/s, which is a few hundred
+  thousand simple instructions a second against about 12 MIPS
+  available. [estimate] If it falls behind, the FIFO fills and samples
+  are lost, which only matters inside a committed packet; check the
+  full flag before committing.
+Option B (C5 gating): a C5 PARLIO TX data bit drives SLWR with a
+  pattern from a DMA buffer (all active = full mode; short bursts =
+  watch mode). Clean timing because the bit is synchronous with the
+  clock. Needs one more pin.
+Option C (C5 slow clock): divide the clock way down (e.g. 1.33 MHz) in
+  watch mode. Power and C/N estimates still work on slow samples;
+  demodulated content does not. Keeps phase per zerowidth's finding.
+Switching a receiver from watch to full takes a vendor request and one
+USB round trip: about 1-2 ms. [estimate]
+
+6.4 Throughput self-test
+Before any C5 is wired: firmware option to use the internal 48 MHz
+IFCLK (or 30 MHz) and stream whatever the floating port reads, with the
+full-flag counter. Run 1, 2 and 3 boards on different ports and on one
+hub, at 13.33/20/26.67 MB/s equivalents (set via divider of internal
+clock or by commit ratio). Record MB/s and lost-sample counts.
+
+
+-----------------------------------------------------------------------
+7. PC HOST SOFTWARE
+-----------------------------------------------------------------------
+
+7.1 Language and libraries (decision)
+- Research and reference implementation: Python 3 + numpy + numba +
+  scipy (C5VRX's research tools already use numpy/scipy/numba). Slow is
+  fine; correctness and plots matter. Runs on recordings.
+- Live engine: Rust.
+  - USB: nusb (pure Rust; Windows via WinUSB, macOS, Linux; async bulk
+    transfers; needs WinUSB bound, WCID descriptors recommended).
+  - Display: wgpu (DX12 on Windows) or SDL2. Low-latency present mode
+    (mailbox/immediate), fullscreen, max frame latency 1.
+  - ML (later): ONNX Runtime with the OpenVINO execution provider (Intel
+    discrete GPUs supported; Windows needs the OpenVINO package
+    installed separately), or OpenVINO directly. DirectML is in
+    maintenance mode; WinML is Microsoft's forward path.
+  - Threads: crossbeam channels / SPSC ring buffers; pin hot threads;
+    Windows MMCSS "Pro Audio" class for capture threads.
+  Why Rust: memory-safe multithreading at tens of MB/s, good USB and GPU
+  crates, single static exe. C++ (libusb + SDL2 + OpenVINO C++) is an
+  equally valid alternative if preferred.
+- Rule: every stage in Rust has a Python twin; golden test vectors
+  (recorded or simulated .iq files with expected outputs) keep them in
+  step.
+
+7.2 Pipeline (per receiver, then combined)
+
+  [USB capture thread]   one per FX2
+     nusb bulk IN, 8-16 transfers queued, 16-64 KB each
+     (16 KB at 26.67 MB/s = 0.6 ms of signal per transfer).
+     Timestamp each completion (QueryPerformanceCounter).
+     Push into a lock-free ring; count bytes; poll EP1 status.
+         |
+  [DSP thread]           one per receiver
+     1. Unpack lanes -> signed I, Q (2v+1 for 7-bit). Lookup table on
+        the 16-bit word is the fastest unpack.
+     2. DC offset estimate and removal (I mainly; track per gain).
+     3. Optional digital frequency shift (fine AFC, removes LO offset;
+        two C5 crystals differ by tens of ppm = ~100 kHz at 5.8 GHz).
+     4. FM discriminator: angle(z[n] * conj(z[n-1])). Exact atan2 or a
+        large table (2^16 entries for 8+8 bits fits in L2 cache).
+        Later: PLL / tracking demodulators for threshold extension
+        (C5VRX's U85Q is a 32-phase tracker, kp=0.85 [c5vrx]).
+     5. Wrap repair (zerowidth's despeck: a sample half a turn or more
+        from the mean of its neighbours is wrapped; move it to the end
+        of the range it wrapped past). Cut luma specks at C/N 7 dB from
+        15 to 2.4 per thousand. [zw-board]
+     6. Low-pass to video bandwidth (4.2 MHz NTSC luma + chroma band).
+     7. Sync: slicer + line clock (PLL on hsync), field detection
+        (NTSC: odd field broad pulse half-way through line 3, even
+        field at line 4; wrap 263/262 lines [zw-board]). Track to
+        ~0.1 sample. Resample each line onto a fixed grid: 4 x fsc
+        (14.31818 MHz, 910 samples/line NTSC) is convenient for colour.
+     8. Per-line quality: envelope C/N from |z|^2 (DC-removed
+        mean^2/var, as C5VRX's cn_estimate: (c+1)^2/(2c+1)) [c5vrx];
+        spike count; sync-tip noise; line-timing error. Also per-sample
+        damage flags (envelope dips, wraps).
+     Output: line records {rx, field, line, samples[910], quality,
+     damage mask, timestamp}.
+         |
+  [Combiner thread]
+     Align records from all receivers by (field number, line number).
+     Same transmitter = same raster, so alignment is by sync, not by
+     clocks. Buffer at most a few lines. Combining: see 7.4.
+         |
+  [Video thread]
+     Colour decode: NTSC first (PAL later). Burst-locked subcarrier
+     reference; 2D (line) comb v1, 3D (frame) comb v2 using the previous
+     frame only (no added delay). At 13.33 MS/s the NTSC subcarrier is
+     exactly 189/704 of the sample rate [zw-board]; on the 4fsc grid it
+     is exactly 1/4.
+     Field -> frame: bob v1; past-only motion-adaptive deinterlace v2
+     (weave where still, interpolate where moving, compared against the
+     same-parity field one frame back: no added delay).
+     Denoise / dropout repair / ML (section 8).
+         |
+  [Display thread]
+     Upload as a texture, draw, present immediately. OSD: per-receiver
+     C/N bars, which receiver feeds each part of the picture, channel,
+     latency counters, dropped-sample counters, REC indicator.
+     Outputs: laptop screen, or HDMI to the HD3 at 1280x720 60 Hz via a
+     USB-C to HDMI adapter (HD3 accepts up to 720p).
+         |
+  [Recorder] (any time, off the hot path)
+     Raw stream per receiver + event log (section 7.6).
+
+7.3 Control thread
+- Opens each C5 console (USB serial), pushes state, runs the gain loop,
+  AFC, phase calibration, channel scan, and (later) the tracker.
+- Gain loop: aim the raw I/Q RMS at a target band (zerowidth uses RMS
+  40-72 on 7-bit lanes; a 50 ms loop made a strong transmitter flash
+  every second or two, fixed gain did not [zw-board]). Use a slow loop
+  with hysteresis, change gain only during vertical blanking, and log
+  each change with its sample index.
+- AFC: measure the back-porch frequency; keep it near -1.0 MHz (C5VRX's
+  porch target [c5vrx]) by digital shift, and retune the C5 only when
+  the offset exceeds a threshold, during blanking.
+- Channel scan: step channels, measure power and sync lock per channel
+  (C5VRX's scan spends ~90 ms+ per channel [c5vrx]). With 2+ receivers,
+  split the band between them to scan faster.
+
+7.4 Diversity (the first goal)
+
+Stage D1, selection per line:
+  For each line, use the receiver with the better quality score, with
+  hysteresis so it does not flicker between near-equal receivers.
+  Already better than whole-picture switching.
+Stage D2, weighted blend per line:
+  Video = sum(w_k * video_k) / sum(w_k), w_k from each line's noise
+  estimate (inverse noise variance, like maximal-ratio combining after
+  detection). Smooth weights across lines.
+Stage D3, per-sample repair:
+  Where receiver A's damage mask flags a sample (spike, envelope dip)
+  and B's does not, take B's sample. Removes most sparkles.
+Stage D4, pre-detection combining (the long-range prize) [idea]:
+  Combine the complex I/Q of both receivers before FM demodulation:
+  estimate the phase difference phi(t) between them by averaging
+  z_A * conj(z_B), rotate B by -phi, align B to A in time with a
+  fractional-delay (Farrow) resampler driven by the line timing, then
+  sum with weights. Coherent combining improves the C/N before the FM
+  threshold, which is where analog video breaks up; up to ~3 dB for two
+  equal branches in noise alone, more in fades [theory, estimate].
+  Needs: per-receiver frequency correction (separate crystals), sample
+  clock drift tracking (separate PLLs, tens of ppm), and robust phase
+  tracking at low C/N.
+
+Alignment notes:
+- Receivers run on independent crystals, so their sample clocks drift.
+  Each DSP thread maps its samples onto the transmitter's own raster
+  (lines and fields), so D1-D3 need no clock relationship at all.
+- D4 needs sub-sample alignment; the line clock gives ~0.1 sample.
+
+Three or more receivers (watch mode):
+- Up to 2 receivers stream full; the others stream in watch mode
+  (1 packet in N). The PC estimates each watcher's power and C/N from
+  its bursts.
+- Promote a watcher when its quality beats the weaker full receiver by
+  a margin for ~100 ms; demote at the same time; switch at the start
+  of a field. [idea, numbers to tune]
+- Works best when antennas point in different directions (slow-
+  changing best direction); the two full streams handle fast fades.
+- Open question (sim S2): 3 receivers at reduced bits vs 2 full + 1
+  watching vs 2 full.
+
+7.5 Latency budget [estimate]
+  FX2 FIFO fill (512 B)                  ~0.02 ms
+  USB transfer chunk (16 KB)             ~0.6 ms
+  USB scheduling / completion            ~0.5-1 ms
+  DSP per line + combiner line buffer    ~0.2-0.5 ms
+  Field assembly (if display waits for a whole field)  up to 16.7 ms
+  ML stage (if on, Arc A370M)            ~2-8 ms (unmeasured)
+  Display (60 Hz panel, present immediately)  0-16.7 ms, avg ~8
+  HD3 HDMI scaler                        unknown
+  Total target: 10-30 ms added. Analog goggles add <1 ms.
+Ways to cut it: present partial fields as lines arrive (beam-racing
+style), high-refresh external monitor, skip ML when behind.
+Measure, do not guess: build the latency tester (section 12, L1).
+
+7.6 Recording format (.openvrx)
+Per receiver, per session:
+  <name>.rx<k>.bin   raw bytes exactly as received (lane words)
+  <name>.json        sidecar: format version, board type, lane map,
+                     bits, word width, divider and sample rate, channel,
+                     gain log [{sample_index, gain}], tune log, slip
+                     log, phase-probe results, USB transfer timestamps
+                     (every Nth), FX2 status snapshots, laptop/firmware
+                     versions, notes.
+Replay mode feeds recordings through the same pipeline at real speed or
+as fast as possible. sim.py output is written in the same format, so
+development and tests run without hardware.
+Data size: 26.67 MB/s = 1.6 GB per minute per receiver. Use the NVMe
+SSD; record on demand (button) plus a rolling 30 s buffer in RAM.
+
+7.7 Windows details
+- WinUSB driver for the FX2 (auto via WCID after renumeration; Zadig
+  once for the blank chip).
+- Disable USB selective suspend in the power plan while running.
+- Laptop on battery throttles the CPU/GPU; plug in, or in the field use
+  a USB-C PD power bank (~100 W) through the hub's PD input.
+- Port plan with two working ports:
+    Port A: USB-C hub with PD passthrough: charger, HDMI to HD3,
+            FX2 #1 (+ watch-mode receivers)
+    Port B: FX2 #2 direct (its own USB 2.0 link)
+  Rule: at most one Mode A (26.67 MB/s) receiver per USB 2.0 link; a
+  hub is one link for all USB 2.0 devices on it, even a USB 3 hub.
+  Check with USBTreeView which controller each device is on.
+
+
+-----------------------------------------------------------------------
+8. PICTURE CLEANUP (after diversity works)
+-----------------------------------------------------------------------
+
+Ordered cheapest first; all past-frames-only for live use.
+  C1 Sparkle removal using the damage mask (no guessing from pixels).
+  C2 Bad-line replacement from the previous same-parity field (what
+     ld-decode / vhs-decode call dropout correction).
+  C3 2D then 3D comb colour decode: removes rainbow and dot crawl.
+  C4 Past-only motion-adaptive deinterlace.
+  C5 Recursive temporal denoise, motion-gated.
+  C6 Small ML repair network on the Arc A370M.
+  C7 Offline heavy cleanup on recordings (bidirectional), like DVR
+     Doctor (dvrdoctor.com, $4.99-7.99, which "rebuilds each frame from
+     the frames around it").
+
+Prior art to read: ld-decode and vhs-decode (software decoding of raw
+RF captures of LaserDisc and VHS: demodulate, time-base correct,
+dropout detect/correct with inter-field replacement, 2D/3D comb chroma
+decoders). github.com/oyvindln/vhs-decode.
+
+ML plan (C6) [idea]:
+- Training pairs for free: extend C5VRX's research/sim.py (which models
+  CVBS -> FM -> C5 channel filter -> noise at a set C/N -> sampling ->
+  quantisation) to take real video frames as the picture, and emit
+  noisy and clean outputs at many C/N levels. Add fading and multipath.
+- Inputs: current field, previous cleaned frame, damage mask, per-line
+  quality. Output: cleaned field. Small recurrent U-Net, int8 or fp16.
+- Runtime: ONNX Runtime + OpenVINO EP on the Arc A370M. Budget: finish
+  each field well inside 16.7 ms (aim < 8 ms); otherwise skip ML.
+Safety rules (do not skip):
+- Only modify pixels the damage mask flags.
+- Stop filling an area after ~3 bad fields; show the raw noise again.
+  Breakup is the pilot's range warning; hiding it is dangerous.
+- Always show the per-receiver C/N bar while cleaning.
+- One key toggles cleaned / raw.
+
+
+-----------------------------------------------------------------------
+9. EXPERIMENTS AND MEASUREMENTS (answer these early)
+-----------------------------------------------------------------------
+
+S1 [sim] Sample format: 8+8 @13.33 vs 7+7 @13.33 vs 4+4 @20/26.67,
+   exact FM demod, picture SINAD vs C/N. Use sim.py (adapted).
+S2 [sim] Receiver count: 2 full vs 3 reduced vs 2 full + 1 watching,
+   under independent fading per antenna.
+S3 [sim] Combining: D1 vs D2 vs D3 vs D4 gain in dB of C/N at equal
+   picture quality.
+S4 [sim] Tracker squint angle and loop gains (section 10).
+B1 [bench] USB throughput on the XPS: 1-3 FX2s, direct and through the
+   hub (6.4).
+B2 [bench] Lane self-test and phase-probe on real hardware.
+B3 [bench] Sensitivity shootout: VTX at its lowest power (pit mode if
+   available) in a metal box -> fixed attenuators -> step attenuator ->
+   2-way splitter -> (C5 + FX2 + PC) and (the HD3's current receiver
+   module). Step the attenuation, note the dB where each picture breaks
+   up and where it is lost. This decides how far the project can go and
+   whether an LNA is worth it. Leakage around the attenuators can fake
+   results: shield the VTX, use good cables, check with the attenuator
+   at maximum that no picture remains.
+   Parts: "SMA step attenuator 0-90 dB 6 GHz" (~$40-80), "5.8GHz 2-way
+   SMA power divider" (~$15), fixed SMA attenuators 10/20/30 dB, SMA
+   cables, U.FL to SMA pigtails. [prices estimate]
+B4 [bench] Latency (L1 tester).
+F1 [field] Diversity flight: two antennas (e.g. one omni, one patch),
+   record raw from both, compare D1/D2/D3 offline on the same flight.
+
+
+-----------------------------------------------------------------------
+10. TRACKER: PATCH ANTENNAS ON A PAN/TILT HEAD (no GPS)
+-----------------------------------------------------------------------
+
+Principle: amplitude-comparison monopulse.
+- Two patch antennas on the head, pointed about +/-15-25 degrees apart
+  (to be set by S4; patches have ~60-70 degree beams [estimate]).
+- Each feeds its own C5 + FX2. They are also the diversity pair, so the
+  tracker costs no extra receivers.
+- Error = power_A(dB) - power_B(dB), using gain-normalised power: raw
+  I/Q power minus each receiver's gain in dB (needs a gain-to-dB table
+  per board, measured on the bench rig B3, and a swap test to cancel
+  board differences).
+- Zero error = the quad is on the boresight between the beams. Drive
+  the pan servo to keep the error near zero.
+- Tilt: patches are tall in coverage; tilt matters close in or high up.
+  Add a second pair (or a 4-patch cross) for an elevation error later.
+- Third receiver with an omni (watch mode) for reacquisition and close
+  range, where the tracker should stop chasing.
+
+Control loop [idea, numbers to tune]:
+- Measure at line rate (15.7 kHz), average to 50-100 Hz.
+- PI controller with deadband (+/-1 dB), slew-rate limit, and gain
+  scheduling by signal level (noisy at low C/N, so slower).
+- Lost signal (both below threshold for 0.5 s): hold, then a slow
+  search sweep; reacquire with the omni's watch data.
+- Pan beyond 180 degrees: classic 180 pan + 180 tilt "flip over" when
+  the target crosses behind. Or a USB-rated slip ring later.
+- Multipath (trees, buildings) can pull the head; the deadband and a
+  plausibility limit on angular speed help.
+
+Hardware [prices estimate]:
+- Pan/tilt bracket + metal-gear servos ("MG996R pan tilt bracket"),
+  ~$15-30. Bigger patches or helicals need stronger servos.
+- Servo driver: Pololu Micro Maestro 6-channel (USB, documented
+  serial protocol) ~$25, or a Raspberry Pi Pico (~$4) running a tiny
+  USB-serial servo firmware.
+- Servo power: separate 5-6 V BEC (~$5); never from a C5 or the FX2.
+- 2x 5.8 GHz patch antennas, SMA ("5.8GHz patch antenna 8dBi SMA",
+  Lumenier AXII Patch, TrueRC X-AIR) ~$15-40 each. Match polarisation to
+  the VTX antenna (RHCP/LHCP).
+- Mount the receivers ON the head with short U.FL-to-SMA pigtails to the
+  patches; only USB cables (with a service loop) cross the moving joint.
+  U.FL is fragile: use a bulkhead SMA and strain relief.
+- Enclosure and patch mount: OpenSCAD, squint angle as a parameter.
+Gain: an 8-9 dBi patch vs ~2 dBi omni is ~6 dB, about double the range
+in free space. A 13-16 dBi helical gains more but needs good tracking.
+[estimate]
+
+
+-----------------------------------------------------------------------
+11. BUILD ORDER (phases)
+-----------------------------------------------------------------------
+
+Phase 0: no hardware needed (start now)
+  0.1 Create the repo: README, LICENSE (GPL-3.0), CREDITS.md (C5VRX
+      and zerowidth, with links), .gitignore (recordings/).
+  0.2 Define the .openvrx recording format (7.6).
+  0.3 Adapt sim.py into lab/simgen.py: real video frames in, .openvrx
+      recordings out (8+8, 7+7, 4+4 variants, C/N sweep, fading).
+  0.4 Python reference decoder: unpack -> offset -> FM demod -> wrap
+      repair -> sync -> NTSC luma (then colour) -> PNG/MP4 of fields.
+  0.5 Run S1 and S2. Decide the sample format.
+  0.6 Real C5 data: tools/capture_iq_snapshot.py from C5VRX gives
+      8,190-byte snapshots at 40 MS/s (~3 video lines). Use them to
+      sanity-check offset and demod on real samples.
+  0.7 Open a GitHub discussion on C5VRX proposing a raw I/Q tap mode;
+      ask zerowidth about reusing c5rx. (Draft first, user approves
+      before posting.)
+
+Phase 1: one receiver, first light
+  1.1 FX2 board arrives: fx2lafw + PulseView sanity check.
+  1.2 libfx2 streaming firmware; throughput test B1 (internal clock).
+  1.3 C5 radio-head firmware: tune, gain, lanes, clock, slip, 11p,
+      selftest.
+  1.4 Wire one receiver; lane self-test B2; phase probe.
+  1.5 Capture to .openvrx; decode offline with the Python reference.
+      First picture.
+  1.6 Rust capture + live display of the Python-verified pipeline.
+
+Phase 2: live single receiver done properly
+  2.1 Rust DSP to match Python on golden vectors.
+  2.2 Gain loop, AFC, channel scan.
+  2.3 Display to laptop screen and HD3 over HDMI; OSD.
+  2.4 Recorder with rolling buffer.
+  2.5 Latency tester L1; measure; optimise.
+
+Phase 3: two-receiver diversity
+  3.1 Second receiver; per-receiver threads; alignment by sync.
+  3.2 D1 selection, D2 blending, D3 per-sample repair.
+  3.3 Bench shootout B3; field test F1.
+
+Phase 4: three or more receivers
+  4.1 FX2 watch mode; promotion/demotion logic.
+  4.2 Third receiver with an omni.
+
+Phase 5: tracker
+  5.1 S4 simulation; OpenSCAD mount; pan servo only.
+  5.2 Monopulse error from the diversity pair; PI loop; search mode.
+  5.3 Tilt; flip-over; field test.
+
+Phase 6: picture cleanup
+  6.1 C1-C5 classic steps.
+  6.2 ML: training set from simgen, train, export ONNX, OpenVINO on the
+      Arc, safety rules.
+
+Phase 7: advanced
+  7.1 D4 pre-detection combining.
+  7.2 LNA front end if B3 shows the C5's noise figure is the limit.
+  7.3 PAL, audio (analog VTX audio sits around 6.5 MHz: outside
+      +/-6.67 MHz at 13.33 MS/s; needs a higher rate) [estimate].
+  7.4 Custom hardware (section 12).
+
+
+-----------------------------------------------------------------------
+12. FUTURE ADDITIONS (ideas bank)
+-----------------------------------------------------------------------
+
+Hardware
+- H1 Receiver stick PCB: C5 module + FX2LP + SMA jack + one USB-C,
+  lanes routed short, ground plane, test points. KiCad, JLCPCB.
+- H2 Multi-receiver board: 4 C5 modules sharing one 40/48 MHz TCXO so
+  their clocks lock, all feeding one Cypress FX3 (USB 3, 32-bit GPIF
+  II, 100 MHz) over one cable. Removes per-receiver USB links and makes
+  D4 easier (common clock). Large project.
+- H3 LNA: a low-noise-figure 5.8 GHz LNA in front of each C5. Noise
+  figure matters more than gain: a hobby broadband module (NLB-310) gave
+  ~5-5.5 dB NF and little real gain; Analog Devices' CN0534 reference
+  design gives ~23 dB gain and 2 dB NF at 5.8 GHz with overpower
+  protection. Watch for overload when the quad is close.
+- H4 Band-pass filter for 5.725-5.875 GHz to reject Wi-Fi.
+- H5 Enclosure (OpenSCAD) for 2-3 receiver sticks and the hub.
+- H6 HackRF One as a gold-standard reference receiver for comparisons.
+
+Software
+- P1 Multi-quad viewer: 4 receivers on 4 channels, auto-detect a quad
+  powering up, 1/2/4 split screen (the "4-box" idea, done on the PC).
+- P2 Spectrum / waterfall view of the ~13-27 MHz window, and a
+  band-scan bar graph.
+- P3 OBS integration (virtual camera, Spout or NDI) for streaming and
+  recording with overlays.
+- P4 DVR export to MP4 via ffmpeg, raw kept for re-decoding.
+- P5 Offline re-decode with heavier demodulators and bidirectional
+  cleanup.
+- P6 Web control page (like C5VRX's web console) for settings on a
+  phone.
+- P7 Race/lap timing from per-line signal strength (RSSI peaks).
+
+Test and measurement
+- L1 Latency tester: a Pico flashes an LED in front of the quad camera
+  and reads a photodiode taped to the screen; reports glass-to-glass
+  ms over many samples.
+- L2 Automated attenuation sweep: step attenuator plus a script that
+  logs C/N, sync lock and picture SNR per dB.
+- L3 Golden-vector regression tests in CI (Python and Rust agree).
+
+
+-----------------------------------------------------------------------
+13. RISKS AND OPEN QUESTIONS
+-----------------------------------------------------------------------
+
+R1 FX2 timing margin at 80 MS/s bus: needs 7.7 ns steady data per edge
+   of a ~12.5 ns bus period. Mitigation: phase probe and slip, drive
+   strength, series resistors, 802.11p setting. Check on hardware early
+   (Phase 1.4).
+R2 USB throughput per link may be below 26.67 MB/s on this laptop.
+   Mitigation: Mode B/C, watch mode. Measured in B1 before wiring C5s.
+R3 C5 sensitivity unknown; may be well behind a RapidFire/Fusion
+   module. B3 answers it; LNA (H3) and D4 are the levers.
+R4 The 802.11p setting is not understood (it writes modem and analog
+   registers) [zw-board]. Treat as empirical.
+R5 Gain changes move the I offset and power; the PC must track them
+   per gain step or the demod and tracker error suffer.
+R6 Laptop on battery throttles; field power needed.
+R7 ML can hide breakup or invent detail; safety rules in section 8.
+R8 Windows scheduling jitter on USB completions; mitigate with queued
+   transfers, MMCSS priority, and buffering measured in lines.
+R9 Two-cable receivers (v1) are messy; v2 single-cable needs the FX2
+   UART relay and spare C5 pins.
+R10 The broken Thunderbolt port: run the checks (power-drain reset,
+   Dell SupportAssist / Dell Command Update for BIOS and Thunderbolt
+   firmware, USBTreeView with a known-good device per port, F12
+   diagnostics). Plan works with two ports either way.
+
+Open questions
+- Q1 Does the bus really change at 40 MS/s with 802.11p on?
+- Q2 Best 4 bits for 8-bit mode: top 4 or C5VRX's {9,6,5,4}?
+- Q3 How much does D4 gain over D3 in practice?
+- Q4 Can the FX2 8051 sustain 1-in-N skipping at full rate?
+- Q5 HD3 HDMI-path latency.
+
+
+-----------------------------------------------------------------------
+14. SHOPPING LIST
+-----------------------------------------------------------------------
+
+Phase 1-3 (diversity) [prices approximate]
+- 4x CY7C68013A FX2LP core board (the C$3.87 listing, board only).
+- Receivers: 2x Waveshare ESP32-C5-Zero (~$7-10 each), or 1 more XIAO
+  ESP32-C5 to pair with the one arriving.
+- 2-4x mini-USB cables (to USB-C for direct, to USB-A for the hub).
+- USB-C hub with PD passthrough, HDMI and 2+ USB-A (Anker/UGREEN class,
+  ~C$30-50).
+- 30 AWG Kynar wire, 22/33 ohm resistors, pin headers, heat shrink.
+- 5.8 GHz antennas for each C5 (U.FL; U.FL-to-SMA pigtails ~$3 each).
+- Optional: 24LC128 EEPROMs (~$1 each) for standalone FX2 boot.
+
+Bench (B3)
+- SMA step attenuator 0-90 dB to 6 GHz, 2-way 5.8 GHz splitter, fixed
+  SMA attenuators, SMA cables, a VTX with an SMA output.
+
+Tracker (Phase 5)
+- MG996R-class pan/tilt bracket and servos, Pololu Micro Maestro or a
+  Pico, 5-6 V BEC, 2-3 patch antennas, SMA bulkheads.
+
+Later
+- 5.8 GHz LNA (low NF), band-pass filters, HackRF One, FX3 dev board,
+  PCB runs.
+
+
+-----------------------------------------------------------------------
+15. REFERENCES
+-----------------------------------------------------------------------
+
+- C5VRX: https://github.com/Twotoz/C5VRX and https://twotoz.github.io/C5VRX/
+  (research/sim.py, main/cn_estimate.h, tools/capture_iq_snapshot.py,
+  docs/FINDINGS.md, AGENTS.md credit rules).
+- zerowidth P4USB: zerowidth/C5VRX PR #3, docs p4-receiver-plan.md and
+  p4-receiver-findings.md (lane plan, clock, lottery, 11p, offsets).
+- CY7C68013A datasheet (Infineon, doc 38-08032 Rev AD): slave FIFO
+  timing tables 23/24, pin descriptions, FIFOPINPOLAR.
+- EZ-USB FX2LP Technical Reference Manual (Infineon): AUTOIN/manual
+  mode, INPKTEND, EP configuration.
+- Infineon community: FX2LP throughput, skipping packets in manual mode,
+  FX2LP with sigrok/PulseView.
+- libfx2: https://github.com/whitequark/libfx2 (docs at
+  glasgowembedded.codeberg.page/libfx2).
+- sigrok fx2lafw: https://sigrok.org/wiki/Fx2lafw
+- nusb: https://docs.rs/nusb
+- ONNX Runtime OpenVINO EP: https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html
+- ESP-IDF v6.0.2 local: components/esp_driver_parlio/include/driver/
+  parlio_tx.h, components/soc/esp32c5/include/soc/soc_caps.h and
+  clk_tree_defs.h.
+- Seeed XIAO ESP32-C5 wiki (pinout): https://wiki.seeedstudio.com/xiao_esp32c5_getting_started/
+- Waveshare ESP32-C5-Zero: https://docs.waveshare.com/ESP32-C5-Zero
+- TBS Fusion manual (FUSION vs diversity mode):
+  https://www.team-blacksheep.com/media/files/tbs-fusion-manual.pdf
+- ld-decode / vhs-decode: https://github.com/oyvindln/vhs-decode
+- DVR Doctor: https://dvrdoctor.com
+- Analog Devices CN0534 5.8 GHz LNA reference design:
+  https://www.analog.com/CN0534
+- VK4GHZ 5.8 GHz LNA for FPV receiver: https://vk4ghz.com/5-8-ghz-lna-for-fpv-receiver/
+- Oscar Liang, analog VTX/VRX latency: https://oscarliang.com/vtx-vrx-latency-analog/
