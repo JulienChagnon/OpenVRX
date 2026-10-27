@@ -1,0 +1,13 @@
+SPDX-License-Identifier: 0BSD
+
+libfx2 (chip support package for the Cypress/Infineon EZ-USB FX2 series)
+Upstream:   https://github.com/whitequark/libfx2
+Commit:     16cdf948a964dbc3506f42753a335db91b63a39b (2026-03-26, "Fix PyPI license metadata.")
+License:    0BSD, see LICENSE-0BSD.txt (Copyright (C) 2018 whitequark@whitequark.org)
+
+Contents: firmware/library/ from that commit, copied unmodified into library/,
+plus the upstream README.md and LICENSE-0BSD.txt. The Python tools, examples
+and documentation of the upstream repository are not vendored.
+
+The OpenVRX build (../../build.py, ../../Makefile) compiles only the objects it
+needs from library/ and does not use the upstream Makefile.
