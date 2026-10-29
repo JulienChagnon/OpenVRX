@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+menu "OpenVRX radio head"
+
+    choice OPENVRX_DEFAULT_BOARD
+        prompt "Pin map on a fresh board (before any save)"
+        default OPENVRX_DEFAULT_BOARD_XIAO
+        help
+            The host selects the board with the board command on connect;
+            this only matters until the first save.
+        config OPENVRX_DEFAULT_BOARD_XIAO
+            bool "Seeed XIAO ESP32-C5"
+        config OPENVRX_DEFAULT_BOARD_ZERO
+            bool "Waveshare ESP32-C5-Zero"
+        config OPENVRX_DEFAULT_BOARD_CUSTOM
+            bool "Custom map below"
+    endchoice
+
+    menu "Custom pin map"
+        comment "GPIO per FX2 pin, -1 = no C5 pin (tie that FX2 pin to GND)"
+        comment "Usable GPIOs: 0..12 and 23..28; every GPIO at most once per table"
+        config OPENVRX_CUSTOM_CLK
+            int "Sample clock (FX2 IFCLK)"
+            range -1 28
+            default -1
+            help
+                GPIO for the sample clock. -1 disables the custom map.
+        config OPENVRX_CUSTOM_PB0
+            int "16-bit presets: FX2 PB0 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB0 (word bit 0) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB1
+            int "16-bit presets: FX2 PB1 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB1 (word bit 1) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB2
+            int "16-bit presets: FX2 PB2 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB2 (word bit 2) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB3
+            int "16-bit presets: FX2 PB3 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB3 (word bit 3) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB4
+            int "16-bit presets: FX2 PB4 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB4 (word bit 4) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB5
+            int "16-bit presets: FX2 PB5 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB5 (word bit 5) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB6
+            int "16-bit presets: FX2 PB6 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB6 (word bit 6) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PB7
+            int "16-bit presets: FX2 PB7 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB7 (word bit 7) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD0
+            int "16-bit presets: FX2 PD0 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD0 (word bit 8) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD1
+            int "16-bit presets: FX2 PD1 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD1 (word bit 9) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD2
+            int "16-bit presets: FX2 PD2 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD2 (word bit 10) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD3
+            int "16-bit presets: FX2 PD3 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD3 (word bit 11) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD4
+            int "16-bit presets: FX2 PD4 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD4 (word bit 12) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD5
+            int "16-bit presets: FX2 PD5 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD5 (word bit 13) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD6
+            int "16-bit presets: FX2 PD6 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD6 (word bit 14) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM_PD7
+            int "16-bit presets: FX2 PD7 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PD7 (word bit 15) for 8x8/7x7/6x6/5x5.
+        config OPENVRX_CUSTOM8_PB0
+            int "8-bit presets: FX2 PB0 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB0 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB1
+            int "8-bit presets: FX2 PB1 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB1 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB2
+            int "8-bit presets: FX2 PB2 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB2 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB3
+            int "8-bit presets: FX2 PB3 (Q)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB3 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB4
+            int "8-bit presets: FX2 PB4 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB4 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB5
+            int "8-bit presets: FX2 PB5 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB5 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB6
+            int "8-bit presets: FX2 PB6 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB6 for the 4x4 presets.
+        config OPENVRX_CUSTOM8_PB7
+            int "8-bit presets: FX2 PB7 (I)"
+            range -1 28
+            default -1
+            help
+                GPIO wired to FX2 PB7 for the 4x4 presets.
+    endmenu
+
+endmenu
