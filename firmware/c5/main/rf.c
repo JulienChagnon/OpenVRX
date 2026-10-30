@@ -213,3 +213,199 @@ static esp_err_t retune(void)
     return err != ESP_OK ? err : ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
+esp_err_t rf_start(const rf_config_t *cfg)
+{
+    s_cfg = *cfg;
+    // No esp_netif_init: no network interface exists.
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    // sta_disconnected_pm must be off: Wi-Fi power management would gate
+    // the RF/PHY clocks that keep MODEM_DIAG streaming.
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    wcfg.sta_disconnected_pm = false;
+    if ((err = esp_wifi_init(&wcfg)) != ESP_OK) return err;
+    if ((err = esp_wifi_set_storage(WIFI_STORAGE_RAM)) != ESP_OK) return err;
+    if ((err = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK) return err;
+    if ((err = esp_wifi_start()) != ESP_OK) return err;
+    if ((err = esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY)) != ESP_OK) return err;
+    if ((err = esp_wifi_set_ps(WIFI_PS_NONE)) != ESP_OK) return err;
+    wifi_protocols_t protocols = {
+        .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX,
+        .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N,
+    };
+    if ((err = esp_wifi_set_protocols(WIFI_IF_STA, &protocols)) != ESP_OK) return err;
+    wifi_bandwidths_t bandwidths = {.ghz_2g = WIFI_BW20, .ghz_5g = WIFI_BW40};
+    if ((err = esp_wifi_set_bandwidths(WIFI_IF_STA, &bandwidths)) != ESP_OK) return err;
+    if ((err = esp_wifi_set_channel(173, WIFI_SECOND_CHAN_NONE)) != ESP_OK) return err;
+    // Promiscuous RX keeps the receive path alive; a zero filter keeps the
+    // LMAC from buffering packets or raising interrupts.
+    if ((err = esp_wifi_set_promiscuous(true)) != ESP_OK) return err;
+    wifi_promiscuous_filter_t filter = {.filter_mask = 0};
+    (void)esp_wifi_set_promiscuous_filter(&filter);
+    if ((err = lock_rx_only()) != ESP_OK) return err;
+    phy_begin();
+    // The filter capacitors still hold the per-chip calibration from PHY
+    // init and the 11p fields their stock values: capture both before
+    // anything writes them.
+    (void)phy_filter_capture_base();
+    phy_11p_capture_stock();
+    capture_table();
+    if (s_cfg.gain > s_table.max_index) s_cfg.gain = s_table.max_index;
+    phy_force_rx_gain(true, s_cfg.gain);
+    s_gain_check = gain_forced_as_set();
+    if (!s_gain_check) console_log("gain register readback not as modelled: gain watchdog off");
+    s_started = true;
+    err = retune();
+    phy_end();
+    return err == ESP_ERR_INVALID_RESPONSE ? ESP_OK : err;   // readback problems show in the state
+}
+
+bool rf_started(void) { return s_started; }
+
+esp_err_t rf_tune(uint16_t mhz, int off_khz)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    phy_begin();
+    esp_err_t err;
+    if (s_setup_valid && mhz == s_setup_mhz && s_setup_bw20 == s_cfg.bw20) {
+        // Offset only (as C5VRX's AFC): the vendor helper re-enables BB AGC,
+        // so the full receive state is restored after it.
+        s_cfg.off_khz = (int16_t)off_khz;
+        phy_chip_set_chan_offset(off_khz);
+        const bool ok = restore_lock();
+        set_state_after_restore(ok);
+        err = ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    } else {
+        const rf_config_t old = s_cfg;
+        s_cfg.mhz = mhz;
+        s_cfg.off_khz = (int16_t)off_khz;
+        err = retune();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_RESPONSE) {
+            s_cfg = old;
+            (void)retune();
+        }
+    }
+    phy_end();
+    return err;
+}
+
+esp_err_t rf_set_gain(uint8_t gain)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    if (gain > s_table.max_index) return ESP_ERR_INVALID_ARG;
+    phy_begin();
+    phy_force_rx_gain(true, gain);
+    s_cfg.gain = gain;
+    const bool ok = !s_gain_check || gain_forced_as_set();
+    if (!ok) s_state = RF_PHY_ERROR;
+    phy_end();
+    return ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t rf_set_p11(bool on)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    if (!phy_pinned()) return ESP_ERR_NOT_SUPPORTED;
+    phy_begin();
+    s_cfg.p11 = on;
+    const esp_err_t err = retune();   // the vendor setup must run in the new mode
+    phy_end();
+    return err;
+}
+
+esp_err_t rf_set_filter(int code, int skirt)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    if (!phy_pinned()) return (code == OPENVRX_FILTER_CAL && skirt == 0) ? ESP_OK : ESP_ERR_NOT_SUPPORTED;
+    phy_begin();
+    s_cfg.filter_code = (int8_t)code;
+    s_cfg.skirt = (uint8_t)skirt;
+    const bool ok = restore_lock();
+    set_state_after_restore(ok);
+    const bool applied = phy_filter_code() == code && phy_filter_skirt() == skirt;
+    if (!applied) {
+        // phy.c fell back to the calibrated bytes: report what is live.
+        s_cfg.filter_code = (int8_t)phy_filter_code();
+        s_cfg.skirt = (uint8_t)phy_filter_skirt();
+    }
+    phy_end();
+    return ok && applied ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t rf_set_bw20(bool bw20)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    phy_begin();
+    s_cfg.bw20 = bw20;
+    // The analog filter branch follows the bandwidth at the last channel
+    // setup, so a change repeats the setup (C5VRX rf_set_filter).
+    const esp_err_t err = retune();
+    phy_end();
+    return err;
+}
+
+rf_config_t rf_config(void) { return s_cfg; }
+rf_phy_state_t rf_phy_state(void) { return s_state; }
+
+const char *rf_phy_state_name(rf_phy_state_t s)
+{
+    switch (s) {
+    case RF_PHY_OK: return "ok";
+    case RF_PHY_RESTORED: return "restored";
+    case RF_PHY_ERROR: return "error";
+    case RF_PHY_UNSUPPORTED: return "unpinned";
+    default: return "down";
+    }
+}
+
+uint8_t rf_gain_max(void) { return s_table.max_index; }
+
+unsigned rf_gain_stage_starts(uint8_t *starts, unsigned max)
+{
+    uint8_t all[ARC_RX_STAGE_COUNT];
+    const unsigned n = arc_gain_stage_starts(&s_table, all);
+    const unsigned m = n < max ? n : max;
+    memcpy(starts, all, m);
+    return m;
+}
+
+void rf_watchdog_poll(void)
+{
+    if (!s_started || s_state == RF_PHY_ERROR) return;
+    phy_begin();
+    const char *why = NULL;
+    if (!(REG32(DUMP_CTRL) & CTRL_ENABLE)) why = "modem";
+    else if (!rx_only_locked()) why = "txq";
+    else if (s_gain_check && !gain_forced_as_set()) why = "gain";
+    else if (phy_pinned() && phy_11p_hw_state() != (s_cfg.p11 ? 1 : 0)) why = "p11";
+    if (why) {
+        const bool ok = restore_lock();
+        s_state = ok ? RF_PHY_RESTORED : RF_PHY_ERROR;
+        console_evt("phy state=%s cause=%s", rf_phy_state_name(s_state), why);
+    }
+    phy_end();
+}
+
+// Resets do not reach the modem domain; the forced clocks and the running
+// dump writer would keep the ROM loader from answering and stall the next
+// app boot. Stop both before any restart.
+static void quiesce_modem(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(50));
+    REG32(DUMP_CTRL) &= ~CTRL_ENABLE;
+    REG32(HP_SRAM_USAGE) &= ~0x00010f00u;
+    if (s_started) (void)esp_wifi_stop();
+}
+
+void rf_reboot(void)
+{
+    quiesce_modem();
+    esp_restart();
+}
+
+void rf_reboot_to_download(void)
+{
+    quiesce_modem();
+    REG_SET_FIELD(LP_AON_SYS_CFG_REG, LP_AON_FORCE_DOWNLOAD_BOOT, 1u);
+    esp_restart();
+}
