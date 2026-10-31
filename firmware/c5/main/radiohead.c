@@ -290,3 +290,176 @@ static void cmd_gains(void)
     reply("OK gains max=%u stages=%s", rf_gain_max(), list);
 }
 
+static void cmd_clk(openvrx_clk_action_t action, unsigned div)
+{
+    esp_err_t err;
+    if (action == OPENVRX_CLK_DIV) {
+        err = sclk_set_div(div);
+        if (err != ESP_OK) {
+            reply_esp_err(OPENVRX_CMD_CLK, err);
+            return;
+        }
+        reply("OK clk div=%u hz=%lu locked=%d", div, (unsigned long)openvrx_clock_hz(div),
+              openvrx_div_bus_locked(div) ? 1 : 0);
+        return;
+    }
+    err = sclk_gate(action == OPENVRX_CLK_ON);
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_CLK, err);
+        return;
+    }
+    reply("OK clk on=%d", sclk_on() ? 1 : 0);
+}
+
+static void cmd_slip(unsigned n)
+{
+    if (!sclk_on()) {
+        reply_err(OPENVRX_CMD_SLIP, OPENVRX_ERR_STATE, "clock is off");
+        return;
+    }
+    const uint32_t before = sclk_slips();
+    const esp_err_t err = sclk_slip(n);
+    if (err == ESP_ERR_TIMEOUT) {
+        reply_err(OPENVRX_CMD_SLIP, OPENVRX_ERR_HW, "clock pad not toggling");
+        return;
+    }
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_SLIP, err);
+        return;
+    }
+    const uint32_t total = sclk_slips();
+    reply("OK slip n=%lu total=%lu rel=%lu", (unsigned long)(total - before), (unsigned long)total,
+          (unsigned long)(total % OPENVRX_BUS_TICKS));
+}
+
+static void cmd_p11(bool on)
+{
+    const esp_err_t err = rf_set_p11(on);
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_P11, err);
+        return;
+    }
+    reply("OK p11 on=%d", on ? 1 : 0);
+}
+
+static void cmd_filter(int code, int skirt)
+{
+    const esp_err_t err = rf_set_filter(code, skirt);
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_FILTER, err);
+        return;
+    }
+    char fbuf[8];
+    const rf_config_t c = rf_config();
+    reply("OK filter code=%s skirt=%u", filter_text(c.filter_code, fbuf, sizeof(fbuf)), c.skirt);
+}
+
+static void cmd_bw(unsigned mhz)
+{
+    const esp_err_t err = rf_set_bw20(mhz == 20);
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_BW, err);
+        return;
+    }
+    reply("OK bw mhz=%u", mhz);
+}
+
+static void cmd_drive(unsigned lanes, int clk)
+{
+    esp_err_t err = lanes_hw_set_drive(lanes);
+    if (err == ESP_OK && clk >= 0) err = sclk_set_drive((unsigned)clk);
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_DRIVE, err);
+        return;
+    }
+    s_drive_lanes = lanes;
+    if (clk >= 0) s_drive_clk = (unsigned)clk;
+    reply("OK drive lanes=%u clk=%u", s_drive_lanes, s_drive_clk);
+}
+
+static void cmd_selftest(openvrx_selftest_mode_t mode, uint32_t value, uint32_t phase_us)
+{
+    const unsigned n = lanes_hw_route()->n;
+    if (mode != OPENVRX_ST_OFF && n == 0) {
+        reply_err(OPENVRX_CMD_SELFTEST, OPENVRX_ERR_STATE, "no lanes routed");
+        return;
+    }
+    const esp_err_t err = lanes_hw_selftest(mode, value, phase_us);
+    if (err == ESP_ERR_INVALID_ARG) {
+        reply_err(OPENVRX_CMD_SELFTEST, OPENVRX_ERR_RANGE, "value wider than the lanes");
+        return;
+    }
+    if (err != ESP_OK) {
+        reply_esp_err(OPENVRX_CMD_SELFTEST, err);
+        return;
+    }
+    if (mode == OPENVRX_ST_OFF) reply("OK selftest mode=off");
+    else if (mode == OPENVRX_ST_CONST) reply("OK selftest mode=const lanes=%u value=%lx", n, (unsigned long)value);
+    else reply("OK selftest mode=%s lanes=%u phase_us=%lu", lanes_hw_selftest_name(mode), n, (unsigned long)phase_us);
+}
+
+static void cmd_save(void)
+{
+    const rf_config_t c = rf_config();
+    openvrx_settings_t s;
+    openvrx_settings_default(&s, s_board, current_preset());
+    s.p11 = c.p11 ? 1 : 0;
+    s.div = (uint16_t)sclk_div();
+    s.mhz = c.mhz;
+    s.off_khz = c.off_khz;
+    s.gain = c.gain;
+    s.filter_code = c.filter_code;
+    s.skirt = c.skirt;
+    s.bw_mhz = c.bw20 ? 20 : 40;
+    s.drive_lanes = (uint8_t)s_drive_lanes;
+    s.drive_clk = (uint8_t)s_drive_clk;
+    const esp_err_t err = settings_store(&s);
+    if (err != ESP_OK) {
+        reply_err(OPENVRX_CMD_SAVE, OPENVRX_ERR_HW, esp_err_to_name(err));
+        return;
+    }
+    reply("OK save");
+}
+
+void radiohead_command(char *line)
+{
+    openvrx_cmd_t cmd;
+    openvrx_err_t err;
+    const char *word;
+    if (!openvrx_cmd_parse(line, &cmd, &err, &word)) {
+        char out[160];
+        openvrx_format_err(out, sizeof(out), word, &err);
+        console_reply(out);
+        return;
+    }
+    switch (cmd.kind) {
+    case OPENVRX_CMD_VER: cmd_ver(); break;
+    case OPENVRX_CMD_STATUS: cmd_status(); break;
+    case OPENVRX_CMD_BOARD: cmd_board(cmd.a.board); break;
+    case OPENVRX_CMD_PINS: cmd_pins(); break;
+    case OPENVRX_CMD_LANES: cmd_lanes(cmd.a.preset); break;
+    case OPENVRX_CMD_TUNE: cmd_tune(cmd.a.tune.mhz, cmd.a.tune.off_khz); break;
+    case OPENVRX_CMD_GAIN: cmd_gain(cmd.a.gain); break;
+    case OPENVRX_CMD_GAINS: cmd_gains(); break;
+    case OPENVRX_CMD_CLK: cmd_clk(cmd.a.clk.action, cmd.a.clk.div); break;
+    case OPENVRX_CMD_SLIP: cmd_slip(cmd.a.slip_n); break;
+    case OPENVRX_CMD_P11: cmd_p11(cmd.a.p11_on); break;
+    case OPENVRX_CMD_FILTER: cmd_filter(cmd.a.filter.code, cmd.a.filter.skirt); break;
+    case OPENVRX_CMD_BW: cmd_bw(cmd.a.bw_mhz); break;
+    case OPENVRX_CMD_DRIVE: cmd_drive(cmd.a.drive.lanes, cmd.a.drive.clk); break;
+    case OPENVRX_CMD_SELFTEST: cmd_selftest(cmd.a.selftest.mode, cmd.a.selftest.value, cmd.a.selftest.phase_us); break;
+    case OPENVRX_CMD_SAVE: cmd_save(); break;
+    case OPENVRX_CMD_REBOOT:
+        reply("OK reboot");
+        console_flush();
+        rf_reboot();
+        break;
+    case OPENVRX_CMD_DL:
+        reply("OK dl");
+        console_flush();
+        rf_reboot_to_download();
+        break;
+    case OPENVRX_CMD_PING: reply("OK ping"); break;
+    default: reply_err(cmd.kind, OPENVRX_ERR_SYNTAX, "unknown command"); break;
+    }
+}
