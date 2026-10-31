@@ -643,3 +643,721 @@ impl<P: StreamPort> Engine<P> {
         });
     }
 
+    /// Sleeps up to `d`; true when a stop arrived.
+    fn sleep_or_stop(&mut self, d: Duration) -> bool {
+        let deadline = std::time::Instant::now() + d;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            match self.cmd.recv_timeout(left) {
+                Ok(c) => {
+                    if self.idle_command(c) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn take_buffer(&self) -> Vec<u8> {
+        let n = self.cfg.transfer_bytes;
+        match self.pool.try_recv() {
+            Ok(mut v) => {
+                v.resize(n, 0);
+                v
+            }
+            Err(_) => vec![0u8; n],
+        }
+    }
+
+    /// Runs one START..STOP session on a link.
+    fn stream_once(&mut self, link: &mut StreamLink, gap_from: &mut Option<(u64, String)>) -> Exit {
+        self.session_blocks = 0;
+        let flags = self.cfg.start_flags();
+        let watch_n = self.cfg.watch_n;
+        // Clean state, queue transfers, then start the FIFO.
+        if let Err(e) = link.control.stop() {
+            return self.control_failure(e);
+        }
+        for _ in 0..self.cfg.transfers {
+            let b = self.take_buffer();
+            link.bulk.submit(b);
+        }
+        if let Err(e) = link.control.start(flags, watch_n) {
+            self.drain(link);
+            return self.control_failure(e);
+        }
+        let started_ns = now_ns();
+        self.emit(StreamEvent::Started {
+            flags,
+            watch_n,
+            byte: self.byte,
+            host_ns: started_ns,
+        });
+        let byte_at_start = self.byte;
+        self.stats(|s| {
+            s.running = true;
+            s.watch = (watch_n > 1).then(|| WatchLedger::new(watch_n, byte_at_start));
+        });
+
+        // Status poller for this session.
+        let poll_stop = Arc::new(AtomicBool::new(false));
+        let poller = self.spawn_status_poller(link, poll_stop.clone());
+
+        let mut last_ns = started_ns;
+        let mut prev_completion_ns = 0u64;
+        let mut no_data_reported = false;
+        let mut window = (started_ns, self.byte);
+        let exit = loop {
+            // Commands.
+            let mut stop = false;
+            for c in self.cmd.try_iter() {
+                match c {
+                    Cmd::Stop => stop = true,
+                    Cmd::SetWatch(n) => match link.control.set_watch(n) {
+                        Ok(()) => {
+                            self.cfg.watch_n = n;
+                            let b = self.byte;
+                            self.stats(|s| s.watch = (n > 1).then(|| WatchLedger::new(n, b)));
+                            self.emit(StreamEvent::WatchChanged {
+                                watch_n: n,
+                                byte: b,
+                                host_ns: now_ns(),
+                            });
+                        }
+                        Err(e) => log::warn!("SET_WATCH {n} failed: {e}"),
+                    },
+                    Cmd::ResetCounters => {
+                        if let Err(e) = link.control.reset_counters() {
+                            log::warn!("RESET_COUNTERS failed: {e}");
+                        }
+                    }
+                }
+            }
+            if stop {
+                let _ = link.control.stop();
+                break Exit::Stop;
+            }
+            let Some(c) = link.bulk.wait_complete(Duration::from_millis(100)) else {
+                let now = now_ns();
+                if !no_data_reported && now - last_ns > self.cfg.no_data_ms * 1_000_000 {
+                    no_data_reported = true;
+                    self.emit(StreamEvent::NoData {
+                        since_ns: last_ns,
+                        host_ns: now,
+                    });
+                }
+                self.flush_drop_event(false);
+                continue;
+            };
+            let host_ns = now_ns();
+            match c.status {
+                Ok(()) => {
+                    if no_data_reported {
+                        no_data_reported = false;
+                        self.emit(StreamEvent::DataResumed { host_ns });
+                    }
+                    if let Some((since, reason)) = gap_from.take() {
+                        let rate = self
+                            .cfg
+                            .nominal_byte_rate
+                            .unwrap_or_else(|| self.stats.lock().map(|s| s.rate_bps).unwrap_or(0.0));
+                        let est = ((host_ns.saturating_sub(since)) as f64 * 1e-9 * rate) as u64;
+                        let est = est / PACKET_BYTES as u64 * PACKET_BYTES as u64;
+                        self.stats(|s| s.gap_bytes_est += est);
+                        self.emit(StreamEvent::Gap {
+                            byte: self.byte,
+                            lost_bytes_est: est,
+                            reason,
+                            host_ns,
+                        });
+                    }
+                    let len = c.data.len();
+                    let block = RawBlock {
+                        rx: self.cfg.rx,
+                        seq: self.seq,
+                        first_byte: self.byte,
+                        host_ns,
+                        data: c.data,
+                    };
+                    if self.cfg.transfer_event_every > 0
+                        && self.seq.is_multiple_of(self.cfg.transfer_event_every as u64)
+                    {
+                        self.emit(StreamEvent::Transfer {
+                            seq: self.seq,
+                            bytes: len,
+                            byte: self.byte,
+                            host_ns,
+                        });
+                    }
+                    self.seq += 1;
+                    self.byte += len as u64;
+                    let (push, spare) = self.sink.push(block);
+                    match push {
+                        Push::Queued => {}
+                        Push::DroppedOldest(_, n) => {
+                            self.pending_drop.0 += 1;
+                            self.pending_drop.1 += n as u64;
+                        }
+                        Push::DroppedNew => {
+                            self.pending_drop.0 += 1;
+                            self.pending_drop.1 += len as u64;
+                        }
+                    }
+                    self.session_blocks += 1;
+                    let interval = (prev_completion_ns != 0).then(|| (host_ns - prev_completion_ns) as f64 * 1e-3);
+                    prev_completion_ns = host_ns;
+                    let byte = self.byte;
+                    let dropped = u64::from(push != Push::Queued);
+                    let rate = if host_ns - window.0 >= 1_000_000_000 {
+                        let r = (byte - window.1) as f64 / ((host_ns - window.0) as f64 * 1e-9);
+                        window = (host_ns, byte);
+                        Some(r)
+                    } else {
+                        None
+                    };
+                    let dropped_len = match push {
+                        Push::Queued => 0,
+                        Push::DroppedOldest(_, n) => n as u64,
+                        Push::DroppedNew => len as u64,
+                    };
+                    self.stats(|s| {
+                        s.bytes = byte;
+                        s.transfers += 1;
+                        s.dropped_blocks += dropped;
+                        s.dropped_bytes += dropped_len;
+                        s.last_completion_ns = host_ns;
+                        if let Some(i) = interval {
+                            s.interval.add(i);
+                        }
+                        if let Some(r) = rate {
+                            s.rate_bps = r;
+                        }
+                        if let Some(w) = s.watch.as_mut() {
+                            w.on_block(len);
+                        }
+                    });
+                    self.flush_drop_event(false);
+                    last_ns = host_ns;
+                    let mut buf = spare.unwrap_or_else(|| self.take_buffer());
+                    buf.resize(self.cfg.transfer_bytes, 0);
+                    link.bulk.submit(buf);
+                }
+                Err(XferError::Disconnected) => {
+                    self.stats(|s| s.transfer_errors += 1);
+                    self.emit(StreamEvent::TransferError {
+                        error: XferError::Disconnected,
+                        byte: self.byte,
+                        host_ns,
+                    });
+                    break Exit::Reconnect("device disconnected".into());
+                }
+                Err(e) => {
+                    self.stats(|s| {
+                        s.transfer_errors += 1;
+                        if e == XferError::Stall {
+                            s.stalls += 1;
+                        }
+                    });
+                    self.emit(StreamEvent::TransferError {
+                        error: e.clone(),
+                        byte: self.byte,
+                        host_ns,
+                    });
+                    let _ = link.control.stop();
+                    break Exit::Restart(e);
+                }
+            }
+        };
+        poll_stop.store(true, Ordering::Relaxed);
+        self.drain(link);
+        if let Some(p) = poller {
+            let _ = p.join();
+        }
+        self.stats(|s| s.running = false);
+        exit
+    }
+
+    fn control_failure(&self, e: HwError) -> Exit {
+        match e {
+            HwError::Disconnected(m) => Exit::Reconnect(m),
+            HwError::Transfer(XferError::Disconnected) => Exit::Reconnect("device disconnected".into()),
+            other => Exit::Reconnect(format!("control request failed: {other}")),
+        }
+    }
+
+    /// Cancels and collects every pending transfer (bounded wait).
+    fn drain(&mut self, link: &mut StreamLink) {
+        link.bulk.cancel_all();
+        let t0 = now_ns();
+        while link.bulk.pending() > 0 && now_ns() - t0 < 2_000_000_000 {
+            // Data completing during cancellation arrives after STOP; it is
+            // discarded and covered by the gap estimate.
+            let _ = link.bulk.wait_complete(Duration::from_millis(200));
+        }
+    }
+
+    fn flush_drop_event(&mut self, force: bool) {
+        let now = now_ns();
+        if self.pending_drop.0 > 0 && (force || now - self.last_drop_event_ns > 100_000_000) {
+            self.emit(StreamEvent::HostDrop {
+                blocks: self.pending_drop.0,
+                bytes: self.pending_drop.1,
+                byte: self.byte,
+                host_ns: now,
+            });
+            self.pending_drop = (0, 0);
+            self.last_drop_event_ns = now;
+        }
+    }
+
+    fn spawn_status_poller(&self, link: &mut StreamLink, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+        let ep = link.status.take();
+        let control = link.control.clone();
+        let stats = self.stats.clone();
+        let events = self.events.clone();
+        let rx = self.cfg.rx;
+        let poller = StatusPoller {
+            stats,
+            events,
+            prev: None,
+        };
+        let r = std::thread::Builder::new()
+            .name(format!("openvrx-fx2-status-rx{rx}"))
+            .spawn(move || poller.run(ep, control, stop));
+        match r {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::warn!("cannot start the status poller: {e}");
+                None
+            }
+        }
+    }
+}
+
+struct StatusPoller {
+    stats: Arc<Mutex<StreamStats>>,
+    events: Sender<StreamEvent>,
+    prev: Option<Fx2Status>,
+}
+
+impl StatusPoller {
+    fn run(mut self, mut ep: Option<Box<dyn InEndpoint>>, control: Arc<dyn ControlIo>, stop: Arc<AtomicBool>) {
+        if let Some(ep) = ep.as_mut() {
+            for _ in 0..2 {
+                ep.submit(vec![0u8; STATUS_EP_BYTES]);
+            }
+        }
+        let mut last_emit = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            let block = match ep.as_mut() {
+                Some(ep) => match ep.wait_complete(Duration::from_millis(50)) {
+                    None => continue,
+                    Some(c) => match c.status {
+                        Ok(()) => {
+                            let s = Fx2Status::decode(&c.data);
+                            let mut buf = c.data;
+                            buf.resize(STATUS_EP_BYTES, 0);
+                            ep.submit(buf);
+                            s.ok()
+                        }
+                        Err(XferError::Cancelled) | Err(XferError::Disconnected) => break,
+                        Err(e) => {
+                            log::debug!("status endpoint: {e}");
+                            if ep.clear_halt().is_err() {
+                                break;
+                            }
+                            let mut buf = c.data;
+                            buf.resize(STATUS_EP_BYTES, 0);
+                            ep.submit(buf);
+                            None
+                        }
+                    },
+                },
+                None => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    control.get_status().ok()
+                }
+            };
+            if let Some(s) = block {
+                let now = now_ns();
+                // Publish every block to stats, events at most every 250 ms.
+                let emit = now - last_emit > 250_000_000;
+                if emit {
+                    last_emit = now;
+                }
+                self.publish(s, now, emit);
+            }
+        }
+        if let Some(mut ep) = ep {
+            ep.cancel_all();
+            let t0 = now_ns();
+            while ep.pending() > 0 && now_ns() - t0 < 500_000_000 {
+                let _ = ep.wait_complete(Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn publish(&mut self, s: Fx2Status, now: u64, emit: bool) {
+        let new_full = self.prev.map_or(0, |p| s.fifo_full_since(&p));
+        // A firmware restart resets counters; ignore the wrap that implies.
+        let new_full = if new_full > 1_000_000 { 0 } else { new_full };
+        self.prev = Some(s);
+        let mut byte = 0;
+        let mut total = 0;
+        if let Ok(mut st) = self.stats.lock() {
+            st.last_status = Some(s);
+            st.fifo_full_events += new_full as u64;
+            byte = st.bytes;
+            total = st.fifo_full_events;
+            if let Some(w) = st.watch.as_mut() {
+                w.on_status(&s);
+            }
+        }
+        if new_full > 0 {
+            let _ = self.events.try_send(StreamEvent::FifoFull {
+                new_events: new_full,
+                total,
+                byte,
+                host_ns: now,
+            });
+        }
+        if emit {
+            let _ = self.events.try_send(StreamEvent::Status {
+                status: s,
+                byte,
+                host_ns: now,
+            });
+        }
+    }
+}
+
+/// Captures about `bytes` from a port in one short session (no thread):
+/// connect, queue transfers, `START`, collect completions, `STOP`. Each
+/// returned buffer is one transfer, contiguous in itself. Used by
+/// calibration, the lane self-test and receiver pairing.
+pub fn capture_once(
+    port: &mut dyn StreamPort,
+    flags: StartFlags,
+    bytes: usize,
+    transfer_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<Vec<u8>>> {
+    let tb = transfer_bytes.max(PACKET_BYTES) / PACKET_BYTES * PACKET_BYTES;
+    let mut link = port.connect()?;
+    link.control.stop()?;
+    let want = bytes.div_ceil(tb).max(1);
+    let queued = want.min(8);
+    for _ in 0..queued {
+        link.bulk.submit(vec![0u8; tb]);
+    }
+    let mut submitted = queued;
+    link.control.start(flags, 1)?;
+    let t0 = std::time::Instant::now();
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut got = 0usize;
+    let mut failure = None;
+    while got < bytes {
+        if t0.elapsed() > timeout {
+            failure = Some(HwError::Timeout(format!(
+                "captured {got} of {bytes} bytes (is the sample clock running?)"
+            )));
+            break;
+        }
+        let Some(c) = link.bulk.wait_complete(Duration::from_millis(50)) else {
+            continue;
+        };
+        match c.status {
+            Ok(()) => {
+                got += c.data.len();
+                if !c.data.is_empty() {
+                    out.push(c.data);
+                }
+                if submitted < want {
+                    link.bulk.submit(vec![0u8; tb]);
+                    submitted += 1;
+                }
+            }
+            Err(e) => {
+                failure = Some(HwError::Transfer(e));
+                break;
+            }
+        }
+    }
+    let _ = link.control.stop();
+    link.bulk.cancel_all();
+    let t1 = std::time::Instant::now();
+    while link.bulk.pending() > 0 && t1.elapsed() < Duration::from_secs(1) {
+        let _ = link.bulk.wait_complete(Duration::from_millis(50));
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fx2::endpoint::sim::SimFx2;
+    use crate::fx2::protocol::req;
+
+    fn cfg() -> StreamConfig {
+        StreamConfig {
+            transfers: 8,
+            transfer_bytes: 16 * 1024,
+            mmcss: false,
+            nominal_byte_rate: Some(8e6),
+            transfer_event_every: 4,
+            ..Default::default()
+        }
+    }
+
+    fn collect(rx: &Receiver<RawBlock>, n: usize) -> Vec<RawBlock> {
+        let mut v = Vec::new();
+        while v.len() < n {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(b) => v.push(b),
+                Err(_) => panic!("only {} of {n} blocks arrived", v.len()),
+            }
+        }
+        v
+    }
+
+    fn counter_ok(blocks: &[RawBlock]) -> bool {
+        let mut prev: Option<u16> = None;
+        for b in blocks {
+            for w in b.data.as_chunks::<2>().0 {
+                let v = u16::from_le_bytes([w[0], w[1]]);
+                if let Some(p) = prev {
+                    if v != p.wrapping_add(1) {
+                        return false;
+                    }
+                }
+                prev = Some(v);
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn capture_once_collects_bytes() {
+        let sim = SimFx2::new(20e6);
+        let mut port = sim.port();
+        let got = capture_once(&mut port, StartFlags::WIDTH16, 100_000, 16384, Duration::from_secs(2)).unwrap();
+        let total: usize = got.iter().map(Vec::len).sum();
+        assert!(total >= 100_000);
+        assert!(counter_ok(
+            &got.into_iter()
+                .enumerate()
+                .map(|(k, d)| RawBlock {
+                    rx: 0,
+                    seq: k as u64,
+                    first_byte: 0,
+                    host_ns: 0,
+                    data: d
+                })
+                .collect::<Vec<_>>()
+        ));
+        assert!(!sim.with(|d| d.running));
+        let dead = SimFx2::new(0.0);
+        let mut port = dead.port();
+        assert!(matches!(
+            capture_once(&mut port, StartFlags::WIDTH16, 1000, 16384, Duration::from_millis(200)),
+            Err(HwError::Timeout(_))
+        ));
+    }
+
+    #[test]
+    fn config_validation() {
+        assert!(cfg().validate().is_ok());
+        assert!(StreamConfig { transfers: 4, ..cfg() }.validate().is_err());
+        assert!(StreamConfig {
+            transfer_bytes: 1000,
+            ..cfg()
+        }
+        .validate()
+        .is_err());
+        assert!(StreamConfig {
+            transfer_bytes: 128 * 1024,
+            ..cfg()
+        }
+        .validate()
+        .is_err());
+        assert!(StreamConfig { watch_n: 0, ..cfg() }.validate().is_err());
+        let w = StreamConfig { watch_n: 8, ..cfg() };
+        assert!(w.start_flags().contains(StartFlags::WATCH));
+    }
+
+    #[test]
+    fn sink_drops_oldest() {
+        let (sink, rx) = block_channel(2);
+        let mk = |seq| RawBlock {
+            rx: 0,
+            seq,
+            first_byte: seq * 10,
+            host_ns: 0,
+            data: vec![0; 10],
+        };
+        assert_eq!(sink.push(mk(0)).0, Push::Queued);
+        assert_eq!(sink.push(mk(1)).0, Push::Queued);
+        let (p, spare) = sink.push(mk(2));
+        assert_eq!(p, Push::DroppedOldest(0, 10));
+        assert_eq!(spare.unwrap().len(), 10);
+        assert_eq!(rx.recv().unwrap().seq, 1);
+        assert_eq!(rx.recv().unwrap().seq, 2);
+    }
+
+    #[test]
+    fn interval_stats() {
+        let mut s = IntervalStats::default();
+        for x in [10.0, 12.0, 14.0] {
+            s.add(x);
+        }
+        assert!((s.mean_us - 12.0).abs() < 1e-9);
+        assert!((s.std_us() - 2.0).abs() < 1e-9);
+        assert_eq!((s.min_us, s.max_us), (10.0, 14.0));
+    }
+
+    #[test]
+    fn streams_contiguous_blocks() {
+        let sim = SimFx2::new(16e6);
+        let stream = Fx2Stream::start(sim.port(), cfg()).unwrap();
+        let blocks = collect(stream.blocks().unwrap(), 40);
+        for (k, b) in blocks.iter().enumerate() {
+            assert_eq!(b.seq, k as u64);
+            assert_eq!(b.first_byte, k as u64 * 16384);
+            assert_eq!(b.data.len(), 16384);
+        }
+        assert!(blocks.windows(2).all(|w| w[1].host_ns >= w[0].host_ns));
+        assert!(counter_ok(&blocks));
+        let st = stream.stop();
+        assert!(st.transfers >= 40);
+        assert_eq!(st.dropped_blocks, 0);
+        assert!(st.interval.count > 30);
+        // START was sent with 16-bit width, then STOP at the end.
+        let reqs = sim.with(|d| d.requests.clone());
+        assert!(reqs.iter().any(|r| r.0 == req::START && r.1 & 1 == 1));
+        assert_eq!(reqs.iter().filter(|r| r.0 == req::START).count(), 1);
+        assert_eq!(reqs.last().unwrap().0, req::STOP);
+    }
+
+    #[test]
+    fn slow_consumer_drops_and_counts() {
+        let sim = SimFx2::new(64e6);
+        let stream = Fx2Stream::start(sim.port(), cfg()).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let rx = stream.blocks().unwrap().clone();
+        let got: Vec<RawBlock> = rx.try_iter().collect();
+        let st = stream.stop();
+        assert!(st.dropped_blocks > 0, "{st:?}");
+        // The queued blocks are the newest ones and still in order.
+        assert!(got.windows(2).all(|w| w[1].seq > w[0].seq));
+        assert!(got.windows(2).all(|w| w[1].first_byte > w[0].first_byte));
+        assert_eq!(st.bytes, st.transfers * 16384);
+    }
+
+    #[test]
+    fn recovers_from_stall_and_disconnect() {
+        let sim = SimFx2::new(16e6);
+        sim.with(|d| {
+            d.faults.push_back((10, XferError::Stall));
+            d.faults.push_back((30, XferError::Disconnected));
+        });
+        let stream = Fx2Stream::start(
+            sim.port(),
+            StreamConfig {
+                reconnect_min_ms: 20,
+                ..cfg()
+            },
+        )
+        .unwrap();
+        sim.with(|d| d.connect_failures = 2);
+        let blocks = collect(stream.blocks().unwrap(), 60);
+        // seq and first_byte stay monotonic across recovery.
+        assert!(blocks.windows(2).all(|w| w[1].seq == w[0].seq + 1));
+        assert!(blocks.windows(2).all(|w| w[1].first_byte == w[0].first_byte + 16384));
+        let events: Vec<StreamEvent> = stream.events().try_iter().collect();
+        let st = stream.stop();
+        assert_eq!(st.stalls, 1);
+        assert_eq!(st.disconnects, 1);
+        assert!(st.restarts >= 1);
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Gap { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Reconnecting { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Transfer { .. })));
+        assert!(sim.with(|d| d.connects) >= 2);
+    }
+
+    #[test]
+    fn watch_mode_switch_and_status() {
+        let sim = SimFx2::new(8e6);
+        let stream = Fx2Stream::start(sim.port(), cfg()).unwrap();
+        let rx = stream.blocks().unwrap().clone();
+        collect(&rx, 5);
+        stream.set_watch(16);
+        collect(&rx, 10);
+        std::thread::sleep(Duration::from_millis(100));
+        let st = stream.stats();
+        let w = st.watch.clone().expect("watch ledger");
+        assert_eq!(w.watch_n, 16);
+        assert!(w.packets_received > 0);
+        assert_eq!(w.source_packet(3), 48);
+        assert_eq!(w.packet_index(w.start_byte + 1024), Some(2));
+        assert!(st.last_status.is_some());
+        assert_eq!(sim.with(|d| d.watch_n), 16);
+        let events: Vec<StreamEvent> = stream.events().try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::WatchChanged { watch_n: 16, .. })));
+        drop(stream);
+    }
+
+    #[test]
+    fn reports_no_data() {
+        let sim = SimFx2::new(0.0);
+        let stream = Fx2Stream::start(
+            sim.port(),
+            StreamConfig {
+                no_data_ms: 100,
+                ..cfg()
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let events: Vec<StreamEvent> = stream.events().try_iter().collect();
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::NoData { .. })),
+            "{events:?}"
+        );
+        drop(stream);
+    }
+
+    #[test]
+    fn watch_ledger_reconciles() {
+        let mut w = WatchLedger::new(8, 1000);
+        w.on_block(512 * 4);
+        let s = Fx2Status {
+            packets_committed: 104,
+            packets_skipped: 700,
+            ..Default::default()
+        };
+        w.on_status(&s);
+        assert_eq!(w.packets_committed, 4);
+        let s2 = Fx2Status {
+            packets_committed: 110,
+            packets_skipped: 742,
+            ..Default::default()
+        };
+        w.on_status(&s2);
+        assert_eq!(w.packets_committed, 10);
+        assert_eq!(w.packets_skipped, 42);
+        assert_eq!(w.outstanding(), 6);
+        assert_eq!(w.packet_index(999), None);
+    }
+}
