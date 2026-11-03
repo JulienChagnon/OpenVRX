@@ -422,3 +422,402 @@ pub enum Agc {
     },
 }
 
+impl Default for Agc {
+    fn default() -> Self {
+        Agc::Loop {
+            target_rms: 220.0,
+            low_rms: 160.0,
+            high_rms: 288.0,
+            period_s: 0.25,
+            initial: None,
+        }
+    }
+}
+
+/// Sampling-phase lottery at start-up.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Lottery {
+    /// Mixed with this probability (3 in 10 by default).
+    Random { p_mixed: f64 },
+    /// Always a clean position.
+    Clean,
+    /// Always the position that latches while lanes change.
+    Mixed,
+}
+
+impl Default for Lottery {
+    fn default() -> Self {
+        Lottery::Random { p_mixed: 0.3 }
+    }
+}
+
+impl std::str::FromStr for Lottery {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "random" => Ok(Lottery::default()),
+            "clean" => Ok(Lottery::Clean),
+            "mixed" => Ok(Lottery::Mixed),
+            other => Err(format!("unknown lottery `{other}` (random|clean|mixed)")),
+        }
+    }
+}
+
+/// Sample clock and lane timing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SamplingConfig {
+    pub lottery: Lottery,
+    /// RMS lane-to-lane skew in 240 MHz ticks (4.17 ns).
+    pub lane_skew_ticks: f64,
+    /// RMS clock jitter per edge in ticks.
+    pub jitter_ticks: f64,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        SamplingConfig {
+            lottery: Lottery::default(),
+            lane_skew_ticks: 0.12,
+            jitter_ticks: 0.03,
+        }
+    }
+}
+
+/// USB loss: chunks of 512-byte packets dropped at random times.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsbLoss {
+    /// Mean loss events per second (0 = none).
+    pub rate_per_s: f64,
+    /// Packets lost per event, drawn uniformly in 1..=max.
+    pub max_packets: u32,
+}
+
+impl Default for UsbLoss {
+    fn default() -> Self {
+        UsbLoss {
+            rate_per_s: 0.0,
+            max_packets: 8,
+        }
+    }
+}
+
+/// One receiver (C5 + FX2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RxConfig {
+    pub preset: LanePreset,
+    /// PARLIO divider of the 240 MHz PLL.
+    pub divider: u32,
+    pub filter: ChannelFilter,
+    /// C/N offset of this receiver relative to the channel, dB.
+    pub cn_offset_db: f64,
+    pub antenna: AntennaPattern,
+    /// Crystal error in ppm (None: drawn in +-15 ppm). Sets the sample
+    /// clock against the transmitter and, unless `lo_offset_hz` is given,
+    /// the LO error (ppm x channel frequency).
+    pub crystal_ppm: Option<f64>,
+    /// Crystal drift, ppm per second.
+    pub ppm_drift_per_s: f64,
+    /// LO error in Hz (None: from the crystal).
+    pub lo_offset_hz: Option<f64>,
+    /// Stream start delay against rx0's start, microseconds (None: drawn
+    /// in 0..500 us; rx0 always 0).
+    pub start_delay_us: Option<f64>,
+    pub agc: Agc,
+    /// Gain index step in dB (assumed C5 gain law).
+    pub gain_step_db: f64,
+    /// Gain index at which `noise_floor_rms` is specified.
+    pub gain_ref: u32,
+    pub gain_min: u32,
+    pub gain_max: u32,
+    /// Thermal noise after the normal channel filter, complex RMS in
+    /// 10-bit ADC units at `gain_ref`.
+    pub noise_floor_rms: f64,
+    /// I DC offset table: (gain index, offset in 8-bit units), linear
+    /// between points and extrapolated beyond.
+    pub dc_i_table: Vec<(f64, f64)>,
+    /// Q DC offset in 10-bit units.
+    pub dc_q: f64,
+    /// Scale of this receiver's DC table.
+    pub dc_scale: f64,
+    /// ADC bits that carry information (from the top); lower bits read 0.
+    pub adc_live_bits: u32,
+    pub sampling: SamplingConfig,
+    pub usb_loss: UsbLoss,
+    /// Command-to-effect latency used for event byte positions, ms.
+    pub command_latency_ms: f64,
+    pub board: String,
+    pub antenna_name: String,
+}
+
+impl Default for RxConfig {
+    fn default() -> Self {
+        RxConfig {
+            preset: LanePreset::I7Q7,
+            divider: 18,
+            filter: ChannelFilter::Normal,
+            cn_offset_db: 0.0,
+            antenna: AntennaPattern::default(),
+            crystal_ppm: None,
+            ppm_drift_per_s: 0.0,
+            lo_offset_hz: None,
+            start_delay_us: None,
+            agc: Agc::default(),
+            gain_step_db: 0.5,
+            gain_ref: 64,
+            gain_min: 40,
+            gain_max: 80,
+            noise_floor_rms: 12.0,
+            dc_i_table: vec![(64.0, 20.0), (68.0, 32.0), (77.0, 85.0)],
+            dc_q: 1.0,
+            dc_scale: 1.0,
+            adc_live_bits: 8,
+            sampling: SamplingConfig::default(),
+            usb_loss: UsbLoss::default(),
+            command_latency_ms: 1.0,
+            board: "sim".into(),
+            antenna_name: "sim".into(),
+        }
+    }
+}
+
+/// A command or marker at a time (receiver time of the target receiver).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledEvent {
+    pub t_s: f64,
+    /// Target receiver (None: all receivers; markers are session-wide).
+    #[serde(default)]
+    pub rx: Option<u8>,
+    pub action: Action,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Action {
+    Gain { index: u32 },
+    Tune { mhz: u32, offset_khz: i32 },
+    Clk { divider: u32 },
+    Slip { count: u32 },
+    Marker { text: String },
+}
+
+impl SimConfig {
+    /// Named presets: `clean`, `edge`, `flyout`, `diversity`, `multipath`,
+    /// `demo`, `glitch`.
+    pub fn preset(name: &str) -> Result<SimConfig, SimError> {
+        let mut c = SimConfig::default();
+        match name {
+            "clean" => {
+                c.channel.cn_db = 25.0;
+                for r in &mut c.receivers {
+                    r.sampling.lottery = Lottery::Clean;
+                }
+            }
+            "edge" => {
+                c.channel.cn_db = 7.0;
+                c.picture = PictureConfig::Scene;
+            }
+            "flyout" => {
+                c.seconds = 10.0;
+                c.channel.cn_db = 24.0;
+                c.channel.scenario = Scenario::Flyout {
+                    depth_db: 22.0,
+                    period_s: 10.0,
+                };
+                c.channel.fading = Fading {
+                    kind: FadingKind::Rician,
+                    doppler_hz: 40.0,
+                    k_db: 6.0,
+                };
+                c.picture = PictureConfig::Scene;
+                c.osd = true;
+            }
+            "diversity" => {
+                c.seconds = 2.0;
+                c.channel.cn_db = 10.0;
+                c.channel.fading = Fading {
+                    kind: FadingKind::Rayleigh,
+                    doppler_hz: 30.0,
+                    k_db: 0.0,
+                };
+                c.receivers = vec![RxConfig::default(), RxConfig::default()];
+                c.receivers[1].antenna.offset_db = -2.0;
+                c.picture = PictureConfig::Scene;
+            }
+            "multipath" => {
+                c.channel.cn_db = 18.0;
+                c.channel.multipath = Some(Multipath::default());
+                c.picture = PictureConfig::Multiburst;
+            }
+            "demo" => {
+                c.seconds = 60.0;
+                c.channel.cn_db = 16.0;
+                c.channel.scenario = Scenario::Orbit {
+                    depth_db: 10.0,
+                    period_s: 8.0,
+                };
+                c.channel.fading = Fading {
+                    kind: FadingKind::Rician,
+                    doppler_hz: 20.0,
+                    k_db: 8.0,
+                };
+                c.picture = PictureConfig::Scene;
+                c.osd = true;
+                for r in &mut c.receivers {
+                    r.sampling.lottery = Lottery::Clean;
+                }
+            }
+            "glitch" => {
+                for r in &mut c.receivers {
+                    r.sampling.lottery = Lottery::Mixed;
+                }
+                c.events.push(ScheduledEvent {
+                    t_s: 0.5,
+                    rx: None,
+                    action: Action::Slip { count: 1 },
+                });
+            }
+            other => {
+                return Err(SimError::Config(format!(
+                    "unknown preset `{other}` (clean|edge|flyout|diversity|multipath|demo|glitch)"
+                )))
+            }
+        }
+        Ok(c)
+    }
+
+    pub const PRESETS: [&'static str; 7] =
+        ["clean", "edge", "flyout", "diversity", "multipath", "demo", "glitch"];
+
+    /// Checks ranges.
+    pub fn validate(&self) -> Result<(), SimError> {
+        let bad = |m: String| Err(SimError::Config(m));
+        if !self.seconds.is_finite() || self.seconds <= 0.0 {
+            return bad(format!("seconds must be > 0 (got {})", self.seconds));
+        }
+        if self.receivers.is_empty() || self.receivers.len() > 8 {
+            return bad("1 to 8 receivers".into());
+        }
+        if !(self.vtx.deviation > 0.0 && self.vtx.deviation < 4.0) {
+            return bad(format!("deviation {} out of range", self.vtx.deviation));
+        }
+        if self.vtx.blank_hz.abs() > 10e6 {
+            return bad("blank_hz beyond +-10 MHz".into());
+        }
+        if self.channel.fading.doppler_hz < 0.0 || self.channel.fading.doppler_hz > 5000.0 {
+            return bad("doppler_hz out of 0..5000".into());
+        }
+        if let Some(m) = &self.channel.multipath {
+            if !(0.0..=2000.0).contains(&m.delay_ns) {
+                return bad("multipath delay must be 0..2000 ns".into());
+            }
+        }
+        if let Some(pe) = &self.vtx.pre_emphasis {
+            if !(pe.zero_hz > 0.0 && pe.pole_hz > pe.zero_hz && pe.pole_hz < 20e6) {
+                return bad("pre-emphasis needs 0 < zero < pole < 20 MHz".into());
+            }
+        }
+        for (k, r) in self.receivers.iter().enumerate() {
+            if !(3..=255).contains(&r.divider) {
+                return bad(format!("rx{k}: divider {} out of 3..255", r.divider));
+            }
+            if r.gain_min > r.gain_max {
+                return bad(format!("rx{k}: gain_min > gain_max"));
+            }
+            if !(1..=10).contains(&r.adc_live_bits) {
+                return bad(format!("rx{k}: adc_live_bits 1..10"));
+            }
+            if r.noise_floor_rms.is_nan() || r.noise_floor_rms <= 0.0 {
+                return bad(format!("rx{k}: noise_floor_rms must be > 0"));
+            }
+            if let Some(p) = r.crystal_ppm {
+                if p.abs() > 500.0 {
+                    return bad(format!("rx{k}: crystal_ppm beyond 500"));
+                }
+            }
+            if let Agc::Loop {
+                low_rms, high_rms, target_rms, period_s, ..
+            } = r.agc
+            {
+                if !(low_rms < target_rms && target_rms < high_rms && period_s > 0.0) {
+                    return bad(format!("rx{k}: AGC needs low < target < high, period > 0"));
+                }
+            }
+            if let Lottery::Random { p_mixed } = r.sampling.lottery {
+                if !(0.0..=1.0).contains(&p_mixed) {
+                    return bad(format!("rx{k}: p_mixed must be 0..1"));
+                }
+            }
+        }
+        for e in &self.events {
+            if let Some(rx) = e.rx {
+                if rx as usize >= self.receivers.len() {
+                    return bad(format!("event for rx{rx}, which does not exist"));
+                }
+            }
+            if let Action::Clk { divider } = e.action {
+                if !(3..=255).contains(&divider) {
+                    return bad(format!("clk divider {divider} out of 3..255"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets the number of receivers, copying rx0's settings.
+    pub fn set_receiver_count(&mut self, n: usize) {
+        let proto = self.receivers.first().cloned().unwrap_or_default();
+        self.receivers.resize(n.max(1), proto);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_validate_and_round_trip() {
+        for p in SimConfig::PRESETS {
+            let c = SimConfig::preset(p).unwrap();
+            c.validate().unwrap();
+            let j = serde_json::to_string(&c).unwrap();
+            let back: SimConfig = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, c, "{p}");
+        }
+        assert!(SimConfig::preset("nope").is_err());
+    }
+
+    #[test]
+    fn partial_json_uses_defaults() {
+        let c: SimConfig = serde_json::from_str(
+            r#"{"standard":"pal","picture":{"kind":"image","path":"x.png"},
+                "receivers":[{"preset":"8x8","divider":12}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.standard, VideoStandard::Pal);
+        assert_eq!(c.receivers[0].divider, 12);
+        assert_eq!(c.receivers[0].gain_ref, 64);
+        assert!(serde_json::from_str::<SimConfig>(r#"{"sedd":1}"#).is_err());
+    }
+
+    #[test]
+    fn scenarios() {
+        let f = Scenario::Flyout {
+            depth_db: 20.0,
+            period_s: 10.0,
+        };
+        assert!(f.offset_db(0.0).abs() < 1e-9);
+        assert!((f.offset_db(5.0) + 20.0).abs() < 1e-9);
+        let c = Scenario::Curve {
+            points: vec![(0.0, 0.0), (1.0, -10.0)],
+        };
+        assert_eq!(c.offset_db(0.5), -5.0);
+        assert_eq!(c.offset_db(3.0), -10.0);
+        assert!("flyout".parse::<Scenario>().is_ok());
+        assert!(matches!("image:a.png".parse::<PictureConfig>(), Ok(PictureConfig::Image { .. })));
+    }
+}
