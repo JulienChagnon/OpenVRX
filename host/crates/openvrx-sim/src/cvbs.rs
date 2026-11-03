@@ -290,3 +290,256 @@ impl Encoder {
             }
         }
 
+        // Picture.
+        if layout.content == Content::Blank {
+            return;
+        }
+        let ar = p.active_range();
+        let width = ar.len();
+        let (a_us, b_us) = match layout.content {
+            Content::Full => (p.active_start_us, p.active_start_us + p.active_us),
+            Content::FirstHalf => (p.active_start_us, 0.5 * h_us - 1.5),
+            Content::SecondHalf => (0.5 * h_us, p.active_start_us + p.active_us),
+            Content::Blank => unreachable!(),
+        };
+        let row = field_row(p, fl);
+        // Picture samples padded by the filter half-length on both sides.
+        let pad = self.luma_fir.len() / 2;
+        let n = width + 2 * pad;
+        let mut y = vec![0.0f32; n];
+        let mut u = vec![0.0f32; n];
+        let mut v = vec![0.0f32; n];
+        if let (Some(img), Some(r)) = (field, row) {
+            let src = &img[r * width..(r + 1) * width];
+            for (k, px) in src.iter().enumerate() {
+                y[pad + k] = px.y;
+                u[pad + k] = px.u;
+                v[pad + k] = px.v;
+            }
+        }
+        let span = (p.white_ire - self.black_ire) as f64;
+        if self.camera_noise_ire > 0.0 {
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(crate::dsp::mix_seed(&[self.seed, 0xCA, abs_line]));
+            let sy = self.camera_noise_ire / span as f32;
+            for k in pad..pad + width {
+                let a: f32 = rng.sample(StandardNormal);
+                let b: f32 = rng.sample(StandardNormal);
+                let c: f32 = rng.sample(StandardNormal);
+                y[k] += sy * a;
+                u[k] += 0.5 * sy * b;
+                v[k] += 0.5 * sy * c;
+            }
+        }
+        // Band-limit along the line (arrays are zero padded by `pad`, the
+        // filters' half length, so the convolution needs no checks).
+        let conv = |x: &[f32], h: &[f32]| -> Vec<f32> {
+            let m = h.len() / 2;
+            let mut out = vec![0.0f32; x.len()];
+            for k in m..x.len() - m {
+                let src = &x[k - m..k - m + h.len()];
+                let mut acc = 0.0f32;
+                for j in 0..h.len() {
+                    acc += h[j] * src[j];
+                }
+                out[k] = acc;
+            }
+            out
+        };
+        let yf = conv(&y, &self.luma_fir);
+        let (uf, vf) = if self.colour {
+            (conv(&u, &self.chroma_fir), conv(&v, &self.chroma_fir))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let dph = p.fsc_per_sample();
+        let pal_sign = if abs_line & 1 == 0 { 1.0 } else { -1.0 };
+        let lo = ((a_us - self.blank_edge_us) / us_per).floor().max(0.0) as usize;
+        let hi = (((b_us + self.blank_edge_us) / us_per).ceil() as usize).min(spl);
+        let ph0 = self.subcarrier_phase(g0 + lo as u64);
+        for (i, o) in out.iter_mut().enumerate().take(hi).skip(lo) {
+            let t = i as f64 * us_per;
+            let w = window(t, a_us, b_us, self.blank_edge_us);
+            if w <= 0.0 {
+                continue;
+            }
+            // Picture sample k sits at grid sample ar.start + k.
+            let k = i as isize - ar.start as isize + pad as isize;
+            if k < 0 || k as usize >= n {
+                *o += (w * self.black_ire as f64) as f32;
+                continue;
+            }
+            let k = k as usize;
+            let mut val = self.black_ire as f64 + span * yf[k] as f64;
+            if self.colour {
+                let (sn, cs) = sincos_turns(ph0 + (i - lo) as f64 * dph);
+                let vs = match self.standard {
+                    VideoStandard::Ntsc => 1.0,
+                    VideoStandard::Pal => pal_sign,
+                };
+                val += span * (uf[k] as f64 * sn as f64 + vs * vf[k] as f64 * cs as f64);
+            }
+            *o += (w * val) as f32;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openvrx_core::standard::{NTSC, PAL};
+
+    fn enc(std: VideoStandard) -> Encoder {
+        Encoder::new(std, &CvbsConfig::default(), 3)
+    }
+
+    fn flat_field(std: VideoStandard, y: f32, u: f32, v: f32) -> Vec<Yuv> {
+        let p = std.params();
+        vec![Yuv { y, u, v }; p.active_width() * p.active_lines_per_field as usize]
+    }
+
+    #[test]
+    fn vertical_interval_pulse_counts() {
+        for std in VideoStandard::ALL {
+            let p = std.params();
+            let (mut eq, mut broad, mut h) = (0, 0, 0);
+            for fl in 1..=p.lines_per_frame {
+                for pulse in line_layout(std, fl).pulses {
+                    match pulse {
+                        Pulse::Eq => eq += 1,
+                        Pulse::Broad => broad += 1,
+                        Pulse::HSync => h += 1,
+                        Pulse::None => {}
+                    }
+                }
+            }
+            // Two fields x (pre + post equalising) and two x broad.
+            let per = if std == VideoStandard::Ntsc { 6 } else { 5 };
+            assert_eq!(eq, 4 * per, "{std:?}");
+            assert_eq!(broad, 2 * per, "{std:?}");
+            // Every slot of the frame (2 per line) has a pulse except the
+            // second halves of normal lines and of the last post-eq line.
+            assert!(h > p.lines_per_frame as usize - 20);
+        }
+        // Visible lines match the core's active lines.
+        for std in VideoStandard::ALL {
+            let p = std.params();
+            let visible = (1..=p.lines_per_frame)
+                .filter(|&fl| line_layout(std, fl).content != Content::Blank)
+                .count();
+            assert_eq!(visible, p.frame_height());
+        }
+    }
+
+    #[test]
+    fn levels_sync_blank_white() {
+        for std in VideoStandard::ALL {
+            let p = std.params();
+            let e = enc(std);
+            let field = flat_field(std, 1.0, 0.0, 0.0);
+            let fl = p.first_active_line[0] + 10;
+            let mut out = vec![0.0; p.samples_per_line];
+            e.render_line(fl as u64 - 1, Some(&field), &mut out);
+            let tip = p.sync_tip_range();
+            for i in tip {
+                assert!((out[i] - p.sync_ire).abs() < 0.01, "{std:?} sync {}", out[i]);
+            }
+            for i in p.back_porch_range() {
+                assert!(out[i].abs() < 0.01, "{std:?} porch {}", out[i]);
+            }
+            let mid = p.active_range().start + p.active_width() / 2;
+            assert!((out[mid] - 100.0).abs() < 0.2, "{std:?} white {}", out[mid]);
+            // Black with setup for NTSC.
+            let field = flat_field(std, 0.0, 0.0, 0.0);
+            e.render_line(fl as u64 - 1, Some(&field), &mut out);
+            assert!((out[mid] - e.black_ire()).abs() < 0.05);
+            // 0H is the 50 % point of the falling sync edge: the previous
+            // line's last sample and this line's first are each side of it.
+            assert!(out[0] < p.sync_ire * 0.3 && out[0] > p.sync_ire * 0.7);
+        }
+    }
+
+    #[test]
+    fn burst_amplitude_and_phase() {
+        let p = &NTSC;
+        let e = enc(VideoStandard::Ntsc);
+        let mut a = vec![0.0; p.samples_per_line];
+        let mut b = vec![0.0; p.samples_per_line];
+        e.render_line(40, None, &mut a);
+        e.render_line(41, None, &mut b);
+        let br = p.burst_range();
+        let mid = br.start + 10..br.end - 10;
+        let peak = mid.clone().map(|i| a[i].abs()).fold(0.0, f32::max);
+        assert!((peak - 20.0).abs() < 0.5, "{peak}");
+        // NTSC: subcarrier flips 180 degrees from line to line on the grid.
+        for i in mid {
+            assert!((a[i] + b[i]).abs() < 0.05, "{} {}", a[i], b[i]);
+        }
+    }
+
+    #[test]
+    fn pal_v_switch_and_grid_slip() {
+        let p = &PAL;
+        let e = enc(VideoStandard::Pal);
+        // Grid slip: phase at the same grid sample one line later advances
+        // by 1135 x fsc_per_sample = 283.75 + 0.0016 cycles.
+        let d = e.subcarrier_phase(1135 + 300) - e.subcarrier_phase(300);
+        let expect = (1135.0 * p.fsc_per_sample()).fract();
+        assert!(((d.rem_euclid(1.0)) - expect).abs() < 1e-9);
+        // Burst phase alternates +-135: the V component flips.
+        let mut a = vec![0.0; p.samples_per_line];
+        let mut b = vec![0.0; p.samples_per_line];
+        e.render_line(100, None, &mut a);
+        e.render_line(101, None, &mut b);
+        let br = p.burst_range();
+        // Demodulate V (cos) and U (sin) over the burst.
+        let demod = |x: &[f32], line: u64| {
+            let (mut su, mut sv) = (0.0, 0.0);
+            for (i, &xi) in x.iter().enumerate().take(br.end - 8).skip(br.start + 8) {
+                let ph = std::f64::consts::TAU * e.subcarrier_phase(line * 1135 + i as u64);
+                su += xi as f64 * ph.sin();
+                sv += xi as f64 * ph.cos();
+            }
+            (su, sv)
+        };
+        let (ua, va) = demod(&a, 100);
+        let (ub, vb) = demod(&b, 101);
+        assert!(ua < 0.0 && ub < 0.0, "burst on -U");
+        assert!(va * vb < 0.0, "V switch");
+        assert!((ua - ub).abs() / ua.abs() < 0.05);
+    }
+
+    #[test]
+    fn chroma_amplitude_matches_uv() {
+        let p = &PAL;
+        let e = enc(VideoStandard::Pal);
+        let field = flat_field(VideoStandard::Pal, 0.5, 0.2, 0.0);
+        let mut out = vec![0.0; p.samples_per_line];
+        e.render_line(100, Some(&field), &mut out);
+        let a = p.active_range();
+        let mid = a.start + 200..a.start + 400;
+        let n = mid.len() as f32;
+        let mean: f32 = mid.clone().map(|i| out[i]).sum::<f32>() / n;
+        let rms = (mid.map(|i| (out[i] - mean).powi(2)).sum::<f32>() / n).sqrt();
+        assert!((mean - 50.0).abs() < 0.5, "{mean}");
+        assert!((rms * std::f32::consts::SQRT_2 - 20.0).abs() < 0.3, "{rms}");
+    }
+
+    #[test]
+    fn camera_noise_is_seeded() {
+        let cfg = CvbsConfig {
+            camera_noise_ire: 2.0,
+            ..Default::default()
+        };
+        let e = Encoder::new(VideoStandard::Ntsc, &cfg, 9);
+        let field = flat_field(VideoStandard::Ntsc, 0.5, 0.0, 0.0);
+        let mut a = vec![0.0; 910];
+        let mut b = vec![0.0; 910];
+        e.render_line(50, Some(&field), &mut a);
+        e.render_line(50, Some(&field), &mut b);
+        assert_eq!(a, b);
+        let mid = &a[300..600];
+        let mean: f32 = mid.iter().sum::<f32>() / 300.0;
+        let var: f32 = mid.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / 300.0;
+        assert!(var.sqrt() > 0.3 && var.sqrt() < 2.5, "{}", var.sqrt());
+    }
+}
