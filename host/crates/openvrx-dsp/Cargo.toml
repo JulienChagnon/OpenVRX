@@ -1,0 +1,24 @@
+[package]
+name = "openvrx-dsp"
+description = "OpenVRX per-receiver DSP: unpack, DC and I/Q correction, AFC, channel filter, FM demodulators, click repair, sync and time-base correction, line quality, phase probe, pre-detection combining"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Exposes the synthetic CVBS/FM/C5 test-signal generator to other crates.
+testsig = []
+
+[dependencies]
+openvrx-core = { path = "../openvrx-core" }
+serde = { version = "1", features = ["derive"] }
+rustfft = "6.4"
+wide = "0.7"
+
+[dev-dependencies]
+serde_json = "1"
+
+[[example]]
+name = "bench"
+required-features = ["testsig"]
