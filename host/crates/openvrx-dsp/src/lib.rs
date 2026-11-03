@@ -663,3 +663,546 @@ impl RxDsp {
         s
     }
 
+    pub fn config(&self) -> &RxDspConfig {
+        &self.cfg
+    }
+
+    /// The back half, for control operations between blocks (it is idle
+    /// then: every push drains it before returning).
+    fn back(&self) -> MutexGuard<'_, Back> {
+        lock(&self.back)
+    }
+
+    /// Replaces the configuration. The chain restarts (sync re-acquires).
+    pub fn set_config(&mut self, cfg: RxDspConfig) {
+        let mut fresh = RxDsp::new(self.rx, cfg);
+        fresh.in_index = self.in_index;
+        fresh.seg_start = self.in_index;
+        fresh.bytes = self.bytes;
+        fresh.gaps = self.gaps;
+        fresh.lost_samples = self.lost_samples;
+        fresh.gain_steps = self.gain_steps;
+        fresh.tap = self.tap;
+        fresh.shift_hist.clear();
+        fresh.shift_hist.push_back((self.in_index, fresh.nco.shift_hz()));
+        fresh.tuned = self.tuned;
+        fresh.back().tbc.append(self.in_index, &[], &[], &[], &[]);
+        *self = fresh;
+        self.restart_chain(self.lut_path);
+    }
+
+    /// Recomputes delays and clears filter states (stream restart point).
+    fn restart_chain(&mut self, lut: bool) {
+        self.lut_path = lut;
+        self.chan.reset();
+        self.demod.reset();
+        self.clicks.reset();
+        let dc = if lut { 0 } else { self.chan.delay() };
+        self.d_pre = dc + self.demod.extra_delay();
+        self.d_clicks = self.clicks.delay();
+        let total = self.total_delay();
+        self.back().restart(total);
+        self.mag_delay_c = Delay::new(self.d_clicks, 0.0);
+        self.seg_start = self.in_index;
+    }
+
+    fn total_delay(&self) -> usize {
+        self.d_pre + self.d_clicks + self.d_video
+    }
+
+    /// Feeds raw FX2 bytes. Completed lines are appended to `out`.
+    pub fn push_bytes(&mut self, data: &[u8], host_ns: u64, out: &mut Vec<LineRecord>) {
+        let t0 = Instant::now();
+        self.bytes += data.len() as u64;
+        let want_words = self.cfg.demod == DemodKind::LutAngle;
+        let mut re = std::mem::take(&mut self.re);
+        let mut im = std::mem::take(&mut self.im);
+        let mut words = std::mem::take(&mut self.words);
+        re.clear();
+        im.clear();
+        words.clear();
+        self.unpack.push(data, &mut re, &mut im, want_words.then_some(&mut words));
+        self.run(&mut re, &mut im, want_words.then_some(&words[..]), host_ns, out);
+        self.re = re;
+        self.im = im;
+        self.words = words;
+        self.account(t0);
+    }
+
+    /// Feeds complex samples (10-bit ADC units), e.g. from the
+    /// pre-detection combiner.
+    pub fn push_iq(&mut self, iq: &[Complex32], host_ns: u64, out: &mut Vec<LineRecord>) {
+        let t0 = Instant::now();
+        let mut re = std::mem::take(&mut self.re);
+        let mut im = std::mem::take(&mut self.im);
+        re.clear();
+        im.clear();
+        re.extend(iq.iter().map(|z| z.re));
+        im.extend(iq.iter().map(|z| z.im));
+        self.run(&mut re, &mut im, None, host_ns, out);
+        self.re = re;
+        self.im = im;
+        self.account(t0);
+    }
+
+    fn account(&mut self, t0: Instant) {
+        self.proc_ns += t0.elapsed().as_nanos() as u64;
+        let win = (self.cfg.stats_window_ms as f64 * 1e-3 * self.fs) as u64;
+        if self.proc_samples >= win.max(1) {
+            let real_ns = self.proc_samples as f64 / self.fs * 1e9;
+            self.load = (self.proc_ns as f64 / real_ns) as f32;
+            let (c0, s0) = self.clicks_window;
+            let ds = self.in_index.saturating_sub(s0).max(1);
+            self.clicks_rate = ((self.clicks_seen - c0) as f64 * self.fs / ds as f64) as f32;
+            self.clicks_window = (self.clicks_seen, self.in_index);
+            self.proc_ns = 0;
+            self.proc_samples = 0;
+        }
+    }
+
+    fn run(&mut self, re: &mut [f32], im: &mut [f32], words: Option<&[u16]>, host_ns: u64, out: &mut Vec<LineRecord>) {
+        let b = self.cfg.block.max(256);
+        let mut pos = 0;
+        while pos < re.len() {
+            let e = (pos + b).min(re.len());
+            let w = words.map(|w| &w[pos..e]);
+            let mid = self.front_block(pos, e, re, im, w, host_ns, out);
+            // The back half of the previous block must be done (and its
+            // AFC applied) before this one is handed over.
+            self.finish_back(out);
+            self.submit(mid);
+            pos = e;
+        }
+        self.finish_back(out);
+    }
+
+    /// Hands a block to the back half.
+    fn submit(&mut self, mid: Mid) {
+        let failed = match &mut self.runner {
+            Runner::Inline { pending } => {
+                *pending = Some(mid);
+                None
+            }
+            Runner::Thread { jobs, busy, .. } => match jobs.as_ref() {
+                Some(tx) => match tx.send(mid) {
+                    Ok(()) => {
+                        *busy = true;
+                        None
+                    }
+                    Err(e) => Some(e.0),
+                },
+                None => None,
+            },
+        };
+        if let Some(mid) = failed {
+            // Worker gone (it panicked): run inline from now on.
+            self.runner = Runner::Inline { pending: Some(mid) };
+        }
+    }
+
+    /// Waits for the back half's block in flight (if any), collects its
+    /// lines and runs the AFC on the result.
+    fn finish_back(&mut self, out: &mut Vec<LineRecord>) {
+        let mut worker_gone = false;
+        let done = match &mut self.runner {
+            Runner::Inline { pending } => match pending.take() {
+                Some(mut mid) => {
+                    let mut b = lock(&self.back);
+                    let before = out.len();
+                    b.process(&mut mid, out);
+                    let snap = b.snap();
+                    drop(b);
+                    Some((mid, out.len() - before, snap))
+                }
+                None => None,
+            },
+            Runner::Thread { done, busy, .. } => {
+                if !*busy {
+                    None
+                } else {
+                    *busy = false;
+                    match spin_recv(done, Duration::from_millis(5)) {
+                        Some(d) => {
+                            let n = d.lines.len();
+                            out.extend(d.lines);
+                            Some((d.mid, n, d.snap))
+                        }
+                        None => {
+                            worker_gone = true;
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        if worker_gone {
+            // Worker gone (it panicked): its block is lost; carry on inline.
+            self.runner = Runner::Inline { pending: None };
+        }
+        if let Some((mut mid, new_lines, snap)) = done {
+            self.snap = snap;
+            let t = Instant::now();
+            self.afc(new_lines);
+            self.stage_ns[6] += t.elapsed().as_nanos() as u64;
+            mid.clear();
+            self.spare.push(mid);
+        }
+    }
+
+    /// Front half of one block: returns the block for the back half.
+    #[allow(clippy::too_many_arguments)]
+    fn front_block(
+        &mut self,
+        a: usize,
+        b: usize,
+        re_all: &mut [f32],
+        im_all: &mut [f32],
+        words: Option<&[u16]>,
+        host_ns: u64,
+        out: &mut Vec<LineRecord>,
+    ) -> Mid {
+        let (re, im) = (&mut re_all[a..b], &mut im_all[a..b]);
+        let n = re.len();
+        let start = self.in_index;
+        let mut mid = self.spare.pop().unwrap_or_default();
+        let mut clock = Instant::now();
+        let mut lap = |s: &mut [u64; STAGES.len()], k: usize| {
+            let now = Instant::now();
+            s[k] += (now - clock).as_nanos() as u64;
+            clock = now;
+        };
+        if let Some(sp) = &mut self.spectrum {
+            sp.push(re, im);
+        }
+        mid.env.resize(n, 0.0);
+        mid.clip.resize(n, 0);
+        self.fe.process(re, im, &mut mid.env, &mut mid.clip, start);
+        lap(&mut self.stage_ns, 0);
+        self.gain_steps += self.fe.steps.len() as u64;
+        mid.steps.append(&mut self.fe.steps);
+        let lut = words.is_some() && self.cfg.demod == DemodKind::LutAngle;
+        if lut != self.lut_path {
+            // Path change: flush through a zero-length gap.
+            self.finish_back(out);
+            self.gap_internal(0);
+            self.restart_chain(lut);
+        }
+        // C/N smoothing and channel adaptation.
+        let cn_db = cn::lin_to_db(self.fe.block_cn);
+        if self.cfg.sample_format.lanes.has_magnitude() {
+            self.cn_smooth_db = if self.cn_smooth_db.is_finite() {
+                self.cn_smooth_db + 0.1 * (cn_db - self.cn_smooth_db)
+            } else {
+                cn_db
+            };
+            if !lut {
+                self.chan.adapt(self.cn_smooth_db);
+            }
+        }
+        let cn_lin = if self.cn_smooth_db.is_finite() {
+            10f64.powf(self.cn_smooth_db as f64 / 10.0)
+        } else {
+            100.0
+        };
+        let p_raw = self.fe.mean_power().max(1e-6);
+        let a2 = p_raw * cn_lin / (1.0 + cn_lin);
+        let nfrac = if lut { 1.0 } else { self.chan.noise_fraction() };
+        let n2 = (p_raw / (1.0 + cn_lin) * nfrac).max(1e-9);
+        let chs = ChannelState {
+            power: a2 + n2,
+            cn: a2 / n2,
+        };
+        let shift_now = self.nco.shift_hz();
+        self.d.resize(n, 0.0);
+        self.envd.resize(n, 0.0);
+        if lut {
+            let dc = self.fe.dc();
+            let corr = if self.cfg.iq_correction.enabled { self.fe.iq_correction() } else { (0.0, 1.0) };
+            self.demod.update_lut(dc, corr, self.step_i);
+            let w_shift = (std::f64::consts::TAU * shift_now / self.fs) as f32;
+            self.demod.process_words(words.unwrap_or(&[]), w_shift, &mut self.d);
+            self.envd.copy_from_slice(&mid.env);
+        } else {
+            self.nco.process(re, im);
+            self.chan.process(re, im);
+            power(re, im, &mut self.envd);
+            lap(&mut self.stage_ns, 1);
+            self.demod.process(re, im, chs, &mut self.d);
+        }
+        // Mean frequency (AFC acquisition) in absolute Hz.
+        let k_hz = self.fs / std::f64::consts::TAU;
+        let mean_rad = vmath::sums12(&self.d).0 / n.max(1) as f64;
+        let mean_abs = mean_rad * k_hz + shift_now;
+        if self.mean_valid {
+            self.mean_hz += 0.2 * (mean_abs - self.mean_hz);
+        } else {
+            self.mean_hz = mean_abs;
+            self.mean_valid = true;
+        }
+        lap(&mut self.stage_ns, 2);
+        // Click repair.
+        self.d2.clear();
+        let ev0 = self.clicks.events.len();
+        self.clicks.process(&self.d, &self.envd, chs.power as f32, &mut self.d2, &mut mid.dmg);
+        let pre = self.d_pre as i64;
+        for &c in &self.clicks.events[ev0..] {
+            let idx = self.seg_start as i64 + c - pre;
+            if idx >= 0 {
+                mid.clicks.push(idx as u64);
+            }
+        }
+        self.clicks_seen += (self.clicks.events.len() - ev0) as u64;
+        self.clicks.events.clear();
+        lap(&mut self.stage_ns, 3);
+        // Hz with the NCO shift added back at the right sample.
+        let d_ck = (self.d_pre + self.d_clicks) as i64;
+        mid.hz.resize(n, 0.0);
+        let first_idx = start as i64 - d_ck; // input index of d2[0]
+        while self.shift_hist.len() > 1 && (self.shift_hist[1].0 as i64) <= first_idx {
+            self.shift_hist.pop_front();
+        }
+        // Samples from `split` on use the next entry of the history.
+        let (sh0, split, sh1) = if self.shift_hist.len() > 1 {
+            let at = self.shift_hist[1].0 as i64 - first_idx;
+            (self.shift_hist[0].1, at.clamp(0, n as i64) as usize, self.shift_hist[1].1)
+        } else {
+            (self.shift_hist[0].1, n, 0.0)
+        };
+        to_hz(&self.d2[..split], k_hz, sh0, &mut mid.hz[..split]);
+        to_hz(&self.d2[split..n], k_hz, sh1, &mut mid.hz[split..n]);
+        // Envelope magnitude aligned with the click output (the back half
+        // delays it further for the video tap).
+        if self.tap.is_some() {
+            self.tmp_f.clear();
+            self.tmp_f.extend(self.envd.iter().map(|&e| e.sqrt()));
+            let mut mag_c = Vec::new();
+            self.mag_delay_c.run(&self.tmp_f, &mut mag_c);
+            if self.tap == Some(TapPoint::Demod) {
+                tap_push(&mut self.tap_buf, self.rx, self.fs, first_idx, &mid.hz, &mag_c, &mid.dmg, host_ns);
+            }
+            mid.mag_c = Some(mag_c);
+        }
+        lap(&mut self.stage_ns, 4);
+        mid.start = start;
+        mid.total = self.total_delay();
+        mid.seg_start = self.seg_start;
+        mid.host_ns = host_ns;
+        self.in_index += n as u64;
+        self.proc_samples += n as u64;
+        self.stage_samples += n as u64;
+        mid
+    }
+
+    /// Enables (Some) or disables (None) the demodulator tap.
+    pub fn set_demod_tap(&mut self, point: Option<TapPoint>) {
+        self.tap = point;
+        self.tap_buf = None;
+        self.mag_delay_c = Delay::new(self.d_clicks, 0.0);
+        let mut b = self.back();
+        b.tap_buf = None;
+        b.mag_delay_v = Delay::new(self.d_video, 0.0);
+    }
+
+    /// Takes the demodulated samples collected since the last call
+    /// (delay compensated: `first_sample` is the input sample index).
+    pub fn demod_tap(&mut self) -> Option<DemodChunk> {
+        let video = self.back().tap_buf.take();
+        self.tap_buf.take().or(video)
+    }
+
+    /// AFC: once enough lines are out, steer the NCO toward the target.
+    fn afc(&mut self, new_lines: usize) {
+        if !self.cfg.afc.enabled {
+            return;
+        }
+        let cfg = &self.cfg.afc;
+        let lim = cfg.max_shift_frac as f64 * self.fs;
+        let cur = self.nco.shift_hz();
+        let target = match (self.snap.levels, self.snap.lock) {
+            (Some((tip, blank)), LockState::Locked) => {
+                self.afc_lines += new_lines as u64;
+                if self.afc_lines < 64 {
+                    return;
+                }
+                self.afc_lines = 0;
+                match cfg.target {
+                    AfcTarget::Centre => {
+                        let std = self.snap.standard.unwrap_or(VideoStandard::Ntsc);
+                        let sync = std.params().sync_ire as f64;
+                        let white = blank + (blank - tip) * 100.0 / (-sync);
+                        0.5 * (tip + white)
+                    }
+                    AfcTarget::Porch { hz } => blank - hz as f64,
+                }
+            }
+            _ => {
+                if !self.mean_valid {
+                    return;
+                }
+                // Before sync the mean frequency sits near the middle of the
+                // video range; move it toward 0 Hz with a wider deadband.
+                if (self.mean_hz - cur).abs() < (cfg.deadband_hz as f64).max(150e3) {
+                    return;
+                }
+                self.mean_hz
+            }
+        };
+        let err = target - cur;
+        if err.abs() <= cfg.deadband_hz as f64 {
+            return;
+        }
+        let new = (cur + cfg.loop_gain as f64 * err).clamp(-lim, lim);
+        self.set_shift(new);
+    }
+
+    fn set_shift(&mut self, hz: f64) {
+        if hz == self.nco.shift_hz() {
+            return;
+        }
+        self.nco.set_shift(hz);
+        let at = self.in_index + if self.lut_path { 0 } else { self.chan.delay() as u64 };
+        self.shift_hist.push_back((at, hz));
+        while self.shift_hist.len() > 4 {
+            self.shift_hist.pop_front();
+        }
+    }
+
+    fn gap_internal(&mut self, lost: u64) {
+        // Samples still inside the filters are lost too.
+        let in_index = self.in_index;
+        let mut b = lock(&self.back);
+        let inflight = in_index.saturating_sub(b.tbc.end());
+        b.tbc.gap(inflight + lost);
+        self.snap = b.snap();
+        drop(b);
+        self.in_index += lost;
+    }
+
+    /// Declares `lost_samples` input samples missing (USB loss) before the
+    /// next pushed data. Lines touching the gap are flagged SAMPLES_LOST;
+    /// short gaps are coasted through, long ones re-acquire.
+    pub fn mark_gap(&mut self, lost_samples: u64) {
+        self.unpack.reset();
+        self.gaps += 1;
+        self.lost_samples += lost_samples;
+        self.gap_internal(lost_samples);
+        let shift = self.nco.shift_hz();
+        self.shift_hist.clear();
+        self.shift_hist.push_back((self.in_index, shift));
+        self.restart_chain(self.lut_path);
+    }
+
+    /// Control events.
+    pub fn note_event(&mut self, ev: RxEvent) {
+        match ev {
+            RxEvent::GainChanged { .. } => {
+                let until = self.in_index + (self.cfg.dc.armed_ms as f64 * 1e-3 * self.fs) as u64;
+                self.fe.arm(until);
+            }
+            RxEvent::Retuned { mhz, offset_khz } => {
+                let prev = self.tuned.replace((mhz, offset_khz));
+                match prev {
+                    Some((m, o)) if m == mhz => {
+                        // LO moved up by d: the carrier moves down by d.
+                        let d = (offset_khz - o) as f64 * 1e3;
+                        {
+                            let mut b = lock(&self.back);
+                            b.tbc.shift_levels(-d);
+                            self.snap = b.snap();
+                        }
+                        self.mean_hz -= d;
+                        let s = self.nco.shift_hz() - d;
+                        let lim = self.cfg.afc.max_shift_frac as f64 * self.fs;
+                        if self.cfg.afc.enabled {
+                            self.set_shift(s.clamp(-lim, lim));
+                        }
+                    }
+                    Some(_) => {
+                        // Another channel: start over (AFC and sync).
+                        let cfg = self.cfg.clone();
+                        self.set_config(cfg);
+                    }
+                    None => {}
+                }
+            }
+            RxEvent::Slipped { .. } => self.back().tbc.expect_jump(),
+            RxEvent::Reset => {
+                let cfg = self.cfg.clone();
+                self.set_config(cfg);
+            }
+        }
+    }
+
+    /// Latest averaged input spectrum (dB, -fs/2 .. +fs/2), if one is ready.
+    pub fn take_spectrum(&mut self) -> Option<Vec<f32>> {
+        self.spectrum.as_mut().and_then(|s| s.take())
+    }
+
+    /// Input sample index of the next pushed sample.
+    pub fn samples_in(&self) -> u64 {
+        self.in_index
+    }
+
+    pub fn stats(&self) -> RxStats {
+        let raw = self.fe.stats();
+        let snap = self.snap;
+        let rep = snap.report;
+        let (carrier, dev) = match (snap.levels, snap.standard) {
+            (Some((tip, blank)), Some(s)) => {
+                let sync = -(s.params().sync_ire as f64);
+                let pp = (blank - tip) * (sync + 100.0) / sync;
+                (blank as f32, (pp / 6.7e6) as f32)
+            }
+            _ => (f32::NAN, f32::NAN),
+        };
+        let line_rate = if rep.line_period > 0.0 { self.fs / rep.line_period } else { 0.0 };
+        let field_rate = if rep.field_lines > 0 && line_rate > 0.0 {
+            line_rate / rep.field_lines as f64
+        } else {
+            0.0
+        };
+        let has_mag = self.cfg.sample_format.lanes.has_magnitude();
+        let mut stage = self.stage_ns;
+        stage[4] += snap.video_ns;
+        stage[5] += snap.sync_ns;
+        RxStats {
+            rx: self.rx,
+            sample_rate_hz: self.fs,
+            samples_processed: self.in_index,
+            bytes_processed: self.bytes,
+            i_rms: raw.i_rms,
+            q_rms: raw.q_rms,
+            i_dc: raw.i_dc,
+            q_dc: raw.q_dc,
+            clip_pct: raw.clip_pct,
+            iq_gain_db: raw.iq_gain_db,
+            iq_phase_deg: raw.iq_phase_deg,
+            power_db: raw.power_db,
+            cn_db: if has_mag { raw.cn_db } else { f32::NAN },
+            carrier_offset_hz: carrier,
+            mean_freq_hz: self.mean_hz as f32,
+            nco_shift_hz: self.nco.shift_hz() as f32,
+            deviation_scale: dev,
+            lock: snap.lock,
+            standard: snap.standard,
+            line_rate_hz: line_rate,
+            field_rate_hz: field_rate,
+            clicks_per_s: self.clicks_rate,
+            glitch_ppm: raw.glitch_ppm,
+            wraps: self.clicks.wraps,
+            lines_out: rep.lines_out,
+            relocks: rep.relocks,
+            coasted_lines: rep.coasted_lines,
+            gaps: self.gaps,
+            lost_samples: self.lost_samples,
+            gain_steps: self.gain_steps,
+            demod: if self.lut_path { DemodKind::LutAngle } else if self.cfg.demod == DemodKind::LutAngle { DemodKind::Polar } else { self.cfg.demod },
+            channel_cutoff_hz: if self.lut_path { (0.5 * self.fs) as f32 } else { self.chan.cutoff_hz() as f32 },
+            load: self.load,
+            stage_ns: stage
+                .iter()
+                .map(|&t| t as f32 / self.stage_samples.max(1) as f32)
+                .collect(),
+        }
+    }
+}
