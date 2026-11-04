@@ -27,8 +27,32 @@
 //   step <0.25|0.5|1|10> | home | at <dB> | set <dB> | get |
 //   press <+|-> [n] | timing <press_ms> <gap_ms>
 // "get" also reports minus=yes|no, so a script can tell which setup it has.
+//
+// Test pattern (video.cpp, ntsc_frame.c): GPIO25 carries a 525-line
+// interlaced monochrome NTSC picture for the VTX's video input, from boot
+// (pattern card, 1 Vpp). DMA replays the frame, so presses never disturb it.
+//   video <on|off> | pattern <card|bars|ramp|check|grey|black|white> |
+//   amp <mV> (sync tip to white, 200..3200, default 1000) |
+//   vget (state and the measured line rate, takes 1 s)
+// Changing pattern or amp restarts the output: the receiver relocks.
+//
+// VTX control (tramp.cpp, IRC Tramp on the VTX's RX pad: P17 through
+// 1 kohm, P16 direct; measure the pad first, docs/BENCH.md):
+//   vtx (limits, channel, power, pit, temperature) | vtx mhz <MHz> |
+//   vtx ch <band><1..8> (A B E F R, e.g. R8) | vtx mw <mW> [force] |
+//   vtx pit <on|off> | vtx active <seconds>
+// Every set is confirmed by reading the status back. Above 200 mW needs
+// "force" (the VTX needs airflow there); the attenuator chain must come first.
+// Pit guard: unless a bench run holds a lease ("vtx active S", up to 600 s,
+// renewed by bench.py every step; "vtx active 0" ends it), the ESP32 checks
+// the VTX every 5 s and puts it in pit mode, so it idles cool from boot, after
+// a run, and if a run dies. "vtx pit off" without a lease is undone by the
+// next check.
 
 #include <Arduino.h>
+
+#include "tramp.h"
+#include "video.h"
 
 static const int PIN_PLUS = 32;
 static const int PIN_MINUS = -1;  // -1: no relay on the - button; 33 with a second relay
@@ -40,6 +64,110 @@ static int press_ms = 60;
 static int gap_ms = 80;
 static int unit = 1;        // attenuator step size in 0.25 dB units (1, 2, 4, 40)
 static int position = -1;   // in 0.25 dB units, -1 = unknown until "home" or "at"
+
+static ntsc_pattern_t vpattern = PAT_CARD;
+static int vamp_mv = 1000;
+static const int VAMP_MIN = 200, VAMP_MAX = 3200;  // white must stay under DAC code 255
+
+static const int VTX_MW_SAFE = 200;  // above this only with "force"
+static const uint32_t GUARD_PERIOD_MS = 5000;
+static const long LEASE_MAX_S = 600;
+static uint32_t lease_until_ms = 0;  // VTX may leave pit mode until then
+static bool lease_on = false;
+static uint32_t next_guard_ms = 0;   // 0: check at once (boot)
+
+static bool lease_active()
+{
+  if (lease_on && (int32_t)(lease_until_ms - millis()) <= 0) lease_on = false;
+  return lease_on;
+}
+
+// Puts the VTX in pit mode when no bench run holds a lease.
+static void pit_guard()
+{
+  if ((int32_t)(millis() - next_guard_ms) < 0) return;
+  next_guard_ms = millis() + GUARD_PERIOD_MS;
+  if (lease_active()) return;
+  TrampState st;
+  const char *err = tramp_set_pit(true, &st);  // reads first, sends only if needed
+  static bool reported = false;
+  if (!err && !reported) {
+    Serial.println("EVT vtx pit on (no bench run)");
+    reported = true;
+  }
+  if (err) reported = false;  // VTX off or not answering: say so again when it is back
+}
+
+static void vtx_reply(const char *err, const TrampState &st)
+{
+  if (err) {
+    Serial.printf("ERR vtx %s\n", err);
+    return;
+  }
+  Serial.print("OK vtx");
+  if (st.have_status)
+    Serial.printf(" mhz=%u conf_mw=%u actual_mw=%u pit=%d lock=%d", st.mhz, st.conf_mw, st.actual_mw,
+                  st.pit ? 1 : 0, st.race_lock ? 1 : 0);
+  if (st.have_limits) Serial.printf(" min_mhz=%u max_mhz=%u max_mw=%u", st.min_mhz, st.max_mhz, st.max_mw);
+  if (st.have_temp) Serial.printf(" temp=%d", st.temp);
+  if (lease_active()) Serial.printf(" guard=active left_s=%ld", (long)((lease_until_ms - millis()) / 1000));
+  else Serial.print(" guard=pit");
+  Serial.println();
+}
+
+static void vtx_command(String arg)
+{
+  TrampState st;
+  int sp = arg.indexOf(' ');
+  String sub = sp < 0 ? arg : arg.substring(0, sp);
+  String val = sp < 0 ? "" : arg.substring(sp + 1);
+  val.trim();
+  if (sub == "") {
+    vtx_reply(tramp_query_all(&st) ? nullptr : "no answer from the VTX (wiring, power, Tramp?)", st);
+  } else if (sub == "mhz" || sub == "ch") {
+    long mhz = sub == "mhz" ? val.toInt() : (val.length() == 2 ? tramp_band_mhz(val[0], val[1] - '0') : 0);
+    if (mhz < 5000 || mhz > 6100) {
+      Serial.println("ERR vtx mhz 5000..6100, or ch like R8 (bands A B E F R)");
+      return;
+    }
+    vtx_reply(tramp_set_mhz((uint16_t)mhz, &st), st);
+  } else if (sub == "mw") {
+    int sp2 = val.indexOf(' ');
+    long mw = (sp2 < 0 ? val : val.substring(0, sp2)).toInt();
+    bool force = sp2 > 0 && val.substring(sp2 + 1) == "force";
+    if (mw < 1 || mw > 1000) {
+      Serial.println("ERR vtx mw 1..1000");
+      return;
+    }
+    if (mw > VTX_MW_SAFE && !force) {
+      Serial.printf("ERR vtx mw above %d needs 'force' (airflow, attenuator chain first)\n", VTX_MW_SAFE);
+      return;
+    }
+    vtx_reply(tramp_set_mw((uint16_t)mw, &st), st);
+  } else if (sub == "pit" && (val == "on" || val == "off")) {
+    vtx_reply(tramp_set_pit(val == "on", &st), st);
+  } else if (sub == "active") {
+    long s = val.toInt();
+    if (s < 0 || s > LEASE_MAX_S || (s == 0 && val != "0")) {
+      Serial.printf("ERR vtx active 0..%ld seconds\n", LEASE_MAX_S);
+      return;
+    }
+    lease_on = s > 0;
+    lease_until_ms = millis() + (uint32_t)s * 1000u;
+    next_guard_ms = millis() + GUARD_PERIOD_MS;
+    vtx_reply(tramp_set_pit(!lease_on, &st), st);
+  } else {
+    Serial.println("ERR vtx [mhz N | ch R8 | mw N [force] | pit on|off | active S]");
+  }
+}
+
+// Restarts the video with the current settings and replies for cmd.
+static void video_reply(const char *cmd)
+{
+  const char *err = video_start(vpattern, vamp_mv);
+  if (err) Serial.printf("ERR %s %s\n", cmd, err);
+  else Serial.printf("OK %s video=on pattern=%s amp_mv=%d\n", cmd, ntsc_pattern_name(vpattern), vamp_mv);
+}
 
 static void drive(int pin, bool on) {
   if (pin < 0) return;
@@ -61,16 +189,22 @@ static int quarters(const String &db) {
 }
 
 void setup() {
-  // Level first, then output: the relay must not click on at boot.
-  drive(PIN_PLUS, false);
+  // Output first, then level. Arduino-ESP32 3.x ignores digitalWrite() on a
+  // pin that pinMode() has not attached yet, and pinMode(OUTPUT) starts LOW,
+  // which holds a low-level relay on (button held, attenuator auto-repeats).
+  // The LOW between the two calls lasts microseconds, far shorter than the
+  // relay's pull-in time, so it does not click.
   pinMode(PIN_PLUS, OUTPUT);
+  drive(PIN_PLUS, false);
   if (PIN_MINUS >= 0) {
-    drive(PIN_MINUS, false);
     pinMode(PIN_MINUS, OUTPUT);
+    drive(PIN_MINUS, false);
   }
   Serial.begin(115200);
   Serial.println(PIN_MINUS >= 0 ? "att_ctl ready (send 'step', then 'home' or 'at')"
                                 : "att_ctl ready, + relay only (send 'step', set the LEDs by hand, then 'at')");
+  video_reply("video");
+  tramp_begin();
 }
 
 static void handle(String line) {
@@ -152,6 +286,40 @@ static void handle(String line) {
       gap_ms = arg.substring(sp2 + 1).toInt();
     }
     Serial.printf("OK timing press_ms=%d gap_ms=%d\n", press_ms, gap_ms);
+  } else if (cmd == "video") {
+    if (arg == "on") {
+      video_reply("video");
+    } else if (arg == "off") {
+      video_stop();
+      Serial.println("OK video video=off");
+    } else {
+      Serial.println("ERR video on or off");
+    }
+  } else if (cmd == "pattern") {
+    int p = ntsc_pattern_from_name(arg.c_str());
+    if (p < 0) {
+      Serial.println("ERR pattern one of card bars ramp check grey black white");
+      return;
+    }
+    vpattern = (ntsc_pattern_t)p;
+    video_reply("pattern");
+  } else if (cmd == "amp") {
+    int mv = arg.toInt();
+    if (mv < VAMP_MIN || mv > VAMP_MAX) {
+      Serial.printf("ERR amp range %d..%d mV\n", VAMP_MIN, VAMP_MAX);
+      return;
+    }
+    vamp_mv = mv;
+    video_reply("amp");
+  } else if (cmd == "vtx") {
+    vtx_command(arg);
+  } else if (cmd == "vget") {
+    bool on = video_running();
+    float hz = video_measure_line_hz(1000);
+    Serial.printf("OK vget video=%s pattern=%s amp_mv=%d rate_hz=%u line_hz=", on ? "on" : "off",
+                  ntsc_pattern_name(vpattern), vamp_mv, NTSC_SAMPLE_HZ);
+    if (hz > 0.0f) Serial.printf("%.1f\n", hz);
+    else Serial.println(on ? "unmeasured" : "0");
   } else {
     Serial.printf("ERR %s unknown\n", cmd.c_str());
   }
@@ -168,4 +336,7 @@ void loop() {
       buf += c;
     }
   }
+  // Between commands only (a check blocks up to about half a second; the
+  // UART buffers what arrives meanwhile).
+  if (buf.length() == 0 && !Serial.available()) pit_guard();
 }
