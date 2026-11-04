@@ -1,0 +1,30 @@
+[package]
+name = "openvrx"
+description = "OpenVRX live receiver app: low-latency wgpu display, OSD, controls, recording"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openvrx"
+path = "src/main.rs"
+
+[dependencies]
+openvrx-core = { path = "../../crates/openvrx-core" }
+openvrx-hw = { path = "../../crates/openvrx-hw" }
+openvrx-dsp = { path = "../../crates/openvrx-dsp" }
+openvrx-video = { path = "../../crates/openvrx-video" }
+openvrx-format = { path = "../../crates/openvrx-format" }
+eframe = "0.37"
+egui = "0.37"
+egui-wgpu = "0.37"
+wgpu = "30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+pollster = "1"
+png = "0.18"
+log = "0.4"
