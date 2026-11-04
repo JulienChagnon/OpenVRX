@@ -220,7 +220,7 @@ pub fn paint_view(p: &Painter, rect: Rect, o: &ViewOsd<'_>) {
                 },
                 fmt_sample_rate(r.sample_rate_hz),
                 fmt_byte_rate(r.usb_bytes_per_s),
-                r.gain,
+                if r.gain_on_c5 { "C5".to_string() } else { r.gain.to_string() },
                 drops
             ),
             c,

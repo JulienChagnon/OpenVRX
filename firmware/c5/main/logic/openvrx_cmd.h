@@ -54,6 +54,7 @@ typedef enum {
     OPENVRX_CMD_REBOOT,
     OPENVRX_CMD_DL,
     OPENVRX_CMD_PING,
+    OPENVRX_CMD_AGC,
     OPENVRX_CMD_COUNT,
 } openvrx_cmd_kind_t;
 
@@ -89,6 +90,7 @@ typedef struct {
         struct { openvrx_clk_action_t action; unsigned div; } clk;
         unsigned slip_n;
         bool p11_on;
+        bool agc_on;
         struct { int code; int skirt; } filter;   // code OPENVRX_FILTER_CAL = calibrated
         unsigned bw_mhz;
         struct { unsigned lanes; int clk; } drive; // clk -1 = unchanged

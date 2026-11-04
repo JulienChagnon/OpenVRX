@@ -322,10 +322,10 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Luma of the frames of a recording, after skipping `skip` frames.
 /// Luma planes, seconds read, lines and DSP statistics of a recording.
 type Lumas = (Vec<Vec<f32>>, f64, u64, RxStats);
 
+/// Luma of the frames of a recording, after skipping `skip` frames.
 fn lumas(rec: &Recording, skip: usize, frames: usize) -> Result<Lumas, String> {
     let mut out = Vec::new();
     let mut seen = 0usize;

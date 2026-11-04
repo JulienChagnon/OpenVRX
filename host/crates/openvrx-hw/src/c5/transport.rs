@@ -283,6 +283,7 @@ pub mod sim {
             let arg = |k: usize| toks.get(k).copied();
             let reply = match (word.as_str(), arg(1)) {
                 ("ping", _) => Ok("OK ping".to_string()),
+                ("agc", Some(v)) if v == "on" || v == "off" => Ok(format!("OK agc on={}", (v == "on") as u8)),
                 ("ver", _) => Ok(format!(
                     "OK ver fw=0.1.0 proto=1 board={} idf=v6.0.2 chip=esp32c5 rev=1",
                     self.board

@@ -16,7 +16,7 @@ depends on, and it is how changes to OpenVRX get compared.
 | SMA male-male jumpers, 20 and 100 cm | between the attenuators |
 | U.FL to SMA female pigtail | into the XIAO C5's U.FL antenna port |
 | 50 ohm SMA dummy loads | cap the VTX whenever it is powered and not in the chain |
-| Optional: ESP32 board + 2 photorelays or NPN transistors | presses the step attenuator's buttons (automated sweeps) |
+| Optional: ESP32 board + 2 relay channels (or photorelays, or NPN transistors) | presses the step attenuator's buttons (automated sweeps) |
 | Optional: metal tin | shields the VTX or the C5 (see leakage) |
 
 ## Chain
@@ -74,7 +74,9 @@ reference's or fewer than half its frames decode.
 
 Build the tools once (`cargo build --release -p openvrx-cli` in `host`),
 set the C5 once with `tools/c5cmd.py` (`tune`, `lanes`, `clk`, `gain`,
-`save`), put the C5 on its own power, plug in the FX2.
+`save`), put the C5 on its own power, plug in the FX2. A fixed-gain sweep
+needs the C5's gain loop off (`agc off`, then `save`); with it on, the
+sweep measures the whole receiver as it flies (`--gains auto`).
 
 ### Manual attenuator (one USB port, no extra parts)
 
@@ -96,7 +98,7 @@ hub), the script also sets the gain:
 
 ```
 python3 tools/bench/bench.py --fixed-db 70 --att esp32:/dev/ttyUSB0 \
-    --c5 /dev/ttyACM0 --gains 48,56,64,72 --steps 0:31.75:1 \
+    --c5 /dev/ttyACM0 --gains auto,48,56,64,72 --steps 0:31.75:1 \
     --lanes 4x4top --clk 9 --mhz 5880
 ```
 
@@ -114,19 +116,86 @@ stay local, like every recording.
 The AW8637 has no PC interface, only its buttons. `tools/bench/att_ctl`
 is a small Arduino sketch for any ESP32 that presses them:
 
-1. Two photorelays (or NPN transistors) with their outputs across the +
-   and - buttons, inputs on GPIO26 (+) and GPIO27 (-), GND common with the
-   attenuator. A 2-channel low-level-trigger relay module fits as is
-   (`ACTIVE_LOW` in the sketch; set it false for NPN transistors).
-2. Set the attenuator's step size to 0.25 dB by hand, once. It is
-   remembered.
-3. Flash with the Arduino IDE or `arduino-cli` (board "ESP32 Dev Module").
-4. Serial 115200: `home` (presses - 130 times, so 0 dB from anywhere),
-   `set 12.5`, `get`, `press + 4`, `timing 60 80` (press and gap in ms;
-   raise them if presses get missed).
+1. One relay on the **+** button (the bench's setup; a second relay on -
+   is optional, see below). A button is two contacts that touch when
+   pressed; solder one wire to each (the AW8637's buttons have exactly two;
+   on a 4-leg tactile switch use two diagonally opposite legs, since legs
+   on the same side are always connected).
+   Those two wires go to the relay's middle screw terminal (COM) and to NO,
+   the end terminal that is open while the relay is off. NC stays empty.
+   With NO and NC swapped the button is held down whenever the relay is
+   off: the attenuator then changes value on its own.
+2. Relay module inputs: VCC to the ESP32's **3V3** (not 5 V: on modules
+   with a PNP driver, a 3.3 V high level cannot switch a 5 V module off),
+   GND to GND, IN1 to GPIO32 (on a 38-pin ESP-32S board: left side,
+   7th pin from the top, printed P32).
+   Low-level trigger modules match `ACTIVE_LOW = true`; set it false for
+   NPN transistors. GPIO32/33 keep the DAC pins (25, 26) free for a video
+   pattern on the same ESP32. The attenuator needs no common ground with a
+   relay; with transistors it does.
+3. One click of + adds 0.25 dB. The seven LEDs show the value in binary,
+   weights 0.25, 0.5, 1, 2, 4, 8, 16 dB (add the lit ones): 1 click =
+   0.25, 2 = 0.5, 3 = 0.75 (0.5 + 0.25), 4 = 1 dB, 127 clicks = 31.75 dB.
+   A 2 dB sweep step is 8 clicks, about a second at the default timing.
+   `bench.py --att-step` defaults to 0.25. If + and - together selects a
+   coarser step on your unit, a coarser step means fewer clicks; set it on
+   the attenuator and pass the same value to `--att-step`.
+4. Flash with the Arduino IDE or `arduino-cli` (board "ESP32 Dev Module").
+5. Serial 115200: `step 0.25` (dB per click, the default), `at 0`
+   (the value the LEDs show now, no presses), `set 12`, `get`,
+   `press + 4`, `timing 60 80` (press and gap in ms; raise them if presses
+   get missed).
+
+With only the + relay the ESP32 can go up, never down: `set` to a lower
+value answers `ERR set down`. `bench.py --att esp32:PORT` notices this by
+itself (`get` reports `minus=no`): it asks you to set 0 dB by hand at the
+start, sweeps upward on its own, and asks again whenever a lower value is
+needed (the next gain). The attenuator does not wrap from 0 to 31.75, so a
+single relay has to be on +, not -.
+
+Optional second relay on -: IN1 to GPIO33 and `PIN_MINUS = 33` in the
+sketch. Then `home` works (presses - until 0 dB) and sweeps run without
+any hand steps.
 
 There is no readback: after a sweep, check that the LEDs show what `get`
 says. If they do not, raise `timing`.
+
+## Standalone VTX and the ESP32 wiring
+
+Instead of the quad, a bare VTX can be the source: an iFlight SucceX
+Force 5.8 GHz 800 mW (30x30, pads VBAT, GND, RX, Video; 7 to 36 V in; IRC
+Tramp control on the RX pad). The ESP32 that presses the attenuator can
+also feed the VTX a test picture and set its channel and power.
+
+ESP-32S NodeMCU, 38-pin board, USB at the bottom, positions counted from
+the antenna end (on 30-pin boards wire by the printed labels):
+
+| Goes to | ESP32 label | Side | Position | Notes |
+|---|---|---|---|---|
+| Relay module VCC | 3V3 | left | 1 | never 5 V/VIN (see the relay notes above) |
+| Relay module IN1 (+ button) | P32 | left | 7 | |
+| (free: optional - relay) | P33 | left | 8 | |
+| VTX Video | P25 | left | 9 | DAC1: composite test pattern |
+| Relay module GND | GND | left | 14 | any GND pin |
+| VTX GND and the 12 V supply's GND | GND | right | 1 | one common ground |
+| VTX RX pad (Tramp), through 1 kohm | P17 | right | 11 | UART2 TX |
+| VTX RX pad (Tramp), direct | P16 | right | 12 | UART2 RX, also hears its own bytes |
+
+- VTX VBAT: 12 V from a USB-C PD trigger board or a bench supply (9 V also
+  works), never the ESP32. About 95 mA at 25 mW, 380 mA at 800 mW.
+- Tramp is one wire both ways, 9600 baud 8N1. The 1 kohm resistor lets
+  the VTX answer while P17 still drives the line. Measure the RX pad before
+  wiring it (VTX powered, nothing connected): about 3.3 V is fine; about
+  5 V needs a 10 kohm resistor in series with P16 as well, since ESP32
+  inputs are not 5 V tolerant.
+- The ESP32 is powered by its own USB cable; its 5V/VIN pin stays unused.
+- RF first: never power the VTX without the attenuator chain (40 dB fixed
+  first, the step attenuator takes at most +24 dBm) or a dummy load on its
+  antenna port. It may start at the last power used, up to 800 mW.
+  Start at 25 mW or pit mode; above 200 mW give it airflow.
+- Firmware for the video pattern and Tramp is not written yet: today the
+  ESP32 runs `att_ctl` (attenuator only). Merging pattern, Tramp and
+  attenuator into one sketch is planned.
 
 ## Bench host on Fedora
 

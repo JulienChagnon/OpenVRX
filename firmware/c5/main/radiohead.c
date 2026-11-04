@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include "agc.h"
 #include "boot_guard.h"
 #include "console.h"
 #include "esp_app_desc.h"
@@ -167,6 +168,8 @@ void radiohead_boot(const openvrx_settings_t *s)
     };
     err = rf_start(&rc);
     if (err != ESP_OK) console_log("radio start: %s", esp_err_to_name(err));
+    err = agc_start(s->agc != 0);
+    if (err != ESP_OK) console_log("agc: %s", esp_err_to_name(err));
 }
 
 // ---------------------------------------------------------------- commands
@@ -184,9 +187,15 @@ static void cmd_status(void)
     const rf_config_t c = rf_config();
     char fbuf[8];
     const openvrx_selftest_mode_t st = lanes_hw_selftest_mode();
-    reply("OK status mhz=%u off_khz=%d gain=%u clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
+    unsigned clip, rms;
+    bool measurable;
+    agc_last(&clip, &rms, &measurable);
+    char level[40];
+    if (measurable) snprintf(level, sizeof(level), "clip=%u.%u rms=%u.%02u", clip / 10, clip % 10, rms / 100, rms % 100);
+    else snprintf(level, sizeof(level), "clip=- rms=-");
+    reply("OK status mhz=%u off_khz=%d gain=%u agc=%d %s clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
           "selftest=%s up_ms=%llu slips=%lu phy=%s board=%s hz=%lu boot=%s",
-          c.mhz, c.off_khz, c.gain, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
+          c.mhz, c.off_khz, c.gain, agc_enabled() ? 1 : 0, level, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
           c.p11 ? 1 : 0, filter_text(c.filter_code, fbuf, sizeof(fbuf)), c.skirt, c.bw20 ? 20u : 40u,
           lanes_hw_selftest_name(st), (unsigned long long)(esp_timer_get_time() / 1000), (unsigned long)sclk_slips(),
           rf_phy_state_name(rf_phy_state()), openvrx_board_name(s_board), (unsigned long)openvrx_clock_hz(sclk_div()),
@@ -413,6 +422,7 @@ static void cmd_save(void)
     s.bw_mhz = c.bw20 ? 20 : 40;
     s.drive_lanes = (uint8_t)s_drive_lanes;
     s.drive_clk = (uint8_t)s_drive_clk;
+    s.agc = agc_enabled() ? 1 : 0;
     const esp_err_t err = settings_store(&s);
     if (err != ESP_OK) {
         reply_err(OPENVRX_CMD_SAVE, OPENVRX_ERR_HW, esp_err_to_name(err));
@@ -460,6 +470,10 @@ void radiohead_command(char *line)
         rf_reboot_to_download();
         break;
     case OPENVRX_CMD_PING: reply("OK ping"); break;
+    case OPENVRX_CMD_AGC:
+        agc_set_enabled(cmd.a.agc_on);
+        reply("OK agc on=%d", cmd.a.agc_on ? 1 : 0);
+        break;
     default: reply_err(cmd.kind, OPENVRX_ERR_SYNTAX, "unknown command"); break;
     }
 }

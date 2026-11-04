@@ -85,6 +85,9 @@ pub struct RxStatus {
     /// Raw I/Q power, dB re 1 ADC unit squared.
     pub power_db: f32,
     pub gain: u8,
+    /// The C5 sets the gain itself (its own loop, or FX2 only where the
+    /// app cannot see it): `gain` is not the live value.
+    pub gain_on_c5: bool,
     pub sync_locked: bool,
     pub freq_mhz: u32,
     pub sample_rate_hz: f64,

@@ -15,7 +15,7 @@ if (-not $cc) {
 if (-not $cc) { Write-Error 'no C compiler found (set CC)'; exit 2 }
 $out = Join-Path ([System.IO.Path]::GetTempPath()) 'openvrx_c5_tests.exe'
 $srcs = @(Join-Path $here 'test_logic.c') + (Get-ChildItem (Join-Path $logic '*.c') | ForEach-Object { $_.FullName })
-& $cc -std=c11 -O2 -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion "-I$logic" @srcs -o $out
+& $cc -std=c11 -O2 -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion "-I$logic" @srcs -lm -o $out
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $out @args
 exit $LASTEXITCODE

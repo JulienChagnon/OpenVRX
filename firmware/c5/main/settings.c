@@ -22,13 +22,11 @@ bool settings_load(openvrx_settings_t *s)
 {
     nvs_handle_t h;
     if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
-    openvrx_settings_t tmp;
-    size_t len = sizeof(tmp);
-    const esp_err_t err = nvs_get_blob(h, KEY, &tmp, &len);
+    uint8_t blob[sizeof(openvrx_settings_t) + 8];
+    size_t len = sizeof(blob);
+    const esp_err_t err = nvs_get_blob(h, KEY, blob, &len);
     nvs_close(h);
-    if (err != ESP_OK || len != sizeof(tmp) || !openvrx_settings_valid(&tmp)) return false;
-    *s = tmp;
-    return true;
+    return err == ESP_OK && openvrx_settings_from_blob(blob, (unsigned)len, s);
 }
 
 esp_err_t settings_store(const openvrx_settings_t *s)

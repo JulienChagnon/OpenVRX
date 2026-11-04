@@ -501,6 +501,7 @@ fn run(
                 cn_db: c,
                 power_db: 20.0 + c,
                 gain: 64,
+                gain_on_c5: false,
                 sync_locked: c > 6.0,
                 freq_mhz: freq,
                 sample_rate_hz: config.sample_rate_hz,

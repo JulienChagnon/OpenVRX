@@ -26,7 +26,7 @@ use crate::source::{
     StatusCell,
 };
 use openvrx_core::clock::now_ns;
-use openvrx_core::{LineRecord, RawBlock, RxId, VideoStandard};
+use openvrx_core::{LanePreset, LineRecord, RawBlock, RxId, VideoStandard};
 use openvrx_dsp::{RxDsp, RxDspConfig, RxEvent, RxStats};
 use openvrx_format::{ReceiverInfo, RecordingSource, RecordingWriter, Sidecar, WriterOptions};
 use openvrx_hw::c5::{find_c5_ports, C5Client, C5Event, C5Settings, ClientConfig, PortConnector, PortSelector};
@@ -54,6 +54,17 @@ const STATUS_NS: u64 = 100_000_000;
 // Pure helpers
 // ---------------------------------------------------------------------
 
+/// True when the C5 steers its own gain for this receiver: gain Auto on a
+/// layout that carries the top ADC bits (the C5 reads its level back from
+/// the lane pads). Folded layouts and angle8 keep the host gain loop.
+pub fn gain_on_c5(r: &ReceiverSettings) -> bool {
+    r.gain == GainMode::Auto
+        && matches!(
+            r.lanes,
+            LanePreset::I8Q8 | LanePreset::I7Q7 | LanePreset::I6Q6 | LanePreset::I5Q5 | LanePreset::I4Q4Top
+        )
+}
+
 /// C5 settings for a receiver at a gain index.
 pub fn c5_settings(r: &ReceiverSettings, gain: u32) -> C5Settings {
     C5Settings {
@@ -62,6 +73,7 @@ pub fn c5_settings(r: &ReceiverSettings, gain: u32) -> C5Settings {
         divider: r.divider as u32,
         mhz: r.freq_mhz,
         gain,
+        agc: Some(gain_on_c5(r)),
         ..C5Settings::default()
     }
 }
@@ -146,6 +158,7 @@ pub fn rx_status(
         cn_db: stats.map_or(f32::NAN, |s| s.cn_db),
         power_db: stats.map_or(f32::NAN, |s| s.power_db),
         gain: gain.min(255) as u8,
+        gain_on_c5: r.control == ControlMode::Fx2Only || gain_on_c5(r),
         sync_locked: stats.is_some_and(|s| s.lock == openvrx_dsp::LockState::Locked),
         // 0 = unknown: in FX2-only mode the C5 keeps its saved channel.
         freq_mhz: match r.control {
@@ -461,8 +474,9 @@ struct LiveRx {
 
 impl LiveRx {
     fn make_gain_loop(r: &ReceiverSettings, gain: u32) -> Option<GainLoop> {
-        // FX2 only: the C5 keeps its saved gain; nothing to steer.
-        if r.gain != GainMode::Auto || r.control == ControlMode::Fx2Only {
+        // FX2 only: the C5 keeps its saved gain (and its own loop); with the
+        // C5's loop on, nothing to steer here either.
+        if r.gain != GainMode::Auto || r.control == ControlMode::Fx2Only || gain_on_c5(r) {
             return None;
         }
         let lanes = r.lanes.format();

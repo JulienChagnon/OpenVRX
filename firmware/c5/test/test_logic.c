@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "arc_gain.h"
+#include "openvrx_agc.h"
 #include "openvrx_boards.h"
 #include "openvrx_cmd.h"
 #include "openvrx_lanes.h"
@@ -490,6 +491,24 @@ static void test_settings_gain(void)
     t = s;
     t.version = 0;
     CHECK(!openvrx_settings_valid(&t));
+    t = s;
+    t.agc = 2;
+    CHECK(!openvrx_settings_valid(&t));
+    // Blobs: the current layout, and a version 1 blob upgraded with the AGC on.
+    CHECK(s.agc == 1 && sizeof(s) > OPENVRX_SETTINGS_V1_SIZE);
+    openvrx_settings_t u;
+    CHECK(openvrx_settings_from_blob(&s, (unsigned)sizeof(s), &u) && u.gain == s.gain);
+    uint8_t v1[OPENVRX_SETTINGS_V1_SIZE];
+    t = s;
+    t.version = 1;
+    t.gain = 56;
+    memcpy(v1, &t, sizeof(v1));
+    memset(&u, 0, sizeof(u));
+    CHECK(openvrx_settings_from_blob(v1, (unsigned)sizeof(v1), &u));
+    CHECK(u.version == OPENVRX_SETTINGS_VERSION && u.agc == 1 && u.gain == 56 && u.mhz == s.mhz);
+    v1[0] = 3;
+    CHECK(!openvrx_settings_from_blob(v1, (unsigned)sizeof(v1), &u));
+    CHECK(!openvrx_settings_from_blob(v1, 5, &u));
 
     arc_gain_table_t g;
     arc_gain_table_from_bytes(&g, NULL, 83);
@@ -538,6 +557,79 @@ static void print_tables(void)
     }
 }
 
+// ---------------------------------------------------------------- agc
+
+// Pad word for 4x4top component values (two's complement nibbles) on a
+// plan whose lane k sits on GPIO k.
+static uint32_t pads_4x4top(const openvrx_lane_t *lanes, unsigned n, int vi, int vq)
+{
+    uint32_t w = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        const int v = lanes[k].comp == 'I' ? vi : vq;
+        const unsigned bit = lanes[k].adc_bit - 6u;   // 4x4top carries ADC bits 9..6
+        if (((unsigned)v >> bit) & 1u) w |= 1u << k;
+    }
+    return w;
+}
+
+static void test_agc(void)
+{
+    openvrx_lane_t lanes[OPENVRX_MAX_LANES];
+    int8_t gpio[OPENVRX_MAX_LANES];
+    const unsigned n = openvrx_preset_lanes(OPENVRX_PRESET_4X4TOP, lanes);
+    for (unsigned k = 0; k < n; ++k) gpio[k] = (int8_t)k;
+    openvrx_agc_plan_t plan;
+    CHECK(openvrx_agc_plan(OPENVRX_PRESET_4X4TOP, lanes, gpio, n, &plan) && plan.bits == 4);
+    CHECK(!openvrx_agc_plan(OPENVRX_PRESET_4X4FINE, lanes, gpio, n, &plan));
+    CHECK(!openvrx_agc_plan(OPENVRX_PRESET_ANGLE8, lanes, gpio, 0, &plan));
+    CHECK(openvrx_agc_plan(OPENVRX_PRESET_4X4TOP, lanes, gpio, n, &plan));
+
+    // Decoding: every value pair round-trips through the pads.
+    openvrx_agc_acc_t a;
+    for (int vi = -8; vi <= 7; ++vi)
+        for (int vq = -8; vq <= 7; ++vq) {
+            openvrx_agc_acc_reset(&a);
+            openvrx_agc_acc_add(&a, &plan, pads_4x4top(lanes, n, vi, vq));
+            const uint64_t want = (uint64_t)((2 * vi + 1) * (2 * vi + 1) + (2 * vq + 1) * (2 * vq + 1));
+            CHECK(a.sumsq4 == want);
+            CHECK(a.clips == (unsigned)((vi == -8 || vi == 7) + (vq == -8 || vq == 7)));
+        }
+    // Hard clipped (Nov 2 close-in capture): all corners, overload.
+    openvrx_agc_acc_reset(&a);
+    for (int k = 0; k < 1000; ++k) openvrx_agc_acc_add(&a, &plan, pads_4x4top(lanes, n, k & 1 ? 7 : -8, k & 2 ? 7 : -8));
+    CHECK(openvrx_agc_clip_share(&a) > 0.99f);
+    CHECK(openvrx_agc_next(56, 0, 77, 4, openvrx_agc_clip_share(&a), openvrx_agc_rms_steps(&a)) == 56 - OPENVRX_AGC_MAX_STEP);
+    // Under one step (range test): only 0 and -1, raise fast.
+    openvrx_agc_acc_reset(&a);
+    for (int k = 0; k < 1000; ++k) openvrx_agc_acc_add(&a, &plan, pads_4x4top(lanes, n, k & 1 ? 0 : -1, k & 2 ? 0 : -1));
+    CHECK(openvrx_agc_rms_steps(&a) < 0.6f && openvrx_agc_clip_share(&a) == 0.0f);
+    CHECK(openvrx_agc_next(56, 0, 77, 4, 0.0f, openvrx_agc_rms_steps(&a)) == 56 + OPENVRX_AGC_MAX_STEP);
+    // On target (4.4 steps), inside the deadband, small errors: hold or one step.
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 4.4f) == 50);
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 5.0f) == 50);
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 3.4f) == 54);
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.0f, 3.9f) == 50);
+    // Weak but clipping (interference spikes): never raised.
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.10f, 2.0f) == 50);
+    // Limits.
+    CHECK(openvrx_agc_next(1, 0, 77, 4, 1.0f, 7.0f) == 0);
+    CHECK(openvrx_agc_next(76, 0, 77, 4, 0.0f, 0.5f) == 77);
+    // 7x7: full scale 64 steps, target about 35.
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 35.0f) == 50);
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 8.0f) == 54);
+
+    // Command.
+    char line[32] = "agc off";
+    openvrx_cmd_t cmd;
+    openvrx_err_t err;
+    const char *word;
+    CHECK(openvrx_cmd_parse(line, &cmd, &err, &word) && cmd.kind == OPENVRX_CMD_AGC && !cmd.a.agc_on);
+    strcpy(line, "agc on");
+    CHECK(openvrx_cmd_parse(line, &cmd, &err, &word) && cmd.a.agc_on);
+    strcpy(line, "agc maybe");
+    CHECK(!openvrx_cmd_parse(line, &cmd, &err, &word));
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--tables") == 0) {
@@ -550,6 +642,7 @@ int main(int argc, char **argv)
     test_selftest();
     test_slip();
     test_settings_gain();
+    test_agc();
     printf("%u checks, %u failures\n", s_checks, s_failures);
     return s_failures ? 1 : 0;
 }

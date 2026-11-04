@@ -17,5 +17,5 @@ if [ -z "$cc" ]; then
     exit 2
 fi
 "$cc" -std=c11 -O2 -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion \
-    -I"$logic" "$here/test_logic.c" "$logic"/*.c -o "$out"
+    -I"$logic" "$here/test_logic.c" "$logic"/*.c -lm -o "$out"
 "$out" "$@"

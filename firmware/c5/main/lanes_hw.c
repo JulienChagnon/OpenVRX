@@ -140,8 +140,9 @@ esp_err_t lanes_hw_apply(const openvrx_route_t *r, unsigned drive)
     for_each(r->idle_mask, to_gpio_signal, NULL);
     GPIO.out_w1tc.val = r->idle_mask;
     for_each(r->idle_mask, force_oe, NULL);
-    // Lanes: GPIO output, then MODEM_DIAG through the matrix.
-    if ((err = config_pins(r->used_mask, GPIO_MODE_OUTPUT, false)) != ESP_OK) return err;
+    // Lanes: GPIO output with the input buffer on (agc.c reads the samples
+    // back through GPIO_IN), then MODEM_DIAG through the matrix.
+    if ((err = config_pins(r->used_mask, GPIO_MODE_INPUT_OUTPUT, false)) != ESP_OK) return err;
     unsigned d = drive;
     for_each(r->used_mask | r->idle_mask, set_drive, &d);
     attach_modem_diag();

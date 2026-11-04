@@ -133,3 +133,18 @@ down until breakup and note the C/N shown on the OSD bars.
   for about 30 s: the picture turns to lines. **A fixed gain with 4 bits covers about 24 dB, much less
   than near to far.** Needs gain control on the C5 (FX2-only has no PC link). Note: in FX2-only mode
   the recording metadata `gain` field shows the app default (64), not the C5's saved gain.
+- Nov 2 indoor run, recording `-235032` (33 s, 3 usb_gaps of 32 KB at 14.5 s), 4x4top clk 9, fixed gain:
+  0 to 5 s 99 % of samples clipped, 12 to 26 s under one step. The decoded picture of the clipped part
+  has fine rainbow stripes in dark and textured areas; an unclipped Oct 31 capture (rms about 6 steps)
+  decodes clean. Per-axis clipping of 4-bit I/Q leaves only a few phase steps, which land in the colour
+  band. Lower gain close in, or the C5 gain loop. The app OSD now warns on overload (30 % clipped) and on
+  a signal under one ADC step.
+- OSD twitter: between fields the camera picture is placed correctly (no alternating shift) but the
+  flight controller OSD jumps exactly one frame row: its chip counts field lines from each vertical sync
+  and ignores the second field's half-line offset. New deinterlace `line-double` (app: Steady OSD, key I,
+  default on) puts the bottom field one field line lower, as goggles do: OSD shift 0.0 rows on both
+  recordings, the camera picture moves one row per field instead. `openvrx-cli decode ... --steady-osd`.
+- Nov 3: C5 gain loop (`agc`) flashed on the XIAO (COM9). The old image used the pre-rename settings
+  namespace, so the board came up on defaults; re-set 4x4top clk 9 5880 MHz, `agc on`, saved, survives a
+  reboot. No VTX on: the loop raised the gain from 56 to the table top (83) in about 2 s; the noise floor
+  there reads rms 1.2 to 2.3 steps, clip 0.2 to 2.6 % (gain 56 put the same noise under one step).

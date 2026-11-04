@@ -237,6 +237,8 @@ pub struct C5Status {
     pub up_ms: u64,
     pub slips: u32,
     pub phy: String,
+    /// The C5's gain loop runs (None: firmware without it).
+    pub agc: Option<bool>,
 }
 
 impl C5Status {
@@ -255,6 +257,7 @@ impl C5Status {
             up_ms: f.parse_as("status", "up_ms")?,
             slips: f.get("slips").and_then(|v| v.parse().ok()).unwrap_or(0),
             phy: f.get("phy").unwrap_or("").to_string(),
+            agc: f.get("agc").map(|v| v == "1"),
         })
     }
 
@@ -421,6 +424,9 @@ pub struct C5Settings {
     pub bw_mhz: Option<u32>,
     /// Pad drive (lanes, clock), 0..=3 (None: firmware default).
     pub drive: Option<(u8, u8)>,
+    /// The C5's own gain loop (`agc on|off`; None: left as the C5 has it).
+    /// With it on, `gain` is only the starting point.
+    pub agc: Option<bool>,
 }
 
 impl Default for C5Settings {
@@ -437,6 +443,7 @@ impl Default for C5Settings {
             filter_skirt: 0,
             bw_mhz: None,
             drive: None,
+            agc: None,
         }
     }
 }
@@ -468,7 +475,8 @@ impl C5Settings {
     }
 
     /// The full state push, in protocol order (`board`, `lanes`, `clk`,
-    /// `tune`, `gain`, `p11`, `filter`, then the optional `bw`, `drive`).
+    /// `tune`, `gain`, `p11`, `filter`, then the optional `bw`, `drive`,
+    /// `agc`).
     pub fn push_commands(&self) -> Vec<String> {
         let mut v = vec![
             self.board_cmd(),
@@ -484,6 +492,9 @@ impl C5Settings {
         }
         if let Some((l, c)) = self.drive {
             v.push(format!("drive {l} {c}"));
+        }
+        if let Some(on) = self.agc {
+            v.push(format!("agc {}", if on { "on" } else { "off" }));
         }
         v
     }
@@ -608,6 +619,7 @@ mod tests {
             drive: Some((1, 2)),
             filter: FilterCode::Code(5),
             filter_skirt: 2,
+            agc: Some(false),
             ..Default::default()
         };
         assert_eq!(
@@ -621,7 +633,8 @@ mod tests {
                 "p11 on",
                 "filter 5 2",
                 "bw 20",
-                "drive 1 2"
+                "drive 1 2",
+                "agc off"
             ]
         );
         s.validate().unwrap();
