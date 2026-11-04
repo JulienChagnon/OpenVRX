@@ -46,6 +46,7 @@ its own power with the settings it saved, so tell the app what those are:
 | D | damage overlay |
 | P / L | present mode / present trigger |
 | C | calibrate sampling phase (needs `--control c5`) |
+| X | side by side: the live picture and the bench ESP32 test card it should show (`--compare-pattern NAME`, default card; `--compare` starts in it) |
 | [ and ] | channel down/up (needs `--control c5`) |
 | F5 | reset latency statistics |
 | F11 | fullscreen |

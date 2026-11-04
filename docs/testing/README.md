@@ -148,3 +148,14 @@ down until breakup and note the C/N shown on the OSD bars.
   namespace, so the board came up on defaults; re-set 4x4top clk 9 5880 MHz, `agc on`, saved, survives a
   reboot. No VTX on: the loop raised the gain from 56 to the table top (83) in about 2 s; the noise floor
   there reads rms 1.2 to 2.3 steps, clip 0.2 to 2.6 % (gain 56 put the same noise under one step).
+- Nov 4, Fedora bench host: standalone SucceX Force VTX fed by the ESP32's NTSC test pattern (att_ctl,
+  P25, `card`, 1 Vpp), VTX LEDs band 5 / channel 8 / power 1, so R8 (5917 MHz), lowest power; 70 dB
+  fixed plus 2 dB step, about -61 dBm at the C5. The receiver locks NTSC at 15734.5 Hz line rate, VTX
+  about 1.6 MHz low. Gain loop on: right after `tune 5917` 43 % clipped at gain 79, settled at gain 70,
+  clip 0.1 %, rms 3.9 within seconds. First recording (taken during the settle): C/N 7.4 dB, 3.4 %
+  damaged, and a 1-sample sliver at every vertical edge: the ESP32 I2S sends each pair of 16-bit DAC
+  slots swapped; fixed in video.cpp. After the fix: card clean (all four stripe zones down to 1 MHz),
+  C/N 17.2 dB, 0 % damaged, 6 % clipped (I/Q DC offsets about +128/+110 of 512 push one side into
+  clipping). Open: 10 relocks in 3 s with the loop on and 25 (2412 coasted lines) with it off at gain
+  70 and 0.03 % clipped, while the simulator's ideal NTSC through the same decode gives 0. Field rate
+  60.055 Hz is the last field's 262 lines, not a fault.

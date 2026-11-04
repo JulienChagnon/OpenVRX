@@ -193,9 +193,56 @@ the antenna end (on 30-pin boards wire by the printed labels):
   first, the step attenuator takes at most +24 dBm) or a dummy load on its
   antenna port. It may start at the last power used, up to 800 mW.
   Start at 25 mW or pit mode; above 200 mW give it airflow.
-- Firmware for the video pattern and Tramp is not written yet: today the
-  ESP32 runs `att_ctl` (attenuator only). Merging pattern, Tramp and
-  attenuator into one sketch is planned.
+- `att_ctl` runs the attenuator, the test pattern (below) and the VTX's
+  Tramp control: `vtx` (channel, power, pit mode, limits, temperature),
+  `vtx ch R8` or `vtx mhz 5917`, `vtx mw 25` (above 200 mW only with
+  `force`), `vtx pit on|off`. Each set is read back to confirm it.
+  `bench.py --vtx-ch R8 --vtx-mw 25` sets the VTX before a sweep, and the
+  reported power sets `--vtx-dbm` when that is not given.
+- Pit-mode guard: the VTX stays in pit mode unless a bench run holds a
+  lease. Every 5 s the ESP32 checks it (from boot, so a VTX powered later
+  is caught too). `bench.py` takes the lease (`vtx active 120`), renews it
+  every step, waits 2 s after leaving pit mode, and ends it when the run
+  ends (`vtx active 0`); a crashed run simply lets it run out. Long hand
+  steps let it lapse too, so the VTX cools meanwhile. `vtx` shows the
+  temperature the VTX reports; nothing acts on it (no thermal cut-off for
+  now). To transmit by hand, `vtx active 600`. Through 70 dB of pads a pit-mode VTX is below the
+  receiver's noise (no lock). Without Tramp
+  (or before checking the RX pad voltage), set the VTX by its buttons:
+  the band, channel and power LEDs blink their numbers (bands 1 to 5 =
+  A, B, E, F, R; power 1 = lowest).
+
+### Test pattern on P25
+
+`att_ctl` also feeds the VTX's video input: P25 (DAC1) carries a 525-line
+interlaced monochrome NTSC picture from boot (pattern `card`, 1 Vpp). DMA
+replays one frame, so relay presses never disturb it.
+
+- Commands, on the same 115200 baud console as the attenuator:
+  `pattern card|bars|ramp|check|grey|black|white`, `amp <mV>` (sync tip to
+  white, 200 to 3200, default 1000), `video on|off`, and `vget` (state, plus
+  the line rate counted from the DMA interrupts; takes 1 s, reads in steps
+  of about 15 Hz around 15734). A change restarts the picture and the
+  receiver relocks.
+- `card`: 8 grey steps, stripes at 1, 0.5, 0.25 and 0.13 MHz, a ramp and a
+  checkerboard. `grey` (flat 50 IRE) suits noise and C/N readings.
+- Limits: 2.014 MS/s (128 samples per line; the DAC driver warns of
+  distortion above about 2 MHz), so about 1 MHz of picture detail and no
+  colour (a burst needs 3.58 MHz). It is a repeatable, static source for
+  lock, C/N and PSNR; colour and fine detail still need the camera (or the
+  MS2107 capture as ground truth).
+- If the picture is dim or will not lock, the VTX input may be loading the
+  DAC: try `amp 2000`.
+- Watch it live: `bench.py --live` runs the OpenVRX app with its window
+  open for the whole sweep and records each step through it (the FX2 has
+  one owner); key X (or `--pattern`, which starts the app in it) shows the
+  received picture beside the card as the ESP32 sends it. App output goes
+  to `app.log` in the run folder.
+- `bench.py --pattern NAME` (and `--video-amp`) sets it before a sweep; the
+  pattern and measured line rate go into run.json.
+- Timing follows the simulator's NTSC layout (`host/crates/openvrx-sim/src/cvbs.rs`);
+  `tools/bench/att_ctl/test/ntsc_frame_test.c` checks the frame on the PC
+  (build line in the file).
 
 ## Bench host on Fedora
 
