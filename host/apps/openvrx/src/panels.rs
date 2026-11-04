@@ -173,6 +173,7 @@ fn video(ui: &mut Ui, app: &mut OpenvrxApp) {
         combo(ui, "preset", &mut v.preset, &VideoPreset::ALL, |p| p.name().to_string());
     });
     ui.checkbox(&mut v.cleanup, "Cleanup (Space: off = raw view)");
+    ui.checkbox(&mut v.steady_osd, "Steady OSD (I: fields line-doubled like goggles)");
     ui.horizontal(|ui| {
         ui.label("Standard");
         combo(ui, "standard", &mut v.standard, &StandardChoice::ALL, |s| s.name().to_string());

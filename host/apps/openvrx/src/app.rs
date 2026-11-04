@@ -291,6 +291,7 @@ impl OpenvrxApp {
             Action::Osd => d.osd = !d.osd,
             Action::Record => self.toggle_recording(),
             Action::Cleanup => self.settings.video.cleanup = !self.settings.video.cleanup,
+            Action::SteadyOsd => self.settings.video.steady_osd = !self.settings.video.steady_osd,
             Action::Hd3 => d.hd3_mode = !d.hd3_mode,
             Action::Layout => d.layout = d.layout.next(),
             Action::PresentMode => d.present_mode = d.present_mode.next(),

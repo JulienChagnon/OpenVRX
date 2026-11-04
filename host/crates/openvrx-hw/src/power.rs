@@ -4,7 +4,9 @@
 //! selective suspend power setting (which can suspend an idle FX2 and
 //! break a stream). On other systems the helpers are harmless no-ops.
 
-use crate::error::{HwError, Result};
+#[cfg(windows)]
+use crate::error::HwError;
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 
 /// Registers the calling thread with MMCSS while alive. Create and drop it

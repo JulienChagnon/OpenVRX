@@ -470,7 +470,7 @@ impl VideoPipeline {
             return None;
         };
         let t = Instant::now();
-        let rows = deinterlace::rows_ready(self.cfg.standard, &w.rep, w.rep_ready, false);
+        let rows = deinterlace::rows_ready(self.cfg.standard, self.cfg.deinterlace, &w.rep, w.rep_ready, false);
         let denoise_on = self.cfg.denoise.is_active();
         let mut updated = None;
         if rows > w.di_rows {

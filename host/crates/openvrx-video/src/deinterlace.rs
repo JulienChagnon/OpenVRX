@@ -6,6 +6,13 @@
 //! Past-only methods (no added delay, usable line by line while a field
 //! arrives):
 //! - `Bob`: 4-tap cubic vertical interpolation of the current field.
+//! - `LineDouble`: bob with the fields placed as goggles count lines. The
+//!   flight controller's OSD chip counts field lines from each vertical
+//!   sync and ignores the half-line offset of the second field, so at the
+//!   true rows its text jumps one row per field (measured on NTSC: the
+//!   text sits one row higher in the bottom field). Here the bottom field
+//!   goes one field line lower (frame row 2 instead of 1): the OSD stands
+//!   still and the camera picture moves one row per field instead.
 //! - `Weave`: missing rows from the previous (opposite parity) field.
 //! - `LinearBlend`: weave followed by a [1 2 1]/4 vertical blend.
 //! - `MotionAdaptive`: weave where the same-parity field differences show
@@ -31,7 +38,7 @@
 use crate::motion::{self, MotionField, Plane, SearchParams};
 use crate::util::{RowsMut, cubic, median3, scratch, scratch_any, smoothstep, Scratch};
 use openvrx_core::quality::damage;
-use openvrx_core::{Frame, FrameMeta, LineQuality, RxId, VideoStandard, YuvField};
+use openvrx_core::{FieldParity, Frame, FrameMeta, LineQuality, RxId, VideoStandard, YuvField};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -42,6 +49,7 @@ use std::sync::Arc;
 #[serde(rename_all = "snake_case")]
 pub enum DeinterlaceMethod {
     Bob,
+    LineDouble,
     Weave,
     LinearBlend,
     MotionAdaptive,
@@ -53,8 +61,9 @@ pub enum DeinterlaceMethod {
 }
 
 impl DeinterlaceMethod {
-    pub const ALL: [DeinterlaceMethod; 9] = [
+    pub const ALL: [DeinterlaceMethod; 10] = [
         DeinterlaceMethod::Bob,
+        DeinterlaceMethod::LineDouble,
         DeinterlaceMethod::Weave,
         DeinterlaceMethod::LinearBlend,
         DeinterlaceMethod::MotionAdaptive,
@@ -68,6 +77,7 @@ impl DeinterlaceMethod {
     pub fn name(self) -> &'static str {
         match self {
             DeinterlaceMethod::Bob => "bob",
+            DeinterlaceMethod::LineDouble => "line-double",
             DeinterlaceMethod::Weave => "weave",
             DeinterlaceMethod::LinearBlend => "blend",
             DeinterlaceMethod::MotionAdaptive => "motion-adaptive",
@@ -98,7 +108,7 @@ impl DeinterlaceMethod {
     /// Previous fields used.
     pub fn history_len(self) -> usize {
         match self {
-            DeinterlaceMethod::Bob => 0,
+            DeinterlaceMethod::Bob | DeinterlaceMethod::LineDouble => 0,
             DeinterlaceMethod::Weave | DeinterlaceMethod::LinearBlend => 1,
             DeinterlaceMethod::EdgeDirectedMA => 2,
             DeinterlaceMethod::MotionAdaptive | DeinterlaceMethod::YadifPast => 3,
@@ -147,6 +157,15 @@ impl<'a> View<'a> {
         View {
             f,
             off: std.params().field_row_offset(f.parity),
+        }
+    }
+
+    /// The field as `method` places it (`LineDouble`: bottom field from
+    /// frame row 2).
+    fn placed(f: &'a YuvField, std: VideoStandard, method: DeinterlaceMethod) -> View<'a> {
+        View {
+            f,
+            off: row_offset(method, std, f.parity),
         }
     }
 
@@ -204,14 +223,30 @@ fn field_sigma(f: &YuvField) -> f32 {
     (v[mid] / (p.white_ire - p.black_ire)).clamp(0.0, 0.2)
 }
 
+/// First frame row of a field of `parity` as `method` places it.
+pub fn row_offset(method: DeinterlaceMethod, standard: VideoStandard, parity: FieldParity) -> usize {
+    let off = standard.params().field_row_offset(parity);
+    if method == DeinterlaceMethod::LineDouble {
+        2 * off
+    } else {
+        off
+    }
+}
+
 /// Output frame rows of a field `rows` computable when `lines_ready` field
 /// lines are final.
-pub fn rows_ready(standard: VideoStandard, field: &YuvField, lines_ready: usize, complete: bool) -> usize {
+pub fn rows_ready(
+    standard: VideoStandard,
+    method: DeinterlaceMethod,
+    field: &YuvField,
+    lines_ready: usize,
+    complete: bool,
+) -> usize {
     let h = 2 * field.lines;
     if complete {
         return h;
     }
-    let off = standard.params().field_row_offset(field.parity) as isize;
+    let off = row_offset(method, standard, field.parity) as isize;
     // Row r needs field lines up to the one holding frame row r + 3.
     let r = 2 * lines_ready as isize - 4 + off;
     r.clamp(0, h as isize) as usize
@@ -246,7 +281,7 @@ type RowOut<'b> = (&'b mut [f32], &'b mut [f32], &'b mut [f32], &'b mut [u8]);
 
 impl Ctx<'_> {
     fn own(&self, r: usize) -> bool {
-        r % 2 == self.cur.off
+        r % 2 == self.cur.off % 2
     }
 
     /// Renders output row `r`. Returns the row's source and quality.
@@ -292,7 +327,7 @@ impl Ctx<'_> {
             return meta;
         }
         match self.method {
-            DeinterlaceMethod::Bob => self.bob(r, oy, ou, ov, od),
+            DeinterlaceMethod::Bob | DeinterlaceMethod::LineDouble => self.bob(r, oy, ou, ov, od),
             DeinterlaceMethod::Weave => match self.p {
                 Some(p) => {
                     let (y, u, v, d) = p.rows(ri);
@@ -340,7 +375,7 @@ impl Ctx<'_> {
     #[inline(always)]
     fn woven(&self, r: isize) -> (&[f32], &[f32], &[f32], &[u8]) {
         let r = r.clamp(0, self.height as isize - 1);
-        if r as usize % 2 == self.cur.off {
+        if r as usize % 2 == self.cur.off % 2 {
             self.cur.rows(r)
         } else {
             self.p.expect("previous field").rows(r)
@@ -1217,7 +1252,7 @@ impl PastDeinterlacer {
         let v = |b: u64| if hl as u64 >= b { self.hist(cur, b).map(|f| View::new(f, std)) } else { None };
         let ctx = Ctx {
             method: self.method,
-            cur: View::new(cur, std),
+            cur: View::placed(cur, std, self.method),
             p: v(1),
             pp: v(2),
             ppp: v(3),

@@ -28,6 +28,7 @@ recordings/
 *.openvrx.json
 *.events.jsonl
 openvrx-out/
+bench-runs/
 lab/results/**/*.png
 lab/results/**/*.jpg
 lab/results/**/*.jpeg

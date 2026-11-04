@@ -33,7 +33,7 @@ use openvrx_hw::c5::{find_c5_ports, C5Client, C5Event, C5Settings, ClientConfig,
 use openvrx_hw::control::{GainConfig, GainLoop, GainTable};
 use openvrx_hw::fx2::{self, list_fx2, Fx2Found, Fx2Kind, Fx2Selector, StreamStats};
 use openvrx_hw::receiver::{auto_pair, LivePairIo, Receiver, ReceiverConfig, ReceiverEvent};
-use openvrx_video::{CombineMode, VideoConfig, VideoPipeline};
+use openvrx_video::{CombineMode, DeinterlaceMethod, VideoConfig, VideoPipeline};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as MpscReceiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -92,6 +92,9 @@ pub fn video_config(v: &VideoSettings, standard: VideoStandard) -> VideoConfig {
         DiversityMode::Blend => CombineMode::Blend,
         DiversityMode::SampleRepair => CombineMode::Repair,
     };
+    if v.steady_osd {
+        cfg.deinterlace = DeinterlaceMethod::LineDouble;
+    }
     cfg.streaming = true;
     // The display reads current_frame(); finished-frame copies are not needed.
     cfg.emit_frames = false;
@@ -155,6 +158,31 @@ pub fn rx_status(
         dropped_transfers: stream.map_or(0, |s| s.dropped_blocks + s.transfer_errors),
         share: 0.0,
     }
+}
+
+/// Share of clipped samples above which the OSD warns of overload. The
+/// C5 clips I and Q separately, so a heavily clipped FM signal keeps only
+/// a few phase steps: the picture gets rainbow stripes in its colour band.
+const OVERLOAD_CLIP_PCT: f32 = 30.0;
+/// I/Q RMS (in steps of the lowest carried bit) under which the OSD warns
+/// that the signal is too small for the lanes: a picture of lines.
+const WEAK_RMS_STEPS: f32 = 1.0;
+
+/// OSD warning when the C5's gain does not fit the signal, else None.
+/// `i_rms`/`q_rms` in 10-bit ADC units as in `RxStats`.
+pub fn level_warning(rx: RxId, r: &ReceiverSettings, clip_pct: f32, i_rms: f32, q_rms: f32) -> Option<String> {
+    if clip_pct >= OVERLOAD_CLIP_PCT {
+        return Some(format!("rx{rx} overload: {clip_pct:.0}% of samples clipped, lower the C5 gain"));
+    }
+    let fmt = openvrx_core::SampleFormat::from_preset(r.lanes, r.divider as u32);
+    if let openvrx_core::lanes::LaneEncoding::Iq { i, q } = &fmt.lanes.encoding {
+        let step = (1u32 << i.adc_lsb().min(q.adc_lsb())) as f32;
+        let rms = i_rms.hypot(q_rms) / std::f32::consts::SQRT_2 / step;
+        if rms < WEAK_RMS_STEPS {
+            return Some(format!("rx{rx} signal under one ADC step ({rms:.1}), raise the C5 gain"));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------
@@ -1092,6 +1120,13 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
             }
             let stats = r.dsp.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let stream = r.receiver.stream_stats();
+            let level = stats
+                .as_ref()
+                .filter(|s| s.samples_processed > 0)
+                .and_then(|s| level_warning(r.rx, &r.settings, s.clip_pct, s.i_rms, s.q_rms));
+            if let Some(w) = level {
+                warnings.push(w);
+            }
             let mut status = rx_status(r.rx, &r.settings, r.gain, stats.as_ref(), stream.as_ref());
             status.dropped_samples += r.dsp.shared.lines_dropped.load(Ordering::Relaxed);
             per_rx.push((r.rx, status, stats));
@@ -1171,6 +1206,7 @@ mod tests {
             standard: StandardChoice::Auto,
             diversity: DiversityMode::Select,
             cleanup: true,
+            steady_osd: false,
         };
         let q = video_config(&v, VideoStandard::Ntsc);
         assert_eq!(q.combiner.mode, CombineMode::Select);
@@ -1185,6 +1221,20 @@ mod tests {
         v.cleanup = false;
         let raw = video_config(&v, VideoStandard::Ntsc);
         assert!(!raw.repair_enabled);
+        v.steady_osd = true;
+        assert_eq!(video_config(&v, VideoStandard::Ntsc).deinterlace, DeinterlaceMethod::LineDouble);
+    }
+
+    #[test]
+    fn level_warnings() {
+        // 4x4top: one step is 64 ADC units.
+        let r = ReceiverSettings {
+            lanes: openvrx_core::LanePreset::I4Q4Top,
+            ..ReceiverSettings::default()
+        };
+        assert_eq!(level_warning(0, &r, 0.0, 300.0, 300.0), None);
+        assert!(level_warning(0, &r, 99.0, 450.0, 450.0).unwrap().contains("overload"));
+        assert!(level_warning(0, &r, 0.0, 40.0, 40.0).unwrap().contains("raise"));
     }
 
     #[test]

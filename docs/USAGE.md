@@ -93,3 +93,15 @@ every plug-in.
 
 Wiring tables: `docs/HARDWARE.md`. Board pinouts: `docs/PINOUTS.md`. Test
 results so far: `docs/testing/README.md`.
+
+## Offline and bench tools (`openvrx-cli`)
+
+    openvrx-cli inspect REC [OUT_DIR]            lane activity, I/Q histograms, FM strip image
+    openvrx-cli decode  REC [OUT_DIR] [FRAMES]   decoded frames as PNG
+    openvrx-cli record  OUT_BASE --lanes 4x4top --clk 9 [--seconds 5] [--mhz 5880] [--gain 56]
+    openvrx-cli score   REC [--ref REC] [--frames 30] [--skip 10]
+
+`record` captures FX2-only without the app window; `score` prints one JSON
+line (lock, C/N, clipping, frames, PSNR against a reference recording).
+Attenuation sweeps built on them: `docs/BENCH.md`. Decoded frames and
+recordings stay local.

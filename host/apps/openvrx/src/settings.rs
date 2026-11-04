@@ -480,6 +480,10 @@ pub struct VideoSettings {
     pub diversity: DiversityMode,
     /// Master cleanup switch (Space). Off = raw view whatever the preset.
     pub cleanup: bool,
+    /// Steady OSD (I): every field on the same rows, as goggles show it.
+    /// The flight controller OSD stops jumping a row per field; the camera
+    /// picture loses its half-line placement.
+    pub steady_osd: bool,
 }
 
 impl Default for VideoSettings {
@@ -489,6 +493,7 @@ impl Default for VideoSettings {
             standard: StandardChoice::Auto,
             diversity: DiversityMode::Blend,
             cleanup: true,
+            steady_osd: true,
         }
     }
 }

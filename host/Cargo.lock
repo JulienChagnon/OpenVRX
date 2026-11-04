@@ -2595,6 +2595,7 @@ dependencies = [
  "openvrx-core",
  "openvrx-dsp",
  "openvrx-format",
+ "openvrx-hw",
  "openvrx-video",
 ]
 

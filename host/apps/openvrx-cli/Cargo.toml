@@ -9,4 +9,5 @@ openvrx-core = { path = "../../crates/openvrx-core" }
 openvrx-format = { path = "../../crates/openvrx-format" }
 openvrx-dsp = { path = "../../crates/openvrx-dsp" }
 openvrx-video = { path = "../../crates/openvrx-video" }
+openvrx-hw = { path = "../../crates/openvrx-hw" }
 image = { version = "0.25", default-features = false, features = ["png"] }
