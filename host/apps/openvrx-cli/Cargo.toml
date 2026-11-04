@@ -1,0 +1,12 @@
+[package]
+name = "openvrx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openvrx-core = { path = "../../crates/openvrx-core" }
+openvrx-format = { path = "../../crates/openvrx-format" }
+openvrx-dsp = { path = "../../crates/openvrx-dsp" }
+openvrx-video = { path = "../../crates/openvrx-video" }
+image = { version = "0.25", default-features = false, features = ["png"] }
