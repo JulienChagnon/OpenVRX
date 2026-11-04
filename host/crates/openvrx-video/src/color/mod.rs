@@ -621,3 +621,605 @@ impl ColorDecoder {
         b0..b_new
     }
 
+    /// Completes the field: decodes any remaining lines and keeps the
+    /// field as history for the 3D methods. Returns the lines finished.
+    pub fn finish_field(&mut self, field: Arc<Field>, out: &mut YuvField, parallel: bool) -> Range<usize> {
+        let r = self.advance(&field, field.lines, true, out, parallel);
+        out.first_ns = field.first_ns;
+        out.last_ns = field.last_ns;
+        if let Some(w) = self.work.take() {
+            let keep = match self.k.method {
+                Method::Comb3D => 2 * self.k.frame_back as usize,
+                Method::Transform3D => 2 * (DEPTH - 1),
+                _ => 0,
+            };
+            let mut w = w;
+            if keep > 0 {
+                self.history.push_front(HistField {
+                    seq: w.seq,
+                    parity: w.parity,
+                    field: field.clone(),
+                    bp: Arc::new(std::mem::take(&mut w.bp)),
+                });
+                self.history.truncate(keep);
+            }
+            w.hist3d.clear();
+            self.spare = Some(w);
+        }
+        self.last_key = Some((field.seq, field.parity));
+        r
+    }
+}
+
+/// Final 2D comb mix (separate function with slice arguments, and every
+/// load outside any branch, so that it vectorises).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn comb2d_mix(c0: &[f32], a: &[f32], b: &[f32], vu: &[f32], vd: &[f32], su: &[f32], sd: &[f32], lev: &[f32], eps: f32, chroma: &mut [f32]) {
+    let s = chroma.len();
+    let (c0, a, b, vu, vd, su, sd, lev) = (&c0[..s], &a[..s], &b[..s], &vu[..s], &vd[..s], &su[..s], &sd[..s], &lev[..s]);
+    for j in 0..s {
+        let (vuj, vdj, suj, sdj, c, aj, bj) = (vu[j], vd[j], su[j], sd[j], c0[j], a[j], b[j]);
+        // Missing neighbours carry a zero validity weight.
+        let wu = vuj / (suj + eps);
+        let wd = vdj / (sdj + eps);
+        let wsum = wu + wd;
+        let mix = (wu * (c - aj) + wd * (c - bj)) * 0.5 / wsum;
+        let c2 = if wsum > 0.0 { mix } else { c };
+        let best = if vuj > 0.0 { suj } else { BIG }.min(if vdj > 0.0 { sdj } else { BIG });
+        let mism = best / (2.0 * lev[j] + eps);
+        let k1 = smoothstep(0.6, 1.2, mism);
+        chroma[j] = c2 + k1 * (c - c2);
+    }
+}
+
+/// Read-only inputs of phase A.
+struct LineCtx<'a> {
+    field: &'a Field,
+    bp: &'a [f32],
+    lc: &'a [LineColor],
+    trans: &'a [f32],
+    hist3d: &'a [HistField],
+    first: usize,
+    lines: usize,
+}
+
+impl Kernel {
+    fn new(p: &'static StandardParams, cfg: &ColorConfig) -> Kernel {
+        let method = match p.standard {
+            VideoStandard::Ntsc => match cfg.ntsc {
+                NtscSeparation::Notch => Method::Notch,
+                NtscSeparation::Comb2D => Method::Comb2D,
+                NtscSeparation::Comb3D => Method::Comb3D,
+            },
+            VideoStandard::Pal => match cfg.pal {
+                PalSeparation::Notch | PalSeparation::DelayLine => Method::Notch,
+                PalSeparation::Comb2D => Method::Comb2D,
+                PalSeparation::Comb3D => Method::Comb3D,
+                PalSeparation::Transform2D => Method::Transform2D,
+                PalSeparation::Transform3D => Method::Transform3D,
+            },
+        };
+        let line_average = p.standard == VideoStandard::Pal
+            && (cfg.pal == PalSeparation::DelayLine || cfg.pal_line_average);
+        let rate = p.grid_rate_hz();
+        let f = p.fsc_per_sample();
+        let active = p.active_range();
+        let pad = 20usize;
+        let span = active.start.saturating_sub(pad)..(active.end + pad).min(p.samples_per_line);
+        // Notch: chroma band about +-1.3 MHz; combs and transforms use a
+        // wider band because the comb itself separates luma.
+        let bp = match method {
+            Method::Notch => design_bandpass(f, 1.45e6 / rate, 41),
+            _ => design_bandpass(f, 2.0e6 / rate, 31),
+        };
+        let lp = design_lowpass(cfg.chroma_bandwidth_hz as f64 / rate, 31);
+        let w = p.samples_per_line;
+        let mut osc_c = vec![0.0f32; w];
+        let mut osc_s = vec![0.0f32; w];
+        for x in 0..w {
+            let ph = 2.0 * std::f64::consts::PI * f * x as f64;
+            osc_c[x] = ph.cos() as f32;
+            osc_s[x] = ph.sin() as f32;
+        }
+        let bp_noise_gain = bp.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let transform = match method {
+            Method::Transform2D | Method::Transform3D => Some(TransformPal::new(f, cfg.transform_threshold)),
+            _ => None,
+        };
+        let mut k = Kernel {
+            p,
+            method,
+            line_average,
+            mono: cfg.force_mono,
+            span,
+            active,
+            dilate: (bp.len() / 2 + lp.len() / 2) / 2,
+            bp,
+            lp,
+            osc_c,
+            osc_s,
+            comb_dist: if p.standard == VideoStandard::Pal { 2 } else { 1 },
+            frame_back: if p.standard == VideoStandard::Pal { 4 } else { 2 },
+            bp_noise_gain,
+            transform,
+            brightness: 0.0,
+            contrast: 1.0,
+            sat_cos: 1.0,
+            sat_sin: 0.0,
+            chroma_delay: 0.0,
+            sharpness: 0.0,
+        };
+        k.set_controls(cfg);
+        k
+    }
+
+    fn set_controls(&mut self, cfg: &ColorConfig) {
+        self.brightness = cfg.brightness;
+        self.contrast = cfg.contrast;
+        let h = cfg.hue_deg.to_radians();
+        let g = cfg.saturation * cfg.contrast;
+        self.sat_cos = g * h.cos();
+        self.sat_sin = g * h.sin();
+        self.chroma_delay = cfg.chroma_delay.clamp(-(UV_MARGIN as f32 - 2.0), UV_MARGIN as f32 - 2.0);
+        self.sharpness = cfg.sharpness.clamp(0.0, 1.0);
+    }
+
+    /// Computes one row of transform blocks and overlap-adds it.
+    fn transform_row(&self, tp: &TransformPal, field: &Field, work: &mut FieldWork, y0: isize, parallel: bool) {
+        let s = self.span.len();
+        let nx = s.div_ceil(HOP_X) + 1;
+        let x00 = self.span.start as isize - HOP_X as isize;
+        let w = self.p.samples_per_line as isize;
+        let lines = field.lines as isize;
+        let hist = &work.hist3d;
+        let three_d = self.method == Method::Transform3D && hist.len() == DEPTH - 1;
+        let block = |i: usize| -> [f32; BLOCK_W * BLOCK_H] {
+            thread_local! {
+                static SCRATCH: std::cell::RefCell<Option<transform::Scratch>> = const { std::cell::RefCell::new(None) };
+            }
+            let xo = x00 + (i * HOP_X) as isize;
+            let mut out = [0.0f32; BLOCK_W * BLOCK_H];
+            SCRATCH.with(|cell| {
+                let mut opt = cell.borrow_mut();
+                let sc = opt.get_or_insert_with(|| transform::Scratch::new(tp));
+                if three_d {
+                    let get = |t: usize, r: usize, c: usize| -> f32 {
+                        let f: &Field = if t == 0 { field } else { &hist[t - 1].field };
+                        let y = (y0 + r as isize).clamp(0, lines - 1) as usize;
+                        let x = (xo + c as isize).clamp(0, w - 1) as usize;
+                        f.video[y * f.width + x]
+                    };
+                    let motion = tp.block_3d(&get, sc, &mut out);
+                    // Where the block moved, fall back toward 2D.
+                    let k = smoothstep(0.02, 0.08, motion);
+                    if k > 0.0 {
+                        let get2 = |r: usize, c: usize| get(0, r, c);
+                        let mut o2 = [0.0f32; BLOCK_W * BLOCK_H];
+                        tp.block_2d(&get2, sc, &mut o2);
+                        for (a, b) in out.iter_mut().zip(&o2) {
+                            *a += k * (b - *a);
+                        }
+                    }
+                } else {
+                    let get = |r: usize, c: usize| -> f32 {
+                        let y = (y0 + r as isize).clamp(0, lines - 1) as usize;
+                        let x = (xo + c as isize).clamp(0, w - 1) as usize;
+                        field.video[y * field.width + x]
+                    };
+                    tp.block_2d(&get, sc, &mut out);
+                }
+            });
+            out
+        };
+        let blocks: Vec<[f32; BLOCK_W * BLOCK_H]> = if parallel {
+            (0..nx).into_par_iter().map(block).collect()
+        } else {
+            (0..nx).map(block).collect()
+        };
+        // Overlap-add into decode lines (field line first-1 is index 0).
+        let dec0 = work.first as isize - 1;
+        let n_dec = (work.active_lines + 1) as isize;
+        for (i, b) in blocks.iter().enumerate() {
+            let xo = x00 + (i * HOP_X) as isize;
+            for r in 0..BLOCK_H {
+                let di = y0 + r as isize - dec0;
+                if di < 0 || di >= n_dec {
+                    continue;
+                }
+                let row = &mut work.trans[di as usize * s..(di as usize + 1) * s];
+                for c in 0..BLOCK_W {
+                    let sx = xo + c as isize - self.span.start as isize;
+                    if sx >= 0 && (sx as usize) < s {
+                        row[sx as usize] += b[r * BLOCK_W + c];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase A for decode line `i` (field line first - 1 + i): chroma
+    /// separation, luma, raw U/V demodulation and the damage footprint.
+    fn phase_a(&self, ctx: &LineCtx, i: usize, y_out: &mut [f32], u_out: &mut [f32], v_out: &mut [f32], d_out: &mut [u8]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::util::has_avx2() {
+                // SAFETY: AVX2 and FMA are available (checked at run time).
+                unsafe { self.phase_a_avx2(ctx, i, y_out, u_out, v_out, d_out) };
+            return;
+            }
+        }
+        self.phase_a_impl(ctx, i, y_out, u_out, v_out, d_out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn phase_a_avx2(&self, ctx: &LineCtx, i: usize, y_out: &mut [f32], u_out: &mut [f32], v_out: &mut [f32], d_out: &mut [u8]) {
+        self.phase_a_impl(ctx, i, y_out, u_out, v_out, d_out)
+    }
+
+    #[inline(always)]
+    fn phase_a_impl(&self, ctx: &LineCtx, i: usize, y_out: &mut [f32], u_out: &mut [f32], v_out: &mut [f32], d_out: &mut [u8]) {
+        let p = self.p;
+        let n = ctx.first - 1 + i;
+        let s = self.span.len();
+        let x0 = self.span.start;
+        let field = ctx.field;
+        let line = field.line(n);
+        let dmg = field.damage_line(n);
+        let bp_n = &ctx.bp[n * s..(n + 1) * s];
+        let lc = ctx.lc[n];
+        let q = field.quality[n];
+        let noise = if q.noise_ire.is_finite() { q.noise_ire.min(30.0) } else { 3.0 };
+        let mut chroma = scratch_any(s);
+        let mut dmg_extra: Option<Vec<u8>> = None;
+
+        match self.method {
+            Method::Notch => chroma.copy_from_slice(bp_n),
+            Method::Comb2D | Method::Comb3D => {
+                self.comb2d(ctx, n, noise, &mut chroma);
+                if self.method == Method::Comb3D && !ctx.hist3d.is_empty() {
+                    self.comb3d(ctx, n, noise, &mut chroma);
+                }
+            }
+            Method::Transform2D | Method::Transform3D => {
+                chroma.copy_from_slice(&ctx.trans[i * s..(i + 1) * s]);
+                // The block transform spreads a damaged sample over its
+                // vertical neighbours.
+                let mut d = vec![0u8; s];
+                for nn in [n.saturating_sub(1), (n + 1).min(ctx.lines - 1)] {
+                    let dl = field.damage_line(nn);
+                    for (o, &v) in d.iter_mut().zip(&dl[self.span.clone()]) {
+                        if v >= damage::CLICK && *o < v {
+                            *o = v;
+                        }
+                    }
+                }
+                dmg_extra = Some(d);
+            }
+        }
+
+        // Luma over the active range.
+        let a = self.active.clone();
+        let black = p.black_ire;
+        let inv_span = 1.0 / (p.white_ire - p.black_ire);
+        let sep = lc.sep;
+        let la = &line[a.clone()];
+        let ca = &chroma[a.start - x0..a.end - x0];
+        for ((o, &l), &c) in y_out.iter_mut().zip(la).zip(ca) {
+            *o = (l - sep * c - black) * inv_span;
+        }
+
+        // Demodulation: mix to baseband, lowpass, rotate by the line phase.
+        let mut mc = scratch_any(s);
+        let mut ms = scratch_any(s);
+        {
+            let oc = &self.osc_c[x0..x0 + s];
+            let os = &self.osc_s[x0..x0 + s];
+            let (mc, ms, ch) = (&mut mc[..s], &mut ms[..s], &chroma[..s]);
+            for j in 0..s {
+                mc[j] = ch[j] * oc[j];
+                ms[j] = ch[j] * os[j];
+            }
+        }
+        let g = 2.0 * lc.gain * inv_span;
+        let (cph, sph) = (lc.phase.cos(), lc.phase.sin());
+        // Lowpass both mixer products at the U/V output positions (span
+        // coordinates, clamped at the span edges).
+        let ustart = a.start - UV_MARGIN - x0;
+        let un = u_out.len();
+        let mut zr = scratch_any(un);
+        let mut zi = scratch_any(un);
+        crate::util::fir_range(&mc, &self.lp, ustart..ustart + un, &mut zr);
+        crate::util::fir_range(&ms, &self.lp, ustart..ustart + un, &mut zi);
+        {
+            let (zr, zi, v_out) = (&zr[..un], &zi[..un], &mut v_out[..un]);
+            let vs = lc.vswitch;
+            for k in 0..un {
+                let zr = zr[k];
+                let zi = -zi[k];
+                // (V' - jU) = z * exp(-j phase)
+                let wr = zr * cph + zi * sph;
+                let wi = zi * cph - zr * sph;
+                v_out[k] = g * wr * vs;
+                u_out[k] = -g * wi;
+            }
+        }
+
+        // Damage footprint of this line (fast path for clean lines).
+        let none = |d: &[u8]| d.iter().fold(0u8, |a, &b| a | b) == 0;
+        let clean = none(&dmg[self.span.clone()]) && dmg_extra.as_deref().map(none).unwrap_or(true);
+        if clean {
+            d_out.fill(0);
+            return;
+        }
+        let mut dl = vec![0u8; p.samples_per_line];
+        dilate_u8(dmg, self.dilate, &mut dl);
+        if let Some(extra) = dmg_extra {
+            let mut e = vec![0u8; s];
+            dilate_u8(&extra, self.dilate, &mut e);
+            for (j, &v) in e.iter().enumerate() {
+                let x = x0 + j;
+                if dl[x] < v {
+                    dl[x] = v;
+                }
+            }
+        }
+        d_out.copy_from_slice(&dl[a]);
+    }
+
+    /// Adaptive 2D comb into `chroma` (span coordinates).
+    #[inline(always)]
+    fn comb2d(&self, ctx: &LineCtx, n: usize, noise: f32, chroma: &mut [f32]) {
+        let s = self.span.len();
+        let x0 = self.span.start;
+        let d = self.comb_dist;
+        let bp = ctx.bp;
+        let c0 = &bp[n * s..(n + 1) * s];
+        let up = if n >= d { Some(n - d) } else { None };
+        let dn = if n + d < ctx.lines { Some(n + d) } else { None };
+        let eps = 0.5 + 1.5 * noise * self.bp_noise_gain;
+        // Similarity and validity rows: written in full by `sim`, or set to
+        // "no neighbour" below.
+        let mut su = scratch_any(s);
+        let mut sd = scratch_any(s);
+        let mut lev = scratch_any(s);
+        let mut vu = scratch_any(s);
+        let mut vd = scratch_any(s);
+        // Neighbour similarity is judged on the chroma-free part of the
+        // lines (composite minus its chroma band): a neighbour whose luma
+        // matches the current line cancels luma in the comb.
+        // All loops run over equal-length slices so that they vectorise.
+        let span = x0..x0 + s;
+        let cur = &ctx.field.line(n)[span.clone()];
+        for (l, &c) in lev[..s].iter_mut().zip(c0) {
+            *l = c.abs();
+        }
+        let sim = |nb: usize, sv: &mut [f32], vv: &mut [f32]| {
+            let a = &bp[nb * s..(nb + 1) * s];
+            let la = &ctx.field.line(nb)[span.clone()];
+            let da = &ctx.field.damage_line(nb)[span.clone()];
+            let (sv, vv) = (&mut sv[..s], &mut vv[..s]);
+            for j in 0..s {
+                sv[j] = ((cur[j] - c0[j]) - (la[j] - a[j])).abs();
+                vv[j] = if da[j] >= damage::CLICK { 0.0 } else { 1.0 };
+            }
+        };
+        match up {
+            Some(u) => sim(u, &mut su, &mut vu),
+            None => {
+                su.fill(BIG);
+                vu.fill(0.0);
+            }
+        }
+        match dn {
+            Some(dd) => sim(dd, &mut sd, &mut vd),
+            None => {
+                sd.fill(BIG);
+                vd.fill(0.0);
+            }
+        }
+        let (mut su_b, mut sd_b, mut lev_b) = (scratch_any(s), scratch_any(s), scratch_any(s));
+        box5_into(&su, &mut su_b);
+        box5_into(&sd, &mut sd_b);
+        box5_into(&lev, &mut lev_b);
+        let (su, sd, lev) = (su_b, sd_b, lev_b);
+        let zero = scratch(s, 0.0);
+        let a = &up.map(|u| &bp[u * s..(u + 1) * s]).unwrap_or(&zero)[..s];
+        let b = &dn.map(|v| &bp[v * s..(v + 1) * s]).unwrap_or(&zero)[..s];
+        comb2d_mix(c0, a, b, &vu, &vd, &su, &sd, &lev, eps, chroma);
+    }
+
+    /// 3D comb: blends in the frame comb where nothing moved.
+    #[inline(always)]
+    fn comb3d(&self, ctx: &LineCtx, n: usize, noise: f32, chroma: &mut [f32]) {
+        let s = self.span.len();
+        let x0 = self.span.start;
+        let h = &ctx.hist3d[0];
+        if n >= h.field.lines {
+            return;
+        }
+        let c0 = &ctx.bp[n * s..(n + 1) * s];
+        let pb = &h.bp[n * s..(n + 1) * s];
+        let cur = ctx.field.line(n);
+        let prev = h.field.line(n);
+        let dprev = h.field.damage_line(n);
+        // Luma motion: the composite minus its chroma band is identical in
+        // both frames when nothing moved.
+        let mut ld = scratch(s, 0.0);
+        let mut cd = scratch(s, 0.0);
+        for j in 0..s {
+            let x = x0 + j;
+            ld[j] = ((cur[x] - c0[j]) - (prev[x] - pb[j])).abs();
+        }
+        // Chroma-band motion: against the same-phase frame two frame
+        // periods back when it exists, else (conservatively) the
+        // inverted-chroma consistency, which also flags static luma in the
+        // chroma band.
+        match ctx.hist3d.get(1) {
+            Some(h2) if n < h2.field.lines => {
+                let b2 = &h2.bp[n * s..(n + 1) * s];
+                for j in 0..s {
+                    cd[j] = (c0[j] - b2[j]).abs();
+                }
+            }
+            _ => {
+                for j in 0..s {
+                    cd[j] = (c0[j] + pb[j]).abs();
+                }
+            }
+        }
+        let mut ldf = scratch(s, 0.0);
+        let mut cdf = scratch(s, 0.0);
+        box5_into(&ld, &mut ldf);
+        box5_into(&cd, &mut cdf);
+        let (ld, cd) = (ldf, cdf);
+        let thr_l = 1.5 + 2.5 * noise;
+        let thr_c = 1.5 + 2.5 * noise * self.bp_noise_gain * 1.5;
+        let mut mot = scratch(s, 0.0);
+        for j in 0..s {
+            mot[j] = (ld[j] / thr_l).max(cd[j] / thr_c);
+        }
+        // Dilate motion over +-4 samples.
+        let mut md = scratch(s, 0.0);
+        for j in 0..s {
+            let lo = j.saturating_sub(4);
+            let hi = (j + 5).min(s);
+            md[j] = mot[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v));
+        }
+        for j in 0..s {
+            let valid = dprev[x0 + j] < damage::CLICK;
+            if !valid {
+                continue;
+            }
+            let k3 = 1.0 - smoothstep(0.7, 1.5, md[j]);
+            let c3 = 0.5 * (c0[j] - pb[j]);
+            chroma[j] = k3 * c3 + (1.0 - k3) * chroma[j];
+        }
+    }
+
+    /// Phase B for active line j: PAL line averaging, controls, chroma
+    /// delay, sharpening.
+    fn phase_b(&self, work: &FieldWork, j: usize, y: &mut [f32], u: &mut [f32], v: &mut [f32], d: &mut [u8]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::util::has_avx2() {
+                // SAFETY: AVX2 and FMA are available (checked at run time).
+                unsafe { self.phase_b_avx2(work, j, y, u, v, d) };
+            return;
+            }
+        }
+        self.phase_b_impl(work, j, y, u, v, d)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn phase_b_avx2(&self, work: &FieldWork, j: usize, y: &mut [f32], u: &mut [f32], v: &mut [f32], d: &mut [u8]) {
+        self.phase_b_impl(work, j, y, u, v, d)
+    }
+
+    #[inline(always)]
+    fn phase_b_impl(&self, work: &FieldWork, j: usize, y: &mut [f32], u: &mut [f32], v: &mut [f32], d: &mut [u8]) {
+        let w = y.len();
+        let wu = w + 2 * UV_MARGIN;
+        let (u, v, d) = (&mut u[..w], &mut v[..w], &mut d[..w]);
+        let i = j + 1; // decode index of this line
+        let yr = &work.y_raw[i * w..(i + 1) * w];
+        let ur = &work.u_raw[i * wu..(i + 1) * wu];
+        let vr = &work.v_raw[i * wu..(i + 1) * wu];
+        let dr = &work.dmg_raw[i * w..(i + 1) * w];
+        let mut ub = scratch_any(wu);
+        let mut vb = scratch_any(wu);
+        if self.line_average {
+            let up = &work.u_raw[(i - 1) * wu..i * wu];
+            let vp = &work.v_raw[(i - 1) * wu..i * wu];
+            let (ub, vb) = (&mut ub[..wu], &mut vb[..wu]);
+            for k in 0..wu {
+                ub[k] = 0.5 * (ur[k] + up[k]);
+                vb[k] = 0.5 * (vr[k] + vp[k]);
+            }
+            let dp = &work.dmg_raw[(i - 1) * w..i * w];
+            for k in 0..w {
+                d[k] = dr[k].max(dp[k]);
+            }
+        } else {
+            ub.copy_from_slice(ur);
+            vb.copy_from_slice(vr);
+            d.copy_from_slice(dr);
+        }
+        // Chroma delay (linear interpolation) and hue/saturation.
+        let pos = UV_MARGIN as f32 - self.chroma_delay;
+        let i0 = pos.floor();
+        let t = pos - i0;
+        let i0 = i0 as usize;
+        let (ua, ub1) = (&ub[i0..i0 + w], &ub[i0 + 1..i0 + 1 + w]);
+        let (va, vb1) = (&vb[i0..i0 + w], &vb[i0 + 1..i0 + 1 + w]);
+        let (sc, ss) = (self.sat_cos, self.sat_sin);
+        for k in 0..w {
+            let uu = ua[k] + t * (ub1[k] - ua[k]);
+            let vv = va[k] + t * (vb1[k] - va[k]);
+            u[k] = uu * sc - vv * ss;
+            v[k] = uu * ss + vv * sc;
+        }
+        // Luma: contrast, brightness, optional sharpening with coring.
+        let c = self.contrast;
+        let b = self.brightness;
+        if self.sharpness > 0.0 {
+            let amt = 0.8 * self.sharpness;
+            for k in 0..w {
+                let g = |o: isize| yr[(k as isize + o).clamp(0, w as isize - 1) as usize];
+                let lp = (g(-2) + 2.0 * g(-1) + 2.0 * g(0) + 2.0 * g(1) + g(2)) * 0.125;
+                let hp = g(0) - lp;
+                let cored = if hp.abs() < 0.004 { 0.0 } else { hp - 0.004 * hp.signum() };
+                y[k] = (g(0) + amt * cored) * c + b;
+            }
+        } else {
+            for k in 0..w {
+                y[k] = yr[k] * c + b;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::{CompositeEncoder, EncoderConfig};
+    use crate::testgen::{color_bars, field_info, image_to_field};
+
+    #[test]
+    fn bars_roughly_decode_all_methods() {
+        for std in VideoStandard::ALL {
+            let p = std.params();
+            let img = color_bars(p.active_width(), p.frame_height(), 0.75);
+            let enc = CompositeEncoder::new(std, EncoderConfig::default());
+            let cfg = ColorConfig {
+                ntsc: NtscSeparation::Notch,
+                pal: PalSeparation::DelayLine,
+                ..ColorConfig::default()
+            };
+            let mut dec = ColorDecoder::new(std, &cfg);
+            let mut last = None;
+            for seq in 0..4u64 {
+                let (par, fi) = field_info(seq);
+                let f = image_to_field(&img, std, par, seq);
+                let recs = enc.encode_field(&f, fi, 0);
+                let mut fld = Field::new(std, seq, par);
+                for r in &recs {
+                    fld.put_line(r);
+                }
+                last = Some((dec.decode_field(Arc::new(fld)), f));
+            }
+            let (out, truth) = last.unwrap();
+            let w = out.width;
+            let j = out.lines / 2;
+            for bar in 0..8 {
+                let x = (bar * 2 + 1) * w / 16;
+                let k = j * w + x;
+                assert!((out.y[k] - truth.y[k]).abs() < 0.02, "{std:?} bar {bar} y {} vs {}", out.y[k], truth.y[k]);
+                assert!((out.u[k] - truth.u[k]).abs() < 0.03, "{std:?} bar {bar} u {} vs {}", out.u[k], truth.u[k]);
+                assert!((out.v[k] - truth.v[k]).abs() < 0.03, "{std:?} bar {bar} v {} vs {}", out.v[k], truth.v[k]);
+            }
+        }
+    }
+}
