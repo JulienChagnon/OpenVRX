@@ -839,11 +839,14 @@ fn handle(ctx: &BackendContext, st: &mut State, cmd: AppCommand) {
 fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSource) {
     let rxs = match source {
         ViewSource::Receivers { rx } => rx,
-        ViewSource::Test { .. } => {
-            ctx.emit(BackendEvent::ViewFailed {
+        ViewSource::Test { pattern, standard } => {
+            // A clean pattern next to the receivers: the reference for the
+            // side-by-side comparison (no hardware, no simulated damage).
+            let mut cfg = crate::source::test_pattern::TestSourceConfig::new(pattern, standard, (2 * view) as RxId);
+            cfg.clean = true;
+            ctx.emit(BackendEvent::ViewOpened {
                 view,
-                error: "the live backend shows receivers only (start with --source test for patterns)"
-                    .into(),
+                source: Box::new(crate::source::test_pattern::TestPatternSource::start(cfg)),
             });
             return;
         }

@@ -633,16 +633,32 @@ pub enum TestPattern {
     MovingBox,
     /// Fast vertical bar: shows tearing and slice presentation.
     Sweep,
+    /// The bench ESP32's NTSC test patterns (tools/bench/att_ctl), drawn
+    /// exactly as it sends them: the reference for side-by-side comparison.
+    BenchCard,
+    BenchBars,
+    BenchRamp,
+    BenchCheck,
+    BenchGrey,
+    BenchBlack,
+    BenchWhite,
 }
 
 impl TestPattern {
     #[cfg(test)]
-    pub const ALL: [TestPattern; 5] = [
+    pub const ALL: [TestPattern; 12] = [
         TestPattern::Mix,
         TestPattern::Bars,
         TestPattern::ZonePlate,
         TestPattern::MovingBox,
         TestPattern::Sweep,
+        TestPattern::BenchCard,
+        TestPattern::BenchBars,
+        TestPattern::BenchRamp,
+        TestPattern::BenchCheck,
+        TestPattern::BenchGrey,
+        TestPattern::BenchBlack,
+        TestPattern::BenchWhite,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -651,7 +667,28 @@ impl TestPattern {
             TestPattern::ZonePlate => "zone plate",
             TestPattern::MovingBox => "moving box",
             TestPattern::Sweep => "sweep",
+            TestPattern::BenchCard => "bench card",
+            TestPattern::BenchBars => "bench bars",
+            TestPattern::BenchRamp => "bench ramp",
+            TestPattern::BenchCheck => "bench check",
+            TestPattern::BenchGrey => "bench grey",
+            TestPattern::BenchBlack => "bench black",
+            TestPattern::BenchWhite => "bench white",
         }
+    }
+    /// A bench ESP32 pattern by its att_ctl name (card, bars, ramp, check,
+    /// grey, black, white).
+    pub fn bench(name: &str) -> Option<TestPattern> {
+        Some(match name {
+            "card" => TestPattern::BenchCard,
+            "bars" => TestPattern::BenchBars,
+            "ramp" => TestPattern::BenchRamp,
+            "check" => TestPattern::BenchCheck,
+            "grey" => TestPattern::BenchGrey,
+            "black" => TestPattern::BenchBlack,
+            "white" => TestPattern::BenchWhite,
+            _ => return None,
+        })
     }
 }
 

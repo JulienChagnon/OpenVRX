@@ -64,6 +64,18 @@ pub struct Args {
     /// Run this many seconds, print latency statistics and exit.
     #[arg(long, value_name = "SECONDS")]
     pub run_for: Option<f64>,
+    /// Bench ESP32 pattern shown beside the live picture by key X: card,
+    /// bars, ramp, check, grey, black, white.
+    #[arg(long, value_name = "PATTERN", default_value = "card",
+          value_parser = ["card", "bars", "ramp", "check", "grey", "black", "white"])]
+    pub compare_pattern: String,
+    /// Start in the side-by-side comparison (key X toggles it).
+    #[arg(long)]
+    pub compare: bool,
+    /// Take bench commands on stdin (record FOLDER, stop, compare, quit)
+    /// and print backend messages on stdout (tools/bench/bench.py --live).
+    #[arg(long)]
+    pub bench_control: bool,
     /// Render a test pattern offscreen through the display shader to this
     /// PNG and exit.
     #[arg(long, value_name = "PNG")]

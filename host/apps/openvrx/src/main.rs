@@ -120,6 +120,9 @@ fn main() -> ExitCode {
     let source = args.source;
     let run_for = args.run_for;
     let note = loaded.note;
+    let compare_pattern = settings::TestPattern::bench(&args.compare_pattern).unwrap_or(settings::TestPattern::BenchCard);
+    let compare = args.compare;
+    let bench_control = args.bench_control;
     let result = eframe::run_native(
         "OpenVRX",
         options,
@@ -128,7 +131,14 @@ fn main() -> ExitCode {
                 SourceKind::Test => backend::BackendHandle::spawn("test", waker, backend::test::run),
                 SourceKind::Live => backend::BackendHandle::spawn("live", waker, backend::live::run),
             };
-            let app = app::OpenvrxApp::new(cc, s, store, start, run_for, note)?;
+            let mut app = app::OpenvrxApp::new(cc, s, store, start, run_for, note)?;
+            app.compare_pattern = compare_pattern;
+            if compare {
+                app.toggle_compare();
+            }
+            if bench_control {
+                app.start_bench_control(cc.egui_ctx.clone());
+            }
             Ok(Box::new(app))
         }),
     );

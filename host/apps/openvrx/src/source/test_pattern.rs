@@ -38,6 +38,9 @@ pub struct TestSourceConfig {
     pub chunk_lines: usize,
     /// Simulated sample clock (Hz) for the rate read-outs.
     pub sample_rate_hz: f64,
+    /// Reference view: no simulated damage or receiver switching, just the
+    /// pattern (side-by-side comparison against a live picture).
+    pub clean: bool,
 }
 
 impl TestSourceConfig {
@@ -49,6 +52,7 @@ impl TestSourceConfig {
             freq_mhz: Arc::new(AtomicU32::new(5658)),
             chunk_lines: 8,
             sample_rate_hz: 240e6 / 18.0,
+            clean: false,
         }
     }
 }
@@ -146,9 +150,52 @@ fn sweep_rgb(nx: f32, ny: f32, t: f32) -> [f32; 3] {
     [0.05, 0.05, 0.05]
 }
 
+/// The bench ESP32's patterns in IRE (black 7.5, white 100), on its grid of
+/// 106 picture samples by 240 field rows: the same function as
+/// `ntsc_pattern_ire` in tools/bench/att_ctl/ntsc_frame.c.
+fn bench_ire(pattern: TestPattern, x: i32, row: i32) -> f32 {
+    const W: i32 = 106;
+    const BLACK: f32 = 7.5;
+    const WHITE: f32 = 100.0;
+    let grey_step = |steps: i32| BLACK + (WHITE - BLACK) * (x * steps / W) as f32 / (steps - 1) as f32;
+    let ramp = || BLACK + (WHITE - BLACK) * x as f32 / (W - 1) as f32;
+    let check = |r: i32| if ((x / 8) + (r / 20)) & 1 == 1 { WHITE } else { BLACK };
+    let stripes = || {
+        let half = 1 << (x * 4 / W);
+        if (x / half) & 1 == 1 { WHITE } else { BLACK }
+    };
+    match pattern {
+        TestPattern::BenchCard => match row {
+            0..=59 => grey_step(8),
+            60..=119 => stripes(),
+            120..=179 => ramp(),
+            _ => check(row - 180),
+        },
+        TestPattern::BenchBars => grey_step(8),
+        TestPattern::BenchRamp => ramp(),
+        TestPattern::BenchCheck => check(row),
+        TestPattern::BenchGrey => 50.0,
+        TestPattern::BenchBlack => BLACK,
+        _ => WHITE,
+    }
+}
+
 /// One pattern pixel as RGB 0..1 (gamma coded).
 pub fn pattern_rgb(pattern: TestPattern, nx: f32, ny: f32, t: f32) -> [f32; 3] {
     match pattern {
+        TestPattern::BenchCard
+        | TestPattern::BenchBars
+        | TestPattern::BenchRamp
+        | TestPattern::BenchCheck
+        | TestPattern::BenchGrey
+        | TestPattern::BenchBlack
+        | TestPattern::BenchWhite => {
+            let x = ((nx * 106.0) as i32).clamp(0, 105);
+            let row = ((ny * 240.0) as i32).clamp(0, 239);
+            // Picture level 0..1 from black to white, as the decoder shows it.
+            let l = ((bench_ire(pattern, x, row) - 7.5) / 92.5).clamp(0.0, 1.0);
+            [l, l, l]
+        }
         TestPattern::Bars => bars_rgb(nx, ny, t),
         TestPattern::ZonePlate => {
             let l = zone_plate(nx, ny, t);
@@ -423,7 +470,7 @@ fn run(
         let t = (clock.field_start_ns(field) * 1e-9) as f32;
         let cn = simulated_cn(t, phase);
         let best_cn = cn[0].max(cn[1]);
-        let prob = damage_probability(best_cn);
+        let prob = if config.clean { 0.0 } else { damage_probability(best_cn) };
         let mut k0 = 0;
         while k0 < lines {
             let k1 = (k0 + chunk).min(lines);
@@ -432,7 +479,11 @@ fn run(
                 return;
             }
             for k in k0..k1 {
-                let src = simulated_row_source(cn, k, t, config.rx_base);
+                let src = if config.clean {
+                    config.rx_base
+                } else {
+                    simulated_row_source(cn, k, t, config.rx_base)
+                };
                 let slot = if src == COMBINED {
                     2
                 } else {
@@ -545,6 +596,26 @@ mod tests {
             pattern_rgb(TestPattern::Bars, 0.01, 0.1, 0.0),
             pattern_rgb(TestPattern::Bars, 0.01, 0.1, 2.0)
         );
+    }
+
+    #[test]
+    fn bench_card_matches_the_esp32() {
+        // Points of ntsc_pattern_ire() in tools/bench/att_ctl/ntsc_frame.c.
+        let c = |x, row| bench_ire(TestPattern::BenchCard, x, row);
+        assert_eq!(c(0, 0), 7.5); // grey steps
+        assert_eq!(c(105, 0), 100.0);
+        assert_eq!(c(0, 60), 7.5); // 1 MHz stripes alternate every sample
+        assert_eq!(c(1, 60), 100.0);
+        assert_eq!(c(80, 60), 7.5); // 0.13 MHz zone: 8 black, 8 white
+        assert_eq!(c(88, 60), 100.0);
+        assert_eq!(c(0, 120), 7.5); // ramp
+        assert_eq!(c(105, 120), 100.0);
+        assert_eq!(c(0, 180), 7.5); // checkerboard, cells 8 x 20
+        assert_eq!(c(8, 180), 100.0);
+        assert_eq!(c(0, 200), 100.0);
+        assert_eq!(bench_ire(TestPattern::BenchGrey, 50, 100), 50.0);
+        assert_eq!(TestPattern::bench("card"), Some(TestPattern::BenchCard));
+        assert_eq!(TestPattern::bench("nope"), None);
     }
 
     #[test]

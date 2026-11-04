@@ -15,7 +15,9 @@ use crate::keys::{action_for, key_name, Action, BINDINGS};
 use crate::layout::{fit_picture, pixel_aspect, view_cells, Rect as LRect, CELL_GAP};
 use crate::osd::{fmt_latency, paint_global, paint_view, ViewOsd};
 use crate::present::{choose_present_mode, mode_name, PresentScheduler};
-use crate::settings::{AppSettings, ControlMode, PresentTrigger, SettingsStore, VIEW_SLOTS};
+use crate::settings::{
+    AppSettings, ControlMode, PresentTrigger, SettingsStore, TestPattern, ViewLayout, ViewSource, VIEW_SLOTS,
+};
 use crate::source::{DirtyRows, FrameSource, SourceStatus, UploadStaging, Waker};
 use crate::stats::{LatencyStats, RateMeter, Summary};
 use crate::{channels, panels};
@@ -82,6 +84,12 @@ pub struct OpenvrxApp {
     adapter_name: String,
     /// Uploaded views whose latency is recorded at the end of this frame.
     uploaded: Vec<(usize, u64)>,
+    /// Reference pattern of the side-by-side comparison (key X).
+    pub compare_pattern: TestPattern,
+    /// Layout and second view's source before the comparison, to restore.
+    compare_saved: Option<(ViewLayout, ViewSource)>,
+    /// Bench control on stdin (`--bench-control`): lines in, messages out.
+    bench_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl OpenvrxApp {
@@ -141,7 +149,78 @@ impl OpenvrxApp {
             waker,
             adapter_name,
             uploaded: Vec::new(),
+            compare_pattern: TestPattern::BenchCard,
+            compare_saved: None,
+            bench_rx: None,
         })
+    }
+
+    /// Side by side: view 1 stays the live picture, view 2 shows the bench
+    /// test card as the ESP32 sends it. Again restores the previous layout.
+    pub fn toggle_compare(&mut self) {
+        if let Some((layout, source)) = self.compare_saved.take() {
+            self.settings.display.layout = layout;
+            self.settings.views[1].source = source;
+            self.note("compare off");
+        } else {
+            self.compare_saved = Some((self.settings.display.layout, self.settings.views[1].source.clone()));
+            self.settings.display.layout = ViewLayout::Dual;
+            self.settings.views[1].source = ViewSource::Test {
+                pattern: self.compare_pattern,
+                standard: openvrx_core::VideoStandard::Ntsc,
+            };
+            self.note(format!("compare: live | {}", self.compare_pattern.name()));
+        }
+    }
+
+    /// Reads bench commands from stdin, one per line (`record FOLDER`,
+    /// `stop`, `compare`, `quit`), and echoes every backend message to
+    /// stdout as `MSG ...` so a script can follow (tools/bench/bench.py --live).
+    pub fn start_bench_control(&mut self, ctx: egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("bench-stdin".into()).spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+        if spawned.is_ok() {
+            self.bench_rx = Some(rx);
+            bench_out("READY");
+        }
+    }
+
+    fn pump_bench(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.bench_rx.as_ref() else { return };
+        let lines: Vec<String> = rx.try_iter().collect();
+        for line in lines {
+            let line = line.trim();
+            let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
+            match cmd {
+                "record" if !arg.is_empty() => {
+                    self.backend.send(AppCommand::StartRecording { folder: arg.into() });
+                    bench_out(&format!("OK record {arg}"));
+                }
+                "stop" => {
+                    self.backend.send(AppCommand::StopRecording);
+                    bench_out("OK stop");
+                }
+                "compare" => {
+                    self.toggle_compare();
+                    bench_out("OK compare");
+                }
+                "quit" => {
+                    bench_out("OK quit");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                "" => {}
+                _ => bench_out(&format!("ERR {cmd} unknown")),
+            }
+        }
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -207,6 +286,9 @@ impl OpenvrxApp {
                         MessageLevel::Warning => "warning: ",
                         MessageLevel::Error => "error: ",
                     };
+                    if self.bench_rx.is_some() {
+                        bench_out(&format!("MSG {prefix}{text}"));
+                    }
                     self.note(format!("{prefix}{text}"));
                 }
             }
@@ -340,6 +422,7 @@ impl OpenvrxApp {
                     d.hd3_mode = false;
                 }
             }
+            Action::Compare => self.toggle_compare(),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -527,6 +610,7 @@ impl eframe::App for OpenvrxApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = now_ns();
+        self.pump_bench(&ctx);
         self.pump_backend();
         self.poll_sources(now);
         if self.scheduler.due(now) {
@@ -586,8 +670,20 @@ impl eframe::App for OpenvrxApp {
     }
 
     fn on_exit(&mut self) {
+        // Do not save the comparison as the user's layout.
+        if self.compare_saved.is_some() {
+            self.toggle_compare();
+        }
         self.backend.send(AppCommand::StopRecording);
         self.store.update(&self.settings);
         self.store.flush();
     }
+}
+
+/// One line to stdout for the bench script (`--bench-control`), flushed at once.
+fn bench_out(line: &str) {
+    use std::io::Write;
+    let mut o = std::io::stdout().lock();
+    let _ = writeln!(o, "{line}");
+    let _ = o.flush();
 }
