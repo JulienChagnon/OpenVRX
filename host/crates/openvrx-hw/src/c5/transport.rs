@@ -83,10 +83,15 @@ impl SystemSerial {
     /// Opens a port. DTR and RTS stay deasserted: on the ESP32-C5 USB
     /// Serial/JTAG those lines drive the chip's reset and boot strapping.
     pub fn open(name: &str) -> Result<SystemSerial> {
-        let mut port = serialport::new(name, 115_200)
-            .timeout(Duration::from_millis(10))
-            .dtr_on_open(false)
-            .open()?;
+        let builder = serialport::new(name, 115_200).timeout(Duration::from_millis(10));
+        // Windows applies this before the lines change, so they never go high.
+        // Not on Linux: the kernel raises DTR and RTS together on open (idle on
+        // the C5), and dropping DTR first would give DTR low + RTS high, the
+        // USB Serial/JTAG reset that hangs a running C5.
+        #[cfg(windows)]
+        let builder = builder.dtr_on_open(false);
+        let mut port = builder.open()?;
+        // RTS before DTR, for the same reason.
         let _ = port.write_request_to_send(false);
         let _ = port.write_data_terminal_ready(false);
         let _ = port.clear(serialport::ClearBuffer::All);

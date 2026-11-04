@@ -40,9 +40,16 @@ def open_quiet(port):
     import serial
     s = serial.Serial()
     s.port, s.baudrate, s.timeout, s.write_timeout = port, 115200, 0.05, 0.5
-    s.dtr = False
-    s.rts = False
-    s.open()
+    if sys.platform == "win32":
+        s.dtr = False
+        s.rts = False
+        s.open()
+    else:
+        # Linux raises DTR and RTS together on open; pySerial would then drop
+        # DTR first (DTR low + RTS high = reset). Drop RTS first instead.
+        s.open()
+        s.rts = False
+        s.dtr = False
     return s
 
 

@@ -24,9 +24,19 @@ def main():
         sys.exit(__doc__)
     s = serial.Serial()
     s.port, s.baudrate, s.timeout, s.write_timeout = sys.argv[1], 115200, 0.1, 2
-    s.dtr = False
-    s.rts = False
-    s.open()
+    if sys.platform == "win32":
+        # Windows applies these before the lines change: they never go high.
+        s.dtr = False
+        s.rts = False
+        s.open()
+    else:
+        # Linux raises DTR and RTS together on open (idle on the C5), and
+        # pySerial then applies dtr=False first: DTR low with RTS high is the
+        # USB Serial/JTAG reset, which hangs a running C5. So open with the
+        # defaults (no change after open) and drop RTS before DTR.
+        s.open()
+        s.rts = False
+        s.dtr = False
     try:
         s.reset_input_buffer()
         for c in sys.argv[2:]:
@@ -37,7 +47,8 @@ def main():
             # A command gets exactly one OK/ERR reply; stop once it arrives.
             while time.time() < deadline:
                 out += s.read(4096)
-                lines = out.decode(errors="replace").splitlines()
+                # Whole lines only, so a reply still arriving is not cut off.
+                lines = out.decode(errors="replace").split("\n")[:-1]
                 if any(l.startswith(("OK " + word, "ERR " + word)) for l in lines):
                     break
             print(f">>> {c}\n{out.decode(errors='replace').rstrip()}")
