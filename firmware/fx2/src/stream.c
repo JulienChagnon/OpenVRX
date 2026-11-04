@@ -190,3 +190,189 @@ void stream_set_watch(uint16_t ratio) __reentrant {
     return;
   }
 
+  // Live switch between AUTOIN and manual commit. Disconnect the pins while
+  // the FIFO is reset so that no partial packet is left behind.
+  IFCONFIG = cfg_ifconfig;                      SYNCDELAY;
+  watch_reload = ratio - 1;
+  watch_left = 0;
+  fifo_reset_ep2(cfg_wordwide | (watch ? 0 : _AUTOIN));
+  watch_n = watch ? ratio : 0;
+  if(watch)
+    cfg_flags |= STF_WATCH;
+  else
+    cfg_flags &= ~STF_WATCH;
+  mode = watch ? MODE_WATCH : MODE_AUTO;
+  IFCONFIG = cfg_ifconfig | IFCFG_SLAVE;        SYNCDELAY;
+}
+
+// ---------------------------------------------------------------------------
+// Loops that are not on the high-speed hot path
+// ---------------------------------------------------------------------------
+
+// Watch mode at full speed (64-byte packets, at most about 1 MB/s on the bus).
+static void watch_loop_fs(void) __reentrant {
+  uint8_t npak;
+  uint8_t full;
+  uint16_t bc;
+
+  while(!svc) {
+    if(EP24FIFOFLGS & _EP2FF)
+      cnt_ffull++;
+    // Committed packets first, then the byte count: a packet sent in between
+    // can only make the estimate smaller (see loop_watch_hs).
+    npak = watch_use_npak ? ((EP2CS >> 4) & 0x07) : 0;
+    bc = ((uint16_t)EP2FIFOBCH << 8) | EP2FIFOBCL;
+    full = (uint8_t)(bc >> 6);
+    if(full <= npak)
+      continue;
+    if(watch_left != 0) {
+      watch_left--;
+      INPKTEND = _SKIP | 2;
+      cnt_skipped++;
+    } else {
+      watch_left = watch_reload;
+      INPKTEND = 2;
+      cnt_committed++;
+    }
+    SYNCDELAY;
+  }
+}
+
+// CPU-sourced test pattern: consecutive 16-bit little-endian words.
+static void pattern_loop(void) __reentrant {
+  bool hs = usb_high_speed();
+
+  while(!svc) {
+    if(EP2468STAT & _EP2F)
+      continue;                 // all four buffers are with the USB engine
+    if(hs && opt_pattern_fast && pattern_warm >= 4) {
+      pattern_fill_high();
+    } else {
+      pattern_fill_full();
+      if(pattern_warm < 4)
+        pattern_warm++;
+    }
+    SYNCDELAY;                  // XAUTODAT2 writes precede EP2BCH (TRM 15.15)
+    if(hs) {
+      EP2BCH = 0x02;            SYNCDELAY;
+      EP2BCL = 0x00;
+    } else {
+      EP2BCH = 0x00;            SYNCDELAY;
+      EP2BCL = 64;
+    }
+    SYNCDELAY;
+    cnt_committed++;
+  }
+}
+
+void stream_run(void) {
+  switch(mode) {
+  case MODE_AUTO:
+    loop_auto();
+    break;
+  case MODE_WATCH:
+    if(usb_high_speed())
+      loop_watch_hs();
+    else
+      watch_loop_fs();
+    break;
+  case MODE_PATTERN:
+    pattern_loop();
+    break;
+  default:
+    while(!svc)
+      ;
+    break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+static void put16(__xdata uint8_t *p, uint16_t v) __reentrant {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+}
+
+static void put32(__xdata uint8_t *p, uint32_t v) __reentrant {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+void status_fill(__xdata uint8_t *buf) __reentrant {
+  uint8_t flags = cfg_flags;
+  if(ifclk_active && mode != MODE_IDLE)
+    flags |= STF_IFCLK_ACTIVE;
+
+  buf[0] = 'P';
+  buf[1] = 'C';
+  buf[2] = 'V';
+  buf[3] = 'S';
+  buf[4] = PROTO_VERSION;
+  buf[5] = flags;
+  put16(buf + 6, watch_n);
+  put32(buf + 8, cnt_committed);
+  put32(buf + 12, cnt_skipped);
+  put32(buf + 16, cnt_ffull);
+  put32(buf + 20, uptime_read());
+  put16(buf + 24, status_seq);
+  put16(buf + 26, (FW_MAJOR << 8) | FW_MINOR);
+  put32(buf + 28, 0);
+}
+
+void stream_tick(void) {
+  ET2 = 0;
+  ifclk_active = fifo_moved;
+  fifo_moved = 0;
+  ET2 = 1;
+
+  if(usb_config_value != 0 && !(EP1INCS & _BUSY)) {
+    status_seq++;
+    status_fill(EP1INBUF);
+    EP1INBC = 32;
+  }
+}
+
+void stream_reset_counters(void) {
+  cnt_committed = 0;
+  cnt_skipped = 0;
+  cnt_ffull = 0;
+}
+
+bool stream_set_option(uint16_t key, uint16_t value) __reentrant {
+  switch(key) {
+  case OPT_WATCH_DETECT:
+    if(value > 1)
+      return false;
+    watch_use_npak = (value == 0);
+    return true;
+  case OPT_SLWR_ACTIVE_HI:
+    if(value > 1)
+      return false;
+    opt_slwr_hi = (value != 0);
+    return true;
+  case OPT_STATUS_INTERVAL:
+    if(value < 1 || value > 255)
+      return false;
+    status_interval = (uint8_t)value;
+    return true;
+  case OPT_PATTERN_FILL:
+    if(value > 1)
+      return false;
+    opt_pattern_fast = (value != 0);
+    return true;
+  case OPT_IFCLK_OUT:
+    // Finds the IFCLK header pin: the FX2 drives its internal clock out of
+    // IFCLK and a jumper from that pin to a port pin shows it toggling in
+    // GET_PINS. Never while streaming; the next START or STOP turns it off.
+    if(value > 1 || mode != MODE_IDLE)
+      return false;
+    IFCONFIG = IFCONFIG_IDLE | (value ? _IFCLKOE : 0);  SYNCDELAY;
+    return true;
+  default:
+    return false;
+  }
+}

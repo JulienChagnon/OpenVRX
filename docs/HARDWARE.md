@@ -172,3 +172,150 @@ FX2 word width changes).
 | PD0 | GPIO11 (499 ohm) | I2 | low | low | low | - | - | - |
 | IFCLK | GPIO0 | clock | clock | clock | clock | clock | clock | clock |
 
+"-" in an 8-bit column: the C5 pin is high-impedance with a weak pull-down
+and the FX2 ignores PD in 8-bit mode.
+
+## Custom boards
+
+`board custom` uses the map set in `idf.py menuconfig` -> OpenVRX radio
+head -> Custom pin map: a clock GPIO, one GPIO per FX2 pin for the 16-bit
+presets and one per FX2 pin for the 8-bit presets (-1 = tied to GND).
+Allowed GPIOs are 0..12 and 23..28 (13/14 are USB, 15..22 flash/PSRAM);
+each GPIO may appear once per table and never as both clock and lane. An
+invalid map is refused with `ERR board state custom map invalid: <reason>`.
+
+## Signal integrity
+
+- 30 AWG (Kynar) wire, 3-5 cm per signal. At these lengths length matching
+  does not matter (2 cm is about 0.1 ns). No breadboard for the final
+  build; one is acceptable for first light.
+- Grounds: at least two GND wires between the boards, one directly beside
+  the clock wire, the other at the far end of the lane bundle. Keep each
+  bundle close to its ground to keep the loop area small.
+- Drive strength: `drive <lanes> [clk]`, ESP-IDF `gpio_drive_cap_t`
+  0..3 (about 5, 10, 20, 40 mA). Default lanes=1, clk=2. Choose by the
+  edge check (phase probe at `clk 6`, OpenVRX-DESIGN.txt 5.4), not by
+  defaulting to the weakest: weak drive slows edges and eats the 7.7 ns
+  setup plus hold window the FX2 needs; strong drive rings. Save the
+  result with `save`.
+- If lanes still show errors: 22-33 ohm series resistors at the C5 end of
+  each lane and the clock.
+- The FX2 needs data steady 3.2 ns before and 4.5 ns after each IFCLK
+  edge, against a bus that changes every 12.5 ns. The edge can land on one
+  of three positions against the bus; `slip` moves it one 4.17 ns step
+  and the host's phase calibration picks a clean position.
+
+## Power
+
+- v1, two cables: the C5's own USB-C gives power and the console; the
+  FX2's mini-USB carries data. Do not also connect the FX2's 5V to the C5
+  in this mode.
+- v2, one cable: the FX2 board's 5V (USB VBUS) feeds the C5's 5V pin and
+  the console moves to a UART relay through the FX2 (needs two more C5
+  pins; decide after v1 works). FX2 board at most 85 mA plus the C5
+  receiving at roughly 100-150 mA fits one USB 2.0 port.
+- All grounds meet at the laptop through USB. Do not add a separately
+  powered supply without a common ground point.
+
+## Which preset to wire first
+
+The owner can rewire freely; the options below are ordered by how quickly
+they produce useful data. Byte rates assume the FX2 sustains them on the
+laptop (measure with the FX2 throughput test first).
+
+1. **C5-Zero 8x8 at 13.33 MS/s** (`clk 18`, 26.67 MB/s, 16-bit FX2 mode).
+   All live ADC bits; one wiring also covers every smaller preset, so the
+   host can emulate 7x7 to 4x4 in software or switch presets with no
+   rewiring. Best first build if a C5-Zero is available.
+2. **XIAO 7x7 at 13.33 MS/s** (`clk 18`, 26.67 MB/s). Needs the four back
+   pads. The default on the XIAO.
+3. **XIAO 5x5 on front pins only** (`clk 18`, 26.67 MB/s). Fastest XIAO
+   build: no back pads, every wire on the header. Later add the back pads
+   for 7x7 without moving any front wire.
+4. **4x4 in 8-bit mode at 20, 26.67 or 40 MS/s** (`clk 12`, `clk 9`,
+   `clk 6`; 20, 26.67, 40 MB/s). Higher sample rate (less phase wrap at
+   the sync tip) for fewer bits. On the XIAO this is the 8-bit front-pin
+   wiring; on the C5-Zero no rewiring. Try `4x4top` and `4x4ultra`
+   (C5VRX's ultrafine slice) on the same capture setup. 40 MB/s is at the
+   FX2 ceiling; treat it as an experiment.
+5. **C5-Zero 8x8 at 20 MS/s** (`clk 12`, 40 MB/s): the stretch goal at the
+   FX2 ceiling; check the FIFO-full counter in the FX2 status block.
+
+Bring-up order for any of them: flash the C5, `board` + `lanes` + `pins`
+to confirm the map, `selftest walk` with the FX2 streaming (the host names
+stuck, swapped or shorted lanes), `selftest off`, then the phase probe
+with `clk 6` and `slip`, then the working divider.
+
+## Simulation ranking
+
+Results of the sample-format simulations (experiments S1/S2) are produced
+by the lab tools and live in `lab/results/`. This section will summarise
+them once they exist; no numbers are given here until then.
+
+## Flashing the C5
+
+ESP-IDF v6.0.2: in `firmware/c5`, `idf.py set-target esp32c5` (once) and
+`idf.py build`. Then flash with
+
+    python tools/flash.py COM9
+
+not `idf.py flash`. A USB DTR/RTS line reset on a running image leaves the
+modem domain running into the ROM loader, which then stops answering
+(esptool "Write timeout", console writes failing); only unplugging all
+power clears it. `tools/flash.py` (adapted from C5VRX) sends the console
+command `dl`, which stops the MODEM_DIAG writer and Wi-Fi and reboots into
+the loader cleanly, then flashes with `--before no-reset --after
+watchdog-reset`. A brand new C5 still running its factory image can be
+flashed with `idf.py flash` once.
+
+The same rule holds for any serial tool: open the console with DTR and RTS
+low before the open (pySerial defaults assert both, and closing the port
+then resets the chip). `tools/c5cmd.py` does this:
+
+    python tools/c5cmd.py COM9 ver status pins
+
+## Running without the C5 on USB (FX2-only, the default)
+
+The app's default control mode is FX2 only: just the FX2 is on the PC's
+USB, and the C5 runs the settings it stored with `save`. Set it up once
+with the C5 on USB:
+
+    python tools/c5cmd.py COM9 "tune <MHz>" "lanes <preset>" "clk <div>" save status
+
+then power the C5 from the FX2 board and start the app with the same layout
+and clock: `openvrx --lanes <preset> --clk <div>` (they must match what the C5
+saved, or the picture is garbage). In this mode the app cannot change
+channel or gain, and sampling-phase calibration and the lane self-test are
+unavailable (both need the console). `--control c5` switches back to full
+console control when the C5 is on USB too.
+
+Powering the XIAO from the FX2 board: wire an FX2 header **VCC pin (the
+board's 3.3 V rail, see PINOUTS.md) to the XIAO 3V3 pin** (plus the GND wires the data lanes already need). The 3V3 pin is
+the XIAO's regulated rail, so this feeds it directly; a receiving C5 draws
+roughly 100 to 150 mA, well within the FX2 board's 3.3 V regulator and one
+USB port. Do not use BAT+/BAT- or VBAT: they are the LiPo battery input
+(3.0 to 4.2 V through the charger), not a supply input for 3.3 V. Remove
+the 3V3 wire before plugging the XIAO's own USB in, so two supplies never
+drive the rail at once.
+
+## The angle8 preset (not available)
+
+`lanes angle8` answers `ERR lanes unsupported`. An on-chip angle needs
+MODEM_DIAG captured by PARLIO RX, a BitScrambler LUT and PARLIO TX out (the
+pipeline C5VRX uses for its decoder). On the ESP32-C5 this does not pay
+off:
+
+- PARLIO RX has at most 8 data lines (`SOC_PARLIO_RX_UNIT_MAX_DATA_WIDTH 8`
+  in ESP-IDF v6.0.2 `soc_caps.h`). The LUT input is therefore at most 4 I
+  + 4 Q bits, exactly what the 4x4 presets already deliver; an 8-bit angle
+  computed from them carries no information the PC cannot compute from
+  the 4x4 word itself, and it loses the magnitude.
+- The GPIO matrix reaches peripheral inputs only through pads, so the 8
+  captured bus bits need 8 loopback pads besides 8 output lanes and the
+  clock: 17 pins, more than the XIAO has and every pin of the C5-Zero.
+- There is one PARLIO TX unit, so the sample clock would have to move to
+  the data transmitter, and the 40 MS/s capture rate would need a
+  BitScrambler decimation program as well.
+
+A worthwhile angle path needs more than 8 input bits per sample, which this
+chip's PARLIO RX cannot capture.
