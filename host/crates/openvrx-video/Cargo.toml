@@ -1,0 +1,26 @@
+[package]
+name = "openvrx-video"
+description = "OpenVRX video stage: diversity combiner, field assembly, NTSC/PAL colour decode, repair, deinterlace, temporal denoise, streaming pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# PNG debug dumps of fields and frames (pure Rust encoder).
+debug-png = ["dep:png"]
+
+[dependencies]
+openvrx-core = { path = "../openvrx-core" }
+serde = { version = "1", features = ["derive"] }
+rayon = "1.10"
+rustfft = "6.2"
+png = { version = "0.17", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[[example]]
+name = "video_bench"
+path = "examples/video_bench.rs"
+
