@@ -2625,6 +2625,7 @@ dependencies = [
 name = "openvrx-format"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "openvrx-core",
  "serde",
  "serde_json",

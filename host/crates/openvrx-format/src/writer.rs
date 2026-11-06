@@ -94,6 +94,39 @@ fn create_file(path: &Path, overwrite: bool) -> Result<File> {
     })
 }
 
+/// Linux: marks a new, still empty raw file no-copy-on-write (what
+/// `chattr +C` sets). On btrfs, the Fedora default, that also turns off
+/// compression and checksums for the file. Without it, every writeback (each
+/// 5 s by default) compressed and checksummed about 130 MB of a 27 MB/s
+/// recording at once, and that burst of kernel CPU starved the USB stream into
+/// dropping blocks, for the live picture too (2026-11-04 on the bench host:
+/// 47 gaps in 40 s in a normal folder, 0 in a no-COW one). On other
+/// filesystems the flag is refused or meaningless; errors are ignored, so this
+/// never fails a recording. The flag only takes on an empty file.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn prefer_nocow(f: &File) {
+    use std::os::fd::AsRawFd;
+    // _IOR('f', 1, long) and _IOW('f', 2, long); the kernel passes an int.
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
+    let fd = f.as_raw_fd();
+    let mut flags: libc::c_int = 0;
+    // SAFETY: fd is open for the call's duration and both ioctls read or
+    // write one c_int through a valid pointer.
+    unsafe {
+        if libc::ioctl(fd, FS_IOC_GETFLAGS as _, &mut flags as *mut libc::c_int) == 0
+            && flags & FS_NOCOW_FL == 0
+        {
+            flags |= FS_NOCOW_FL;
+            let _ = libc::ioctl(fd, FS_IOC_SETFLAGS as _, &flags as *const libc::c_int);
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn prefer_nocow(_f: &File) {}
+
 impl RecordingWriter {
     /// Creates `BASE.openvrx.json`, `BASE.rxK.bin` per receiver,
     /// `BASE.events.jsonl` and, when `sidecar.sim.truth` is set,
@@ -126,6 +159,7 @@ impl RecordingWriter {
         for r in &sidecar.receivers {
             let path = paths.rx(r.rx);
             let f = create_file(&path, opts.overwrite)?;
+            prefer_nocow(&f);
             streams.push(RxStream {
                 rx: r.rx,
                 path,
