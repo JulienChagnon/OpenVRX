@@ -51,6 +51,20 @@ Commands (per run): `openvrx-cli record BASE --lanes 4x4top --clk 9 --seconds 3 
   bench.py. Checked at gain 70 fixed: pit mode, no lock (C/N -10 dB); leased, locked, C/N 16.9 dB.
   `power_db` read higher in pit mode than leased (DSP-2).
 
+## First sweep and the leakage hunt (afternoon)
+
+- Sweep `bench-runs/20261104-150221` (`bench.py --fixed-db 70 --extra-loss-db 4.5 --att esp32:/dev/ttyUSB0
+  --att-at 0 --pattern card --vtx-mw 25 --c5 /dev/ttyACM0 --gains auto --steps 0:30:2 --live`, C5 under
+  the table on 1 m of RG316): C/N 20.8 to 19.4 dB and PSNR 26.9 to 26.5 at every step. Not a sweep of
+  level: the attenuation does not reach the C5 (BENCH-7).
+- Checks in order: step attenuator input unscrewed, nothing (no path around it in the air); 20 dB pad
+  added, no change; pads bonded to the tin and the tin closed, the signal fell; then step 10 gave more
+  signal than step 0; unplugging the ESP32's USB lowered it again. Conclusion: several leak paths
+  (outside of the coax, the USB ground loop, radiation into the receiver), together comparable to the
+  attenuated signal. Fix plan in BENCH-7. The step attenuator (ARW637, rated to 8 GHz) is not the fault.
+- Lesson for the leak test: with the chain unscrewed from the C5 the outside-of-coax path is broken
+  too, so that test passed while the real setup leaked (BENCH-5).
+
 ## Improvements raised
 
 C5-1, C5-2, DSP-1 in [IMPROVEMENTS.md](IMPROVEMENTS.md); fixed and verified: BENCH-1, BENCH-2, BENCH-3.

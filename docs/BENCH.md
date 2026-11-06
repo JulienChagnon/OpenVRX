@@ -212,6 +212,32 @@ the antenna end (on 30-pin boards wire by the printed labels):
   the band, channel and power LEDs blink their numbers (bands 1 to 5 =
   A, B, E, F, R; power 1 = lowest).
 
+### Colour test pattern on a resistor ladder (default)
+
+`att_ctl` drives a 6-bit binary-weighted ladder through I2S0 in parallel
+(LCD) mode at 4 x fsc (14.318 MHz), so the test picture has a colour burst
+and full NTSC detail. Wiring, all into one VIDEO node that goes to the VTX's
+video pad (the old P25 wire, moved):
+
+| ESP32 pin | Bit | Resistor to VIDEO |
+|---|---|---|
+| P18 | 0 | 8.2 kohm |
+| P19 | 1 | 3.9 kohm |
+| P21 | 2 | 2.0 kohm |
+| P22 | 3 | 1.0 kohm |
+| P23 | 4 | 470 ohm |
+| P26 | 5 | 240 ohm |
+
+VIDEO also gets 200 ohm and 470 pF to the shared GND. P25 stays free.
+
+- `out ladder` (default, saved) or `out dac` (the old monochrome P25 DAC,
+  section below); both use I2S0, so only one runs.
+- Patterns: `card` is 75 % colour bars, a multiburst (0.5, 1, 2, 3, 4 MHz),
+  a ramp and flat grey; `bars` is full-height bars; the others as below.
+- `amp` defaults to 1600 on the ladder: the decoder's deviation_scale reads
+  1.00 into this VTX (the ladder's swing depends on the VTX input's load).
+- 6 bits give about 50 levels from black to white: a ramp shows steps.
+
 ### Test pattern on P25
 
 `att_ctl` also feeds the VTX's video input: P25 (DAC1) carries a 525-line
