@@ -26,6 +26,9 @@ C5 gain (the C5 firmware has its own gain loop, `agc on|off`):
   --c5 PORT --gains auto,56
                         `auto` runs a sweep with the C5's gain loop on: the whole
                         receiver as it flies
+  --c5 PORT --dc off    the C5's DC correction off (or on) for the sweep; with
+                        --c5 every step also logs the C5's i_dc, q_dc, dco, trim
+                        and clip (results.jsonl/csv)
 
 Test pattern (the same ESP32 runs it: att_ctl puts NTSC on GPIO25 for the
 standalone VTX's video input, docs/BENCH.md):
@@ -73,6 +76,12 @@ MAX_PSNR_DROP_DB = 3.0
 def open_serial(port):
     import serial  # only needed for esp32/c5 control
 
+    if "://" in port:
+        # A network console, e.g. socket://openvrx-bench.local:2323 (att_ctl
+        # over Wi-Fi: the ESP32 on a power bank, no USB ground to the PC).
+        s = serial.serial_for_url(port, timeout=0.1, write_timeout=2)
+        s.reset_input_buffer()
+        return s
     s = serial.Serial()
     s.port, s.baudrate, s.timeout, s.write_timeout = port, 115200, 0.1, 2
     # A line reset can hang a running C5 (and reboots the attenuator ESP32).
@@ -91,22 +100,47 @@ def open_serial(port):
     return s
 
 
-def command(s, line, word, timeout):
-    """Sends one console line and waits for its OK/ERR reply."""
-    s.write((line + "\n").encode())
-    deadline = time.time() + timeout
-    out = b""
-    while time.time() < deadline:
-        out += s.read(4096)
-        # Whole lines only: a reply still arriving would match "OK word"
-        # half read (e.g. a get without its minus= field).
-        for l in out.decode(errors="replace").split("\n")[:-1]:
-            l = l.rstrip("\r")
-            if l.startswith("OK " + word):
-                return l
-            if l.startswith("ERR " + word):
-                raise RuntimeError(l)
-    raise RuntimeError(f"no reply to '{line}'")
+def command(s, line, word, timeout, tries=1):
+    """Sends one console line and waits for its OK/ERR reply. With tries > 1
+    a missing reply or an ERR is retried (after a short pause); the error of
+    the last try is raised, quoting what was received."""
+    for t in range(tries):
+        if t:
+            time.sleep(0.5)
+        s.write((line + "\n").encode())
+        deadline = time.time() + timeout
+        out = b""
+        err = None
+        while time.time() < deadline and err is None:
+            out += s.read(4096)
+            # Whole lines only: a reply still arriving would match "OK word"
+            # half read (e.g. a get without its minus= field).
+            for l in out.decode(errors="replace").split("\n")[:-1]:
+                l = l.rstrip("\r")
+                if l.startswith("OK " + word):
+                    return l
+                if l.startswith("ERR " + word):
+                    err = l
+                    break
+        if t + 1 < tries:
+            print(f"  '{line}': {err or 'no reply'}, retrying")
+    if err:
+        raise RuntimeError(err)
+    got = out.decode(errors="replace").strip().splitlines()
+    raise RuntimeError(f"no reply to '{line}'" + (f" (received: {got[-3:]})" if got else " (nothing received)"))
+
+
+# C5 status fields kept per step (DC correction, C5-1): the C5's own view
+# of the samples before the lanes, next to the PC's score.
+C5_FIELDS = {"gain": "c5_gain", "clip": "c5_clip", "i_dc": "i_dc", "q_dc": "q_dc", "dc": "dc", "dco": "dco",
+             "trim": "dc_trim"}
+
+
+def c5_status(s):
+    """The C5 `status` reply as a dict of the C5_FIELDS (renamed)."""
+    line = command(s, "status", "status", 2.0)
+    kv = dict(t.split("=", 1) for t in line.split()[2:] if "=" in t)
+    return {new: kv[old] for old, new in C5_FIELDS.items() if old in kv}
 
 
 class ManualAttenuator:
@@ -164,6 +198,10 @@ class LiveApp:
                "--clk", str(args.clk), "--bench-control", "--compare-pattern", args.pattern or "card"]
         if args.mhz:
             cmd += ["--mhz", str(args.mhz)]
+        # The comparison draws the card of the ESP32's output (colour ladder
+        # or monochrome DAC), as `vget` reported it; the app defaults to ladder.
+        if getattr(args, "video_out", None) in ("ladder", "dac"):
+            cmd += ["--compare-out", args.video_out]
         if args.pattern:
             cmd.append("--compare")
         self.log = open(log_path, "w")
@@ -267,6 +305,28 @@ def setup_vtx(args, att):
             raise
         print(f"  no VTX over Tramp ({e}): no pit-mode guard, the VTX stays as it is")
         return None, None
+    if args.pit:
+        # No lease: att_ctl's guard keeps the VTX in pit mode. End any lease
+        # left over from an earlier run and check the VTX says so.
+        state = dict(kv.split("=", 1) for kv in first.split()[2:] if "=" in kv)
+        try:
+            # Tramp reads miss now and then (att_ctl's set gives up on one
+            # missed first read): try again before giving up.
+            reply = command(s, "vtx active 0", "vtx", 8.0, tries=3)
+            state.update(kv.split("=", 1) for kv in reply.split()[2:] if "=" in kv)
+        except RuntimeError as e:
+            if state.get("pit") != "1":
+                raise
+            # Already in pit and no lease is taken: the guard keeps it there.
+            print(f"  WARNING: 'vtx active 0' failed ({e}); the VTX already reports pit=1, carrying on")
+        if state.get("pit") not in ("1", "on", "yes", "true"):
+            time.sleep(6.0)  # the guard checks every 5 s
+            state.update(kv.split("=", 1) for kv in command(s, "vtx", "vtx", 5.0).split()[2:] if "=" in kv)
+        if state.get("pit") not in ("1", "on", "yes", "true"):
+            sys.exit(f"--pit: the VTX does not report pit mode (pit={state.get('pit')}); stopping")
+        print(f"  VTX: {state.get('mhz')} MHz, pit mode {state.get('pit')} for the whole run, "
+              f"temp {state.get('temp')} C")
+        return state, None
     guard = VtxGuard(s)
     reply = guard.renew()  # out of pit mode for the run
     state = dict(kv.split("=", 1) for kv in first.split()[2:] if "=" in kv)
@@ -357,6 +417,9 @@ def main():
                     help="esp32: treat it as + only even if the firmware has a - relay (+ only is detected anyway)")
     ap.add_argument("--c5", help="C5 console port, to set each gain (else gains are labels only)")
     ap.add_argument("--gains", default="56", help="comma list of C5 gain indexes, or auto (C5 gain loop)")
+    ap.add_argument("--dc", choices=("on", "off"), default=None,
+                    help="with --c5: the C5's DC correction for this sweep (default: leave as is); "
+                         "an A/B is two runs, the attenuator reset between them")
     ap.add_argument("--lanes", default="4x4top")
     ap.add_argument("--clk", type=int, default=9)
     ap.add_argument("--mhz", type=int, default=5880,
@@ -379,6 +442,17 @@ def main():
     ap.add_argument("--vtx-mhz", type=int, default=None, help="set the VTX frequency over Tramp first")
     ap.add_argument("--vtx-mw", type=int, default=None,
                     help="set the VTX power (mW) over Tramp first; also sets --vtx-dbm if that is not given")
+    ap.add_argument("--pit", action="store_true",
+                    help="keep the VTX in pit mode for the whole run (threshold ladders down to the noise "
+                         "floor, BENCH-10); its power is unknown, so rx_dbm is left empty")
+    ap.add_argument("--ref", default=None,
+                    help="score every step against this recording (base path of a strong clean one) "
+                         "instead of the first step")
+    ap.add_argument("--ok-psnr", type=float, default=None,
+                    help="picture ok when PSNR median is at least this (dB) and half the frames decode; "
+                         "default: within 3 dB of the reference's own PSNR")
+    ap.add_argument("--demod", default=None, help="openvrx-cli score --demod (default: the DSP default)")
+    ap.add_argument("--preset", default=None, help="openvrx-cli score --preset (default raw)")
     args = ap.parse_args()
 
     if args.att_step not in (0.25, 0.5, 1.0, 10.0):
@@ -403,6 +477,7 @@ def main():
     video = setup_video(args, att)
     if video:
         meta["video"] = video
+        args.video_out = video.get("out")
     vtx, guard = setup_vtx(args, att)
     if vtx:
         meta["vtx"] = vtx
@@ -432,22 +507,40 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
     jl = open(os.path.join(out, "results.jsonl"), "a")
     cf = open(os.path.join(out, "results.csv"), "a", newline="")
     fields = ["gain", "att_db", "rx_dbm", "frames", "psnr_median", "psnr_min", "damaged", "lock",
-              "cn_db", "clip_pct", "power_db", "picture"]
+              "cn_db", "clip_pct", "power_db", "picture"] + (list(C5_FIELDS.values()) if c5 else [])
+    if c5 and args.dc:
+        print(command(c5, f"dc {args.dc}", "dc", 2.0))
+        time.sleep(2.0)   # a few servo updates before the first step
     cw = csv.DictWriter(cf, fieldnames=fields, extrasaction="ignore")
     if cf.tell() == 0:
         cw.writeheader()
 
+    if c5:
+        # The console must answer before the sweep relies on it; a missing
+        # reply here says the port, not a command, is the problem.
+        c5.write(b"\n")  # ends any half line left in the C5's input
+        time.sleep(0.2)
+        c5.reset_input_buffer()
+        print("  C5: " + command(c5, "ping", "ping", 2.0, tries=3))
     summary = {}
     for gain in gains:
         if c5:
             if gain == "auto":
-                command(c5, "agc on", "agc", 2.0)
+                command(c5, "agc on", "agc", 3.0, tries=3)
             else:
-                command(c5, "agc off", "agc", 2.0)
-                command(c5, f"gain {gain}", "gain", 2.0)
+                command(c5, "agc off", "agc", 3.0, tries=3)
+                command(c5, f"gain {gain}", "gain", 3.0, tries=3)
             time.sleep(0.5)
         print(f"\n== gain {gain}: {len(steps)} steps, fixed {args.fixed_db:g} dB")
         ref, ref_psnr, ref_frames, prev = None, None, None, None
+        extra = (["--demod", args.demod] if args.demod else []) + (["--preset", args.preset] if args.preset else [])
+        if args.ref:
+            # External reference: its own score sets the frame count to expect.
+            ref = args.ref
+            r0 = json.loads(run([args.cli, "score", ref, "--ref", ref, "--frames", str(args.frames),
+                                 "--skip", "10"] + extra).strip().splitlines()[-1])
+            ref_psnr, ref_frames = r0["psnr_median"], max(r0["frames"], 1)
+            print(f"  reference {ref}: PSNR on itself {ref_psnr}, {r0['frames']} frames")
         for db in steps:
             att.set(db)
             if guard:
@@ -460,17 +553,22 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
                 run([args.cli, "record", base, "--lanes", args.lanes, "--clk", str(args.clk),
                      "--seconds", str(args.seconds), "--mhz", str(args.mhz),
                      "--gain", "0" if gain == "auto" else gain])
-            score_cmd = [args.cli, "score", base, "--frames", str(args.frames), "--skip", "10"]
+            score_cmd = [args.cli, "score", base, "--frames", str(args.frames), "--skip", "10"] + extra
             if ref is None:
                 ref = base
             score_cmd += ["--ref", ref]
             r = json.loads(run(score_cmd).strip().splitlines()[-1])
             if ref == base:
                 ref_psnr, ref_frames = r["psnr_median"], max(r["frames"], 1)
-            r.update(gain=gain, att_db=db,
-                     rx_dbm=round(args.vtx_dbm - args.fixed_db - args.extra_loss_db - db, 2))
+            # Pit mode: the VTX power is unknown, so no absolute level.
+            rx = None if args.pit else round(args.vtx_dbm - args.fixed_db - args.extra_loss_db - db, 2)
+            r.update(gain=gain, att_db=db, rx_dbm=rx)
+            if c5:
+                r.update(c5_status(c5))
+            psnr_floor = args.ok_psnr if args.ok_psnr is not None else (
+                None if ref_psnr is None else ref_psnr - MAX_PSNR_DROP_DB)
             ok = (r["frames"] >= MIN_FRAME_SHARE * ref_frames and r["psnr_median"] is not None
-                  and ref_psnr is not None and r["psnr_median"] >= ref_psnr - MAX_PSNR_DROP_DB)
+                  and psnr_floor is not None and r["psnr_median"] >= psnr_floor)
             r["picture"] = "ok" if ok else "lost"
             # Leakage check: 10 dB more attenuation should cost about 10 dB of power
             # while the C5 is in its linear range (no clipping, above the noise).
@@ -484,11 +582,12 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
             jl.flush()
             cw.writerow(r)
             cf.flush()
-            print(f"  att {db:5.2f} dB  rx ~{r['rx_dbm']:7.2f} dBm  frames {r['frames']:3d}  "
+            lvl = "rx ?  (pit)" if r["rx_dbm"] is None else f"rx ~{r['rx_dbm']:7.2f} dBm"
+            print(f"  att {db:5.2f} dB  {lvl}  frames {r['frames']:3d}  "
                   f"psnr {r['psnr_median']}  C/N {r['cn_db']:.1f}  clip {r['clip_pct']:.1f}%  {r['picture']}"
                   + (f"  LEAK? {r['leak_warning']}" if "leak_warning" in r else ""))
             if r["picture"] == "ok":
-                summary[gain] = r["rx_dbm"]
+                summary[gain] = r["rx_dbm"] if r["rx_dbm"] is not None else f"att {db:g} dB"
             if not args.keep and base != ref:
                 for ext in (".rx0.bin", ".openvrx.json", ".events.jsonl"):
                     try:
@@ -501,7 +600,7 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
                     except OSError:
                         pass
             prev = r
-        if not args.keep:
+        if not args.keep and not args.ref:  # never delete an external reference
             for ext in (".rx0.bin",):
                 try:
                     os.remove(ref + ext)
@@ -510,7 +609,7 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
 
     print("\nweakest level with a picture, per gain:")
     for g, dbm in summary.items():
-        print(f"  gain {g}: {dbm:.1f} dBm (estimated)")
+        print(f"  gain {g}: {dbm}" if isinstance(dbm, str) else f"  gain {g}: {dbm:.1f} dBm (estimated)")
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump({str(g): v for g, v in summary.items()}, f, indent=2)
     print(f"results: {out}")
