@@ -4,7 +4,8 @@
 // 6bc9e4bbb5bef5948d42a065da27eae39315ad2d (itself from
 // legacy/c5vrx4/main/phy_rx_lab.c, pinned C5 PHY investigation #150-153,
 // #165). Changes for OpenVRX: generations, actuator leases, observation hooks,
-// the digital filter selection menu and all DC DAC code removed; filter
+// the digital filter selection menu and C5VRX's DC DAC searches removed (a
+// smaller DC hold, phy_dco_*, from C5VRX main/phy.c, is at the end); filter
 // writes take the 11p state into account; 11p off path added (stock flags
 // and MMIO fields captured at boot). The 11p observation is credited by
 // C5VRX to SushiDude (@Ready4Sushi).
@@ -313,5 +314,155 @@ esp_err_t phy_11p_apply_off(void)
     }
     lock_give();
     return result;
+#endif
+}
+
+// ---- RX DC DACs (C5VRX main/phy.c phy_dco_hold, pin_bank1 and
+// pbus_workmode_keep_gain, same pinned libphy). Bank-2 pair of blocks 2/3
+// in PBUS debug mode; see phy.h.
+#ifdef OPENVRX_PHY_PINNED
+extern uint16_t phy_pbus_rd(uint32_t block, uint32_t bank);
+extern void phy_pbus_force_test(uint32_t block, uint32_t bank, uint32_t value);
+extern void phy_pbus_debugmode(void);
+extern void phy_pbus_workmode(void);
+extern void phy_force_rx_gain(bool enable, uint8_t gain_idx);
+#define PBUS_BLOCKS 9u
+#define DCO_GAIN_FORCE_REG 0x600A702Cu
+#define DCO_GAIN_FORCE_BIT (1u << 23)
+// Only the gain/DC words the hold owns: BB (0), fine (1), DC (2, 3) and the
+// 5 GHz RF code (8).
+static inline bool pbus_owned(unsigned b) { return b <= 3u || b == 8u; }
+static bool s_dco_held;
+
+static void dco_read_live(uint16_t live[PBUS_BLOCKS][2])
+{
+    for (unsigned b = 0; b < PBUS_BLOCKS; ++b)
+        if (pbus_owned(b))
+            for (unsigned k = 0; k < 2; ++k) live[b][k] = phy_pbus_rd(b, k + 1);
+}
+
+static void dco_workmode_keep_gain(void)
+{
+    const uint32_t gain = REG_READ(DCO_GAIN_FORCE_REG);
+    phy_pbus_workmode();
+    if (gain & DCO_GAIN_FORCE_BIT) phy_force_rx_gain(true, (uint8_t)(gain >> 24));
+}
+
+static bool dco_pair_is(const int code[2])
+{
+    return phy_pbus_rd(2, 2) == (uint16_t)code[0] && phy_pbus_rd(3, 2) == (uint16_t)code[1];
+}
+
+static bool dco_code_ok(const int code[2])
+{
+    return code[0] >= 0 && code[0] <= 511 && code[1] >= 0 && code[1] <= 511;
+}
+#endif
+
+bool phy_dco_read(int bank1[2], int bank2[2])
+{
+#ifdef OPENVRX_PHY_PINNED
+    lock_take();
+    bank1[0] = phy_pbus_rd(2, 1);
+    bank1[1] = phy_pbus_rd(3, 1);
+    bank2[0] = phy_pbus_rd(2, 2);
+    bank2[1] = phy_pbus_rd(3, 2);
+    lock_give();
+    return true;
+#else
+    bank1[0] = bank1[1] = bank2[0] = bank2[1] = -1;
+    return false;
+#endif
+}
+
+esp_err_t phy_dco_hold(const int bank1[2], const int code[2], int vendor_out[2], int bank1_out[2])
+{
+#ifndef OPENVRX_PHY_PINNED
+    (void)bank1;
+    (void)code;
+    (void)vendor_out;
+    (void)bank1_out;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    if (!dco_code_ok(code) || (bank1 && !dco_code_ok(bank1))) return ESP_ERR_INVALID_ARG;
+    lock_take();
+    if (s_dco_held) {
+        lock_give();
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint16_t live[PBUS_BLOCKS][2];
+    dco_read_live(live);
+    if (vendor_out) {
+        vendor_out[0] = live[2][1];
+        vendor_out[1] = live[3][1];
+    }
+    if (bank1_out) {
+        bank1_out[0] = live[2][0];
+        bank1_out[1] = live[3][0];
+    }
+    if (bank1) {
+        live[2][0] = (uint16_t)bank1[0];
+        live[3][0] = (uint16_t)bank1[1];
+    }
+    // Debug mode stops the work-mode replay: re-assert every owned word
+    // first so gain and bank 1 stay as they were, then the pair.
+    phy_pbus_debugmode();
+    for (unsigned b = 0; b < PBUS_BLOCKS; ++b)
+        if (pbus_owned(b))
+            for (unsigned k = 0; k < 2; ++k) phy_pbus_force_test(b, k + 1, live[b][k]);
+    phy_pbus_force_test(2, 2, (uint32_t)code[0]);
+    phy_pbus_force_test(3, 2, (uint32_t)code[1]);
+    s_dco_held = true;
+    const bool ok = dco_pair_is(code) && phy_pbus_rd(2, 1) == live[2][0] && phy_pbus_rd(3, 1) == live[3][0];
+    if (!ok) {
+        dco_workmode_keep_gain();
+        s_dco_held = false;
+    }
+    lock_give();
+    return ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+#endif
+}
+
+esp_err_t phy_dco_set(const int code[2])
+{
+#ifndef OPENVRX_PHY_PINNED
+    (void)code;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    if (!dco_code_ok(code)) return ESP_ERR_INVALID_ARG;
+    lock_take();
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_dco_held) {
+        phy_pbus_force_test(2, 2, (uint32_t)code[0]);
+        phy_pbus_force_test(3, 2, (uint32_t)code[1]);
+        err = dco_pair_is(code) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    }
+    lock_give();
+    return err;
+#endif
+}
+
+bool phy_dco_release(void)
+{
+#ifndef OPENVRX_PHY_PINNED
+    return false;
+#else
+    lock_take();
+    const bool was = s_dco_held;
+    if (was) {
+        dco_workmode_keep_gain();
+        s_dco_held = false;
+    }
+    lock_give();
+    return was;
+#endif
+}
+
+bool phy_dco_held(void)
+{
+#ifdef OPENVRX_PHY_PINNED
+    return s_dco_held;
+#else
+    return false;
 #endif
 }

@@ -26,6 +26,7 @@ static const char *const s_words[OPENVRX_CMD_COUNT] = {
     [OPENVRX_CMD_DL] = "dl",
     [OPENVRX_CMD_PING] = "ping",
     [OPENVRX_CMD_AGC] = "agc",
+    [OPENVRX_CMD_DC] = "dc",
 };
 
 const char *openvrx_cmd_word(openvrx_cmd_kind_t kind)
@@ -202,6 +203,10 @@ bool openvrx_cmd_parse(char *line, openvrx_cmd_t *cmd, openvrx_err_t *err, const
     case OPENVRX_CMD_AGC:
         if (!args(n, 1, 1, err)) return false;
         if (!parse_on_off(tok[1], &cmd->a.agc_on)) return fail(err, OPENVRX_ERR_SYNTAX, "expected on or off");
+        return true;
+    case OPENVRX_CMD_DC:
+        if (!args(n, 1, 1, err)) return false;
+        if (!parse_on_off(tok[1], &cmd->a.dc_on)) return fail(err, OPENVRX_ERR_SYNTAX, "expected on or off");
         return true;
     case OPENVRX_CMD_FILTER:
         if (!args(n, 1, 2, err)) return false;

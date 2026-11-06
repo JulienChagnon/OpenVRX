@@ -53,7 +53,32 @@ void openvrx_agc_acc_add(openvrx_agc_acc_t *a, const openvrx_agc_plan_t *plan, u
     const int lo = -(1 << (plan->bits - 1));
     a->clips += (vi == hi || vi == lo) + (vq == hi || vq == lo);
     a->sumsq4 += (uint64_t)((2 * vi + 1) * (2 * vi + 1)) + (uint64_t)((2 * vq + 1) * (2 * vq + 1));
+    a->sum2[0] += 2 * vi + 1;
+    a->sum2[1] += 2 * vq + 1;
+    a->neg[0] += vi < 0;
+    a->neg[1] += vq < 0;
     a->values += 2;
+}
+
+float openvrx_agc_mean_steps(const openvrx_agc_acc_t *a, unsigned axis)
+{
+    const uint32_t per_axis = a->values / 2u;
+    return axis < 2u && per_axis ? (float)a->sum2[axis] / (2.0f * (float)per_axis) : 0.0f;
+}
+
+float openvrx_agc_neg_share(const openvrx_agc_acc_t *a, unsigned axis)
+{
+    const uint32_t per_axis = a->values / 2u;
+    return axis < 2u && per_axis ? (float)a->neg[axis] / (float)per_axis : 0.5f;
+}
+
+float openvrx_agc_rms_ac_steps(const openvrx_agc_acc_t *a)
+{
+    if (!a->values) return 0.0f;
+    // Mean square over both axes minus the mean of the two squared means.
+    const float mi = openvrx_agc_mean_steps(a, 0), mq = openvrx_agc_mean_steps(a, 1);
+    const float ms = (float)a->sumsq4 / (4.0f * (float)a->values) - 0.5f * (mi * mi + mq * mq);
+    return ms > 0.0f ? sqrtf(ms) : 0.0f;
 }
 
 float openvrx_agc_clip_share(const openvrx_agc_acc_t *a)
@@ -82,4 +107,34 @@ unsigned openvrx_agc_next(unsigned gain, unsigned gain_min, unsigned gain_max, u
     if (next < (int)gain_min) next = (int)gain_min;
     if (next > (int)gain_max) next = (int)gain_max;
     return (unsigned)next;
+}
+
+void openvrx_agc_ctl_init(openvrx_agc_ctl_t *c) { memset(c, 0, sizeof(*c)); }
+
+// Milliseconds from a to b, wrap-safe (uint32 ms wraps after 49 days).
+static int32_t ms_since(uint32_t now, uint32_t then) { return (int32_t)(now - then); }
+
+unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min, float clip_share)
+{
+    if (clip_share < OPENVRX_AGC_ATTACK_CLIP) {
+        c->hot = 0;
+        return gain;
+    }
+    if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM) ++c->hot;
+    if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM || gain <= gain_min) return gain;
+    if (c->attacked && ms_since(now_ms, c->last_attack_ms) < (int32_t)OPENVRX_AGC_ATTACK_GAP_MS) return gain;
+    const unsigned next = gain > gain_min + OPENVRX_AGC_ATTACK_STEP ? gain - OPENVRX_AGC_ATTACK_STEP : gain_min;
+    c->attacked = true;
+    c->last_attack_ms = now_ms;
+    ++c->attacks;
+    return next;
+}
+
+unsigned openvrx_agc_slow(const openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min,
+                          unsigned gain_max, unsigned bits, float clip_share, float rms_steps)
+{
+    const unsigned next = openvrx_agc_next(gain, gain_min, gain_max, bits, clip_share, rms_steps);
+    if (next > gain && c->attacked && ms_since(now_ms, c->last_attack_ms) < (int32_t)OPENVRX_AGC_RAISE_HOLD_MS)
+        return gain;
+    return next;
 }

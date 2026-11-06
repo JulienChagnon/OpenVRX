@@ -22,6 +22,7 @@ void openvrx_settings_default(openvrx_settings_t *s, openvrx_board_id_t board, o
     s->drive_lanes = 1;
     s->drive_clk = 2;
     s->agc = 1;
+    s->dc = 1;
 }
 
 bool openvrx_settings_valid(const openvrx_settings_t *s)
@@ -39,6 +40,7 @@ bool openvrx_settings_valid(const openvrx_settings_t *s)
     if (s->bw_mhz != 20 && s->bw_mhz != 40) return false;
     if (s->drive_lanes > OPENVRX_DRIVE_MAX || s->drive_clk > OPENVRX_DRIVE_MAX) return false;
     if (s->agc > 1) return false;
+    if (s->dc > 1) return false;
     return true;
 }
 
@@ -46,12 +48,18 @@ bool openvrx_settings_from_blob(const void *blob, unsigned len, openvrx_settings
 {
     openvrx_settings_t s;
     memset(&s, 0, sizeof(s));
-    if (len == sizeof(s)) {
+    const uint8_t version = len ? ((const uint8_t *)blob)[0] : 0u;
+    if (len == sizeof(s) && version == OPENVRX_SETTINGS_VERSION) {
         memcpy(&s, blob, sizeof(s));
-    } else if (len == OPENVRX_SETTINGS_V1_SIZE && ((const uint8_t *)blob)[0] == 1u) {
+    } else if (len >= OPENVRX_SETTINGS_V2_FIELDS && len <= sizeof(s) && version == 2u) {
+        memcpy(&s, blob, OPENVRX_SETTINGS_V2_FIELDS);
+        s.version = OPENVRX_SETTINGS_VERSION;
+        s.dc = 1;
+    } else if (len == OPENVRX_SETTINGS_V1_SIZE && version == 1u) {
         memcpy(&s, blob, OPENVRX_SETTINGS_V1_SIZE);
         s.version = OPENVRX_SETTINGS_VERSION;
         s.agc = 1;
+        s.dc = 1;
     } else {
         return false;
     }

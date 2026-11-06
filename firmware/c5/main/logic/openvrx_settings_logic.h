@@ -11,9 +11,12 @@
 extern "C" {
 #endif
 
-#define OPENVRX_SETTINGS_VERSION 2u
+#define OPENVRX_SETTINGS_VERSION 3u
 // Size of the version 1 blob (no agc byte), upgraded on load.
 #define OPENVRX_SETTINGS_V1_SIZE 16u
+// Version 2 (agc, no dc): 17 bytes of fields plus one of padding, the same
+// size as version 3, so the two are told apart by the version byte.
+#define OPENVRX_SETTINGS_V2_FIELDS 17u
 
 // Stored as one NVS blob by `save`. Fixed layout, no pointers.
 typedef struct {
@@ -31,13 +34,15 @@ typedef struct {
     uint8_t drive_lanes;  // 0..3
     uint8_t drive_clk;    // 0..3
     uint8_t agc;          // 0/1, version 2
+    uint8_t dc;           // 0/1, version 3: DC correction (rf_dc_*)
 } openvrx_settings_t;
 
 void openvrx_settings_default(openvrx_settings_t *s, openvrx_board_id_t board, openvrx_preset_t preset);
 // Every field in range (the board fit of the preset is checked at boot).
 bool openvrx_settings_valid(const openvrx_settings_t *s);
-// Reads a stored blob of `len` bytes: the current layout, or a version 1
-// blob upgraded with the AGC on. False when it is neither or invalid.
+// Reads a stored blob of `len` bytes: the current layout, or an older one
+// upgraded (version 1: AGC and DC on; version 2: DC on). False when it is
+// none of them or invalid.
 bool openvrx_settings_from_blob(const void *blob, unsigned len, openvrx_settings_t *out);
 
 #ifdef __cplusplus

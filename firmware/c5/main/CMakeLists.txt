@@ -4,7 +4,7 @@ idf_component_register(
         "main.c" "boot_guard.c" "console.c" "radiohead.c" "rf.c" "phy.c" "sclk.c" "lanes_hw.c" "settings.c" "agc.c"
         "logic/arc_gain.c" "logic/openvrx_boards.c" "logic/openvrx_cmd.c" "logic/openvrx_lanes.c"
         "logic/openvrx_sclk_logic.c" "logic/openvrx_selftest.c" "logic/openvrx_settings_logic.c"
-        "logic/openvrx_agc.c"
+        "logic/openvrx_agc.c" "logic/openvrx_dc.c"
     INCLUDE_DIRS "." "logic"
     REQUIRES esp_wifi esp_phy nvs_flash esp_event esp_driver_parlio esp_driver_gpio esp_driver_gptimer
              esp_driver_usb_serial_jtag esp_timer esp_hw_support esp_hal_gpio esp_app_format esp_system hal soc esp_hal_wdt)

@@ -165,6 +165,7 @@ void radiohead_boot(const openvrx_settings_t *s)
         .filter_code = s->filter_code,
         .skirt = s->skirt,
         .bw20 = s->bw_mhz == 20,
+        .dc = s->dc != 0,
     };
     err = rf_start(&rc);
     if (err != ESP_OK) console_log("radio start: %s", esp_err_to_name(err));
@@ -193,9 +194,23 @@ static void cmd_status(void)
     char level[40];
     if (measurable) snprintf(level, sizeof(level), "clip=%u.%u rms=%u.%02u", clip / 10, clip % 10, rms / 100, rms % 100);
     else snprintf(level, sizeof(level), "clip=- rms=-");
-    reply("OK status mhz=%u off_khz=%d gain=%u agc=%d %s clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
+    // DC: measured mean (ADC units, full scale 512) and the held DAC pair
+    // with its trim from the vendor code.
+    rf_dc_info_t d;
+    rf_dc_info(&d);
+    int dc_adc[2];
+    agc_last_dc(dc_adc);
+    char dc[80];
+    int len = measurable ? snprintf(dc, sizeof(dc), "i_dc=%d q_dc=%d", dc_adc[0], dc_adc[1])
+                         : snprintf(dc, sizeof(dc), "i_dc=- q_dc=-");
+    if (len < 0) len = 0;
+    if (d.held)
+        snprintf(dc + len, sizeof(dc) - (size_t)len, " dco=%d/%d trim=%d/%d", d.code[0], d.code[1], d.trim[0], d.trim[1]);
+    else
+        snprintf(dc + len, sizeof(dc) - (size_t)len, " dco=%s trim=-", d.failed ? "error" : "-");
+    reply("OK status mhz=%u off_khz=%d gain=%u agc=%d %s atk=%u dc=%d %s clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
           "selftest=%s up_ms=%llu slips=%lu phy=%s board=%s hz=%lu boot=%s",
-          c.mhz, c.off_khz, c.gain, agc_enabled() ? 1 : 0, level, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
+          c.mhz, c.off_khz, c.gain, agc_enabled() ? 1 : 0, level, agc_attacks(), c.dc ? 1 : 0, dc, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
           c.p11 ? 1 : 0, filter_text(c.filter_code, fbuf, sizeof(fbuf)), c.skirt, c.bw20 ? 20u : 40u,
           lanes_hw_selftest_name(st), (unsigned long long)(esp_timer_get_time() / 1000), (unsigned long)sclk_slips(),
           rf_phy_state_name(rf_phy_state()), openvrx_board_name(s_board), (unsigned long)openvrx_clock_hz(sclk_div()),
@@ -407,6 +422,23 @@ static void cmd_selftest(openvrx_selftest_mode_t mode, uint32_t value, uint32_t 
     else reply("OK selftest mode=%s lanes=%u phase_us=%lu", lanes_hw_selftest_name(mode), n, (unsigned long)phase_us);
 }
 
+static void cmd_dc(bool on)
+{
+    const esp_err_t err = rf_dc_set_enabled(on);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        reply_err(OPENVRX_CMD_DC, OPENVRX_ERR_UNSUPPORTED, "needs the pinned PHY");
+        return;
+    }
+    rf_dc_info_t d;
+    rf_dc_info(&d);
+    if (err != ESP_OK) {
+        reply_err(OPENVRX_CMD_DC, OPENVRX_ERR_HW, "hold did not read back");
+        return;
+    }
+    if (d.held) reply("OK dc on=%d held=1 dco=%d/%d", on ? 1 : 0, d.code[0], d.code[1]);
+    else reply("OK dc on=%d held=0", on ? 1 : 0);
+}
+
 static void cmd_save(void)
 {
     const rf_config_t c = rf_config();
@@ -423,6 +455,7 @@ static void cmd_save(void)
     s.drive_lanes = (uint8_t)s_drive_lanes;
     s.drive_clk = (uint8_t)s_drive_clk;
     s.agc = agc_enabled() ? 1 : 0;
+    s.dc = c.dc ? 1 : 0;
     const esp_err_t err = settings_store(&s);
     if (err != ESP_OK) {
         reply_err(OPENVRX_CMD_SAVE, OPENVRX_ERR_HW, esp_err_to_name(err));
@@ -474,6 +507,7 @@ void radiohead_command(char *line)
         agc_set_enabled(cmd.a.agc_on);
         reply("OK agc on=%d", cmd.a.agc_on ? 1 : 0);
         break;
+    case OPENVRX_CMD_DC: cmd_dc(cmd.a.dc_on); break;
     default: reply_err(cmd.kind, OPENVRX_ERR_SYNTAX, "unknown command"); break;
     }
 }

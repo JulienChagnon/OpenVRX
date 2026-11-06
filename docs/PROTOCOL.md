@@ -34,13 +34,14 @@ The C5 stores nothing in flash unless `save` is sent.
 | Command | Reply (example) | Notes |
 |---|---|---|
 | `ver` | `OK ver fw=0.1.0 proto=1 board=xiao idf=v6.0.2 chip=esp32c5 rev=1` | |
-| `status` | `OK status mhz=5732 off_khz=0 gain=64 agc=1 clip=0.4 rms=4.31 clk=18 clk_on=1 lanes=7x7 p11=1 filter=cal selftest=off up_ms=12345 slips=2 phy=ok` | `clip` (% of I/Q values at full scale) and `rms` (per component, in steps of the lowest carried bit) are the last gain-loop measurement, `-` when the layout cannot be measured. |
+| `status` | `OK status mhz=5732 off_khz=0 gain=64 agc=1 clip=0.4 rms=4.31 atk=0 dc=1 i_dc=3 q_dc=-5 dco=241/250 trim=-18/-14 clk=18 clk_on=1 lanes=7x7 p11=1 filter=cal selftest=off up_ms=12345 slips=2 phy=ok` | `clip` (% of I/Q values at full scale) and `rms` (per component, in steps of the lowest carried bit) are the last gain-loop measurement, `-` when the layout cannot be measured. While the DC is held, `rms` is taken around the mean (the offset is not signal); otherwise it includes it. `atk`: fast-attack gain drops since boot. `i_dc`/`q_dc`: the measured I and Q mean in ADC units (full scale 512, the unit of the PC's `decode` stats). `dco`: the held DC DAC pair (`-` not held, `error` when a hold did not read back), `trim`: its distance from the vendor code of the gain row. |
 | `board <xiao\|zero\|custom>` | `OK board name=xiao pins=15` | Selects the pin map (see HARDWARE.md). Re-routes lanes. |
 | `pins` | `OK pins clk=G10 q=G1,G0,... i=G23,...` | Pin map for the current board and lanes, MSB first. |
 | `lanes <preset>` | `OK lanes preset=7x7 data_pins=14` | Presets as `openvrx_core::LanePreset` names: `8x8 7x7 6x6 5x5 4x4top 4x4fine 4x4ultra angle8`. `ERR range` if the board lacks pins. |
 | `tune <MHz> [offset_khz]` | `OK tune mhz=5732 off_khz=0` | Raw MHz, any value the PHY accepts (5645..5945 typical). |
 | `gain <index>` | `OK gain index=64` | Receive gain table index. Vendor AGC stays off. With `agc on` this is only the starting point. |
-| `agc <on\|off>` | `OK agc on=1` | The C5's own gain loop (default on). Every 100 ms it reads the lane pads back 4096 times, measures clipping and RMS, and moves the gain index (deadband 1.5 dB, up to 4 indexes per step, never raised while 5 % of values clip). Target RMS 0.55 of full scale (4.4 steps on 4x4top). Only layouts carrying the top ADC bits (8x8 to 4x4top); folded layouts and angle8 hold the gain. Works in FX2-only mode. |
+| `agc <on\|off>` | `OK agc on=1` | The C5's own gain loop (default on). Every 100 ms it reads the lane pads back 4096 times, measures clipping and RMS, and moves the gain index (deadband 1.5 dB, up to 4 indexes per step, never raised while 5 % of values clip). Target RMS 0.55 of full scale (4.4 steps on 4x4top). Between those updates a fast attack checks every 5 ms on 256 reads: after three hot batches in a row (10 % or more clipped, 10 ms of clipping, longer than an interference burst) the gain drops 6 indexes, again every 10 ms while it still clips, and raises are held off for 500 ms after. Only layouts carrying the top ADC bits (8x8 to 4x4top); folded layouts and angle8 hold the gain. Works in FX2-only mode. |
+| `dc <on\|off>` | `OK dc on=1 held=1 dco=241/250` | DC correction ahead of the ADC (default on, pinned PHY only, else `ERR dc unsupported`). The C5's I/Q leave the ADC with an offset the boot calibration leaves in (crash flight: I at +216 of 512); gain cannot remove it and once the samples are cut to 4 bits the clipped side is lost. While on, the DC DAC pair of the gain row in force (PBUS bank 2, C5VRX's recovered libphy facts) is held at the vendor code plus a per-row trim, and every 100 ms a servo on the gain loop's pad reads moves the trim of that row: proportional steps while the cloud spans zero, a sign-bit bracket while it sits on one side. A row seen for the first time starts from its nearest neighbour's trim. Trims live in RAM (they differ per boot and channel setup). Measured on the same layouts as the gain loop; on other layouts the trims are held as they are. `off` returns to the vendor DC. `ERR dc hw` when the hold did not read back. |
 | `gains` | `OK gains max=77 table=...` | Gain table size and optional dB estimates. |
 | `clk <divider>` | `OK clk div=18 hz=13333333` | Sample clock = 240 MHz / divider, divider 6..1023. Clock keeps running. |
 | `clk off` / `clk on` | `OK clk on=0` | Stops/starts the clock pin (FX2 stops latching). |
@@ -50,7 +51,7 @@ The C5 stores nothing in flash unless `save` is sent.
 | `bw <20\|40>` | `OK bw mhz=20` | Wi-Fi front end bandwidth select. |
 | `drive <lanes 0-3> [clk 0-3]` | `OK drive lanes=1 clk=2` | Pad drive strength of the lane pins and the clock pin (ESP-IDF `gpio_drive_cap_t`, 0 = weakest). Default lanes=1 clk=2. |
 | `selftest <off\|walk\|const HEX\|count>` | `OK selftest mode=walk lanes=14 phase_us=1000` | See below. Lanes are plain GPIO outputs while active. |
-| `save` | `OK save` | Stores board/lanes/clk/tune/gain/p11/filter/agc in NVS (a version 1 blob loads with the AGC on). |
+| `save` | `OK save` | Stores board/lanes/clk/tune/gain/p11/filter/agc/dc in NVS (older blobs load with what they lacked on: version 1 gets AGC and DC, version 2 gets DC). |
 | `reboot` | `OK reboot` | Then resets. |
 | `dl` | `OK dl` | Reboots into the ROM download mode for flashing. |
 | `ping` | `OK ping` | |
@@ -108,9 +109,17 @@ Added fields and arguments; nothing above changes meaning.
   when the clock pad cannot be observed. Each slip briefly runs the clock
   at 200 kHz (about 25 us), so the FX2 sees a short gap.
 - `gains` replies `OK gains max=<index> stages=<first index of each RF stage>`.
-- `EVT phy state=<state> cause=<modem|txq|gain|p11>` when the once-a-second
-  watchdog finds the receive lock drifted and restores it; `EVT phy
-  state=<state>` once after boot.
+- `EVT phy state=<state> cause=<modem|txq|gain|p11|dco>` when the once-a-second
+  watchdog finds the receive lock drifted and restores it (`dco`: the DC hold
+  was lost or its words no longer read as held); `EVT phy state=<state>` once
+  after boot.
+- DC correction: `EVT dc state=error cause=<hold|set|row> ...` when a hold or a
+  trim write did not read back (the correction stays off until `dc on` or the
+  next retune); `EVT dc limit gain=<g> i=<adc> q=<adc>` the first time (then
+  every 64th) a trim reaches its limit (96 codes from the vendor code), i.e.
+  a DC the DAC cannot reach; `EVT dc bank1 moved stage=<s> pin=<i/q>
+  live=<i/q>` once when the vendor's bank 1 changed under a pin (C5VRX saw this
+  move every row of a stage beyond the trim range; the pin is kept).
 - A line longer than 120 characters gets `ERR line syntax line longer than
   120 characters`. Commands received while the radio head is still booting
   get `ERR <command> state booting`. Empty lines get no reply.

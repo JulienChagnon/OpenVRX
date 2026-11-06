@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "openvrx_cmd.h"
+#include "openvrx_dc.h"
 #include "phy.h"
 #include "soc/lp_aon_reg.h"
 #include "soc/soc.h"
@@ -72,6 +73,18 @@ static uint16_t s_setup_mhz;
 static arc_gain_table_t s_table;
 static rf_phy_state_t s_state = RF_PHY_DOWN;
 static bool s_gain_check;   // GAIN_FORCE_REG matched our model after the first restore
+
+// DC hold (rf_dc_*). All under phy_begin().
+static openvrx_dc_rows_t s_dc_rows;
+static bool s_dc_failed;
+static int s_dc_base[2] = {-1, -1}, s_dc_code[2] = {-1, -1}, s_dc_bank1[2] = {-1, -1};
+// Bank 1 pinned per RF stage for one channel setup (C5VRX 2026-10-27: a
+// vendor rewrite of bank 1 frozen into a hold moved every row of the stage
+// beyond the trim range, until a reboot).
+static int s_bank1_pin[ARC_RX_STAGE_COUNT][2];
+static bool s_bank1_valid[ARC_RX_STAGE_COUNT];
+static uint32_t s_bank1_overrides;
+static volatile uint32_t s_dc_epoch;
 
 static esp_err_t lock_rx_only(void)
 {
@@ -126,13 +139,66 @@ static bool gain_forced_as_set(void)
     return (v & GAIN_FORCE_BIT) && ((v >> 24) & 0xffu) == s_cfg.gain;
 }
 
+// Back to PBUS work mode, so gain writes and channel setups replay the
+// vendor rows. Caller holds phy_begin().
+static void dc_release(void)
+{
+    if (phy_dco_release()) ++s_dc_epoch;
+}
+
+// Holds the DC pair of the gain row in force at its vendor code plus the
+// row's trim. Caller holds phy_begin(), after the gain write.
+static void dc_hold(void)
+{
+    if (!s_cfg.dc || s_dc_failed || !phy_pinned() || phy_dco_held()) return;
+    arc_gain_tuple_t t;
+    int bank1[2], base[2], trim[2];
+    if (!arc_gain_tuple_decode(&s_table, s_cfg.gain, &t) || t.rf_stage >= ARC_RX_STAGE_COUNT ||
+        s_cfg.gain >= OPENVRX_DC_ROWS || !phy_dco_read(bank1, base)) {   // work mode: the row's own words
+        s_dc_failed = true;   // reported once; the watchdog leaves a failed hold alone
+        console_evt("dc state=error cause=row gain=%u", s_cfg.gain);
+        return;
+    }
+    if (!s_bank1_valid[t.rf_stage]) {
+        s_bank1_pin[t.rf_stage][0] = bank1[0];
+        s_bank1_pin[t.rf_stage][1] = bank1[1];
+        s_bank1_valid[t.rf_stage] = true;
+    } else if (bank1[0] != s_bank1_pin[t.rf_stage][0] || bank1[1] != s_bank1_pin[t.rf_stage][1]) {
+        if (!s_bank1_overrides++)
+            console_evt("dc bank1 moved stage=%u pin=%d/%d live=%d/%d", t.rf_stage, s_bank1_pin[t.rf_stage][0],
+                        s_bank1_pin[t.rf_stage][1], bank1[0], bank1[1]);
+    }
+    openvrx_dc_rows_claim(&s_dc_rows, s_cfg.gain, trim);
+    const int code[2] = {openvrx_dc_code(base[0], trim[0]), openvrx_dc_code(base[1], trim[1])};
+    const esp_err_t err = phy_dco_hold(s_bank1_pin[t.rf_stage], code, NULL, NULL);
+    ++s_dc_epoch;
+    if (err != ESP_OK) {
+        s_dc_failed = true;
+        console_evt("dc state=error cause=hold err=%s", esp_err_to_name(err));
+        return;
+    }
+    memcpy(s_dc_base, base, sizeof(s_dc_base));
+    memcpy(s_dc_code, code, sizeof(s_dc_code));
+    memcpy(s_dc_bank1, s_bank1_pin[t.rf_stage], sizeof(s_dc_bank1));
+}
+
+// A new channel setup: bank 1 legitimately differs per frequency group,
+// so the pins start over; a failed hold gets another try.
+static void dc_new_setup(void)
+{
+    memset(s_bank1_valid, 0, sizeof(s_bank1_valid));
+    s_dc_failed = false;
+}
+
 // Every tuning/filter transaction restores the same receive state: modem
 // streaming, RX-only lock, vendor AGC off, bandwidth, forced gain, 11p
-// state, analog filter, digital filter. Caller holds phy_begin(). Returns
-// true when everything read back as requested.
+// state, analog filter, digital filter, DC hold. Caller holds phy_begin().
+// Returns true when everything read back as requested (a failed DC hold is
+// reported on its own, rf_dc_info).
 static bool restore_lock(void)
 {
     bool ok = true;
+    dc_release();   // the restore must run in work mode (vendor rows replayed)
     enable_continuous_modem();
     ok &= lock_rx_only() == ESP_OK;
     phy_disable_agc();
@@ -150,6 +216,7 @@ static bool restore_lock(void)
     if (!phy_filter_set_skirt(s_cfg.skirt, s_cfg.p11)) ok = false;
     if (!phy_dfilt_apply_default()) ok = false;
     if (s_gain_check && !gain_forced_as_set()) ok = false;
+    dc_hold();   // last: after the gain write, which replays the row's words
     return ok;
 }
 
@@ -205,6 +272,8 @@ static esp_err_t channel_setup(uint16_t mhz)
 // Full retune at the configured frequency and offset. Caller holds phy_begin().
 static esp_err_t retune(void)
 {
+    dc_release();   // before the setup: in debug mode the vendor rows would not replay
+    dc_new_setup();
     esp_err_t err = channel_setup(s_cfg.mhz);
     if (err == ESP_OK && s_cfg.off_khz) phy_chip_set_chan_offset(s_cfg.off_khz);
     const bool ok = restore_lock();
@@ -271,6 +340,8 @@ esp_err_t rf_tune(uint16_t mhz, int off_khz)
         // Offset only (as C5VRX's AFC): the vendor helper re-enables BB AGC,
         // so the full receive state is restored after it.
         s_cfg.off_khz = (int16_t)off_khz;
+        dc_release();
+        dc_new_setup();
         phy_chip_set_chan_offset(off_khz);
         const bool ok = restore_lock();
         set_state_after_restore(ok);
@@ -294,10 +365,19 @@ esp_err_t rf_set_gain(uint8_t gain)
     if (!s_started) return ESP_ERR_INVALID_STATE;
     if (gain > s_table.max_index) return ESP_ERR_INVALID_ARG;
     phy_begin();
+    // Re-writing the gain in force while held changes nothing but would
+    // leave debug mode for a moment (C5VRX rf_set_gain): skip it.
+    if (gain == s_cfg.gain && phy_dco_held()) {
+        phy_end();
+        return ESP_OK;
+    }
+    dc_release();   // a hold keeps PBUS in debug mode, where the gain row would not replay
     phy_force_rx_gain(true, gain);
     s_cfg.gain = gain;
+    ++s_dc_epoch;
     const bool ok = !s_gain_check || gain_forced_as_set();
     if (!ok) s_state = RF_PHY_ERROR;
+    dc_hold();
     phy_end();
     return ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
@@ -344,6 +424,69 @@ esp_err_t rf_set_bw20(bool bw20)
     return err;
 }
 
+esp_err_t rf_dc_set_enabled(bool on)
+{
+    if (on && !phy_pinned()) return ESP_ERR_NOT_SUPPORTED;
+    phy_begin();
+    s_cfg.dc = on;
+    s_dc_failed = false;
+    esp_err_t err = ESP_OK;
+    if (!on) {
+        dc_release();
+    } else if (s_started) {
+        dc_hold();
+        if (!phy_dco_held()) err = ESP_ERR_INVALID_RESPONSE;
+    }
+    phy_end();
+    return err;
+}
+
+bool rf_dc_held(void) { return phy_dco_held(); }
+uint32_t rf_dc_epoch(void) { return s_dc_epoch; }
+
+esp_err_t rf_dc_step(uint8_t gain, const int step[2], int applied[2], bool limited[2])
+{
+    applied[0] = applied[1] = 0;
+    limited[0] = limited[1] = false;
+    if (gain >= OPENVRX_DC_ROWS) return ESP_ERR_INVALID_ARG;
+    phy_begin();
+    const bool live = phy_dco_held() && gain == s_cfg.gain;
+    // A row not in force: its vendor code is not known here, so only the
+    // trim window bounds it (the DAC range is applied at its next hold).
+    static const int mid[2] = {OPENVRX_DC_CODE_MAX / 2, OPENVRX_DC_CODE_MAX / 2};
+    openvrx_dc_rows_step(&s_dc_rows, gain, live ? s_dc_base : mid, step, applied, limited);
+    esp_err_t err = ESP_OK;
+    if (live && (applied[0] || applied[1])) {
+        const int code[2] = {openvrx_dc_code(s_dc_base[0], s_dc_rows.trim[gain][0]),
+                             openvrx_dc_code(s_dc_base[1], s_dc_rows.trim[gain][1])};
+        err = phy_dco_set(code);
+        if (err == ESP_OK) {
+            memcpy(s_dc_code, code, sizeof(s_dc_code));
+        } else {
+            dc_release();
+            s_dc_failed = true;
+            console_evt("dc state=error cause=set err=%s", esp_err_to_name(err));
+        }
+    }
+    phy_end();
+    return err;
+}
+
+void rf_dc_info(rf_dc_info_t *out)
+{
+    phy_begin();
+    out->held = phy_dco_held();
+    out->failed = s_dc_failed;
+    for (unsigned a = 0; a < 2; ++a) {
+        out->code[a] = out->held ? s_dc_code[a] : -1;
+        out->base[a] = out->held ? s_dc_base[a] : -1;
+        out->trim[a] = out->held ? s_dc_code[a] - s_dc_base[a] : 0;
+        out->bank1[a] = out->held ? s_dc_bank1[a] : -1;
+    }
+    out->bank1_overrides = s_bank1_overrides;
+    phy_end();
+}
+
 rf_config_t rf_config(void) { return s_cfg; }
 rf_phy_state_t rf_phy_state(void) { return s_state; }
 
@@ -378,6 +521,14 @@ void rf_watchdog_poll(void)
     else if (!rx_only_locked()) why = "txq";
     else if (s_gain_check && !gain_forced_as_set()) why = "gain";
     else if (phy_pinned() && phy_11p_hw_state() != (s_cfg.p11 ? 1 : 0)) why = "p11";
+    else if (s_cfg.dc && !s_dc_failed && phy_pinned()) {
+        int bank1[2], bank2[2];
+        if (!phy_dco_held()) why = "dco";
+        else if (phy_dco_read(bank1, bank2) &&
+                 (bank2[0] != s_dc_code[0] || bank2[1] != s_dc_code[1] || bank1[0] != s_dc_bank1[0] ||
+                  bank1[1] != s_dc_bank1[1]))
+            why = "dco";
+    }
     if (why) {
         const bool ok = restore_lock();
         s_state = ok ? RF_PHY_RESTORED : RF_PHY_ERROR;

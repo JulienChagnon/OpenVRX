@@ -4,12 +4,15 @@
 // Build and run with test/run_tests.sh (or run_tests.ps1). With the
 // argument --tables the program prints the wiring tables used in
 // docs/HARDWARE.md instead of running the tests.
+#include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "arc_gain.h"
 #include "openvrx_agc.h"
+#include "openvrx_dc.h"
 #include "openvrx_boards.h"
 #include "openvrx_cmd.h"
 #include "openvrx_lanes.h"
@@ -506,6 +509,25 @@ static void test_settings_gain(void)
     memset(&u, 0, sizeof(u));
     CHECK(openvrx_settings_from_blob(v1, (unsigned)sizeof(v1), &u));
     CHECK(u.version == OPENVRX_SETTINGS_VERSION && u.agc == 1 && u.gain == 56 && u.mhz == s.mhz);
+    CHECK(u.dc == 1);
+    // Version 2: same blob size as version 3 (padding), told apart by the
+    // version byte, upgraded with DC on; agc kept as stored.
+    CHECK(sizeof(s) == 18u && OPENVRX_SETTINGS_V2_FIELDS == offsetof(openvrx_settings_t, dc));
+    uint8_t v2[18];
+    t = s;
+    t.version = 2;
+    t.agc = 0;
+    t.gain = 61;
+    memcpy(v2, &t, sizeof(v2));
+    v2[OPENVRX_SETTINGS_V2_FIELDS] = 0xAA;   // padding garbage
+    memset(&u, 0, sizeof(u));
+    CHECK(openvrx_settings_from_blob(v2, (unsigned)sizeof(v2), &u));
+    CHECK(u.version == OPENVRX_SETTINGS_VERSION && u.dc == 1 && u.agc == 0 && u.gain == 61);
+    t = s;
+    t.dc = 0;
+    CHECK(openvrx_settings_from_blob(&t, (unsigned)sizeof(t), &u) && u.dc == 0);
+    t.dc = 2;
+    CHECK(!openvrx_settings_valid(&t));
     v1[0] = 3;
     CHECK(!openvrx_settings_from_blob(v1, (unsigned)sizeof(v1), &u));
     CHECK(!openvrx_settings_from_blob(v1, 5, &u));
@@ -630,6 +652,469 @@ static void test_agc(void)
     CHECK(!openvrx_cmd_parse(line, &cmd, &err, &word));
 }
 
+// ---------------------------------------------------------------- dc
+
+// Pad word for component values v (two's complement, `bits` wide) on a
+// top-bit plan whose lane k sits on GPIO k.
+static uint32_t pads_top(const openvrx_lane_t *lanes, unsigned n, unsigned bits, int vi, int vq)
+{
+    uint32_t w = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        const int v = lanes[k].comp == 'I' ? vi : vq;
+        const unsigned bit = lanes[k].adc_bit - (10u - bits);
+        if (((unsigned)v >> bit) & 1u) w |= 1u << k;
+    }
+    return w;
+}
+
+static uint32_t s_rng = 12345u;
+static float frand(void)
+{
+    s_rng = s_rng * 1664525u + 1013904223u;
+    return (float)((s_rng >> 8) + 0.5) / 16777216.0f;
+}
+static float gauss(void)
+{
+    const float u = frand(), v = frand();
+    return sqrtf(-2.0f * logf(u)) * cosf(6.2831853f * v);
+}
+
+// The receiver ahead of the lane cut: DC = dc0 + slope * own trim + cross *
+// slope * other trim (ADC units), Gaussian noise, an optional constant
+// envelope carrier at a random phase per sample (FM video averages out).
+typedef struct {
+    float dc0[2], slope[2], cross, noise, carrier;
+    unsigned bits;
+    openvrx_lane_t lanes[OPENVRX_MAX_LANES];
+    unsigned n;
+    openvrx_agc_plan_t plan;
+} dc_plant_t;
+
+static void plant_init(dc_plant_t *p, openvrx_preset_t preset)
+{
+    memset(p, 0, sizeof(*p));
+    int8_t gpio[OPENVRX_MAX_LANES];
+    p->n = openvrx_preset_lanes(preset, p->lanes);
+    for (unsigned k = 0; k < p->n; ++k) gpio[k] = (int8_t)k;
+    CHECK(openvrx_agc_plan(preset, p->lanes, gpio, p->n, &p->plan));
+    p->bits = p->plan.bits;
+}
+
+static float plant_dc(const dc_plant_t *p, const int trim[2], unsigned a)
+{
+    return p->dc0[a] + p->slope[a] * (float)trim[a] + p->cross * p->slope[a] * (float)trim[1 - a];
+}
+
+static void plant_measure_n(const dc_plant_t *p, const int trim[2], openvrx_agc_acc_t *acc, unsigned reads)
+{
+    openvrx_agc_acc_reset(acc);
+    const int shift = 10 - (int)p->bits;
+    for (unsigned k = 0; k < reads; ++k) {
+        const float ph = 6.2831853f * frand();
+        int v[2];
+        for (unsigned a = 0; a < 2; ++a) {
+            const float x = plant_dc(p, trim, a) + p->noise * gauss() + p->carrier * (a ? sinf(ph) : cosf(ph));
+            int code = (int)floorf(x);
+            code = code < -512 ? -512 : code > 511 ? 511 : code;
+            v[a] = code >> shift;   // arithmetic: floor
+        }
+        openvrx_agc_acc_add(acc, &p->plan, pads_top(p->lanes, p->n, p->bits, v[0], v[1]));
+    }
+}
+
+static void plant_measure(const dc_plant_t *p, const int trim[2], openvrx_agc_acc_t *acc)
+{
+    plant_measure_n(p, trim, acc, OPENVRX_AGC_READS);
+}
+
+static void meas_from(const dc_plant_t *p, const openvrx_agc_acc_t *acc, openvrx_dc_meas_t *m)
+{
+    m->step_adc = (float)(1u << (10u - p->bits));
+    m->rms_ac_adc = openvrx_agc_rms_ac_steps(acc) * m->step_adc;
+    m->reads = acc->values / 2u;
+    for (unsigned a = 0; a < 2; ++a) {
+        m->mean_adc[a] = openvrx_agc_mean_steps(acc, a) * m->step_adc;
+        m->neg_share[a] = openvrx_agc_neg_share(acc, a);
+    }
+}
+
+// Runs the servo on one row for `updates` measurements; returns the largest
+// true |DC| over the last `tail` updates.
+static float dc_run(dc_plant_t *p, openvrx_dc_servo_t *s, openvrx_dc_rows_t *rows, unsigned row, uint32_t epoch,
+                    unsigned updates, unsigned tail, float wander)
+{
+    static const int base[2] = {256, 256};
+    float worst = 0.0f;
+    for (unsigned u = 0; u < updates; ++u) {
+        int trim[2];
+        openvrx_dc_rows_claim(rows, row, trim);
+        openvrx_agc_acc_t acc;
+        plant_measure(p, trim, &acc);
+        openvrx_dc_meas_t m;
+        meas_from(p, &acc, &m);
+        int step[2], applied[2];
+        bool limited[2];
+        openvrx_dc_servo_decide(s, row, epoch, &m, step);
+        openvrx_dc_rows_step(rows, row, base, step, applied, limited);
+        openvrx_dc_servo_applied(s, applied, limited);
+        if (getenv("DC_TRACE"))
+            printf("row %u u %2u trim %4d/%4d dc %7.1f/%7.1f mean %7.1f/%7.1f neg %.3f/%.3f step %3d/%3d pol %d/%d\n",
+                   row, u, trim[0], trim[1], (double)plant_dc(p, trim, 0), (double)plant_dc(p, trim, 1),
+                   (double)m.mean_adc[0], (double)m.mean_adc[1], (double)m.neg_share[0], (double)m.neg_share[1],
+                   applied[0], applied[1], s->pol[0], s->pol[1]);
+        if (u + tail >= updates) {
+            openvrx_dc_rows_claim(rows, row, trim);
+            for (unsigned a = 0; a < 2; ++a) {
+                const float d = fabsf(plant_dc(p, trim, a));
+                if (d > worst) worst = d;
+            }
+        }
+        p->dc0[0] += wander * gauss();
+        p->dc0[1] += wander * gauss();
+    }
+    return worst;
+}
+
+static float dc_clip_now(dc_plant_t *p, openvrx_dc_rows_t *rows, unsigned row)
+{
+    int trim[2];
+    openvrx_dc_rows_claim(rows, row, trim);
+    openvrx_agc_acc_t acc;
+    plant_measure(p, trim, &acc);
+    return openvrx_agc_clip_share(&acc);
+}
+
+static void test_dc(void)
+{
+    // DC_SEED=n reruns the simulations with another noise sequence.
+    if (getenv("DC_SEED")) s_rng = (uint32_t)strtoul(getenv("DC_SEED"), NULL, 10);
+    // Accumulator: mean, sign share and RMS around the mean.
+    dc_plant_t p;
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    openvrx_agc_acc_t acc;
+    openvrx_agc_acc_reset(&acc);
+    for (int k = 0; k < 1000; ++k)
+        openvrx_agc_acc_add(&acc, &p.plan, pads_top(p.lanes, p.n, 4, k & 1 ? 3 : 1, k & 1 ? -2 : -4));
+    CHECK(fabsf(openvrx_agc_mean_steps(&acc, 0) - 2.5f) < 1e-4f);    // (3.5 + 1.5) / 2
+    CHECK(fabsf(openvrx_agc_mean_steps(&acc, 1) + 2.5f) < 1e-4f);    // (-1.5 - 3.5) / 2
+    CHECK(openvrx_agc_neg_share(&acc, 0) == 0.0f && openvrx_agc_neg_share(&acc, 1) == 1.0f);
+    CHECK(fabsf(openvrx_agc_rms_ac_steps(&acc) - 1.0f) < 1e-3f);     // +-1 step around each mean
+    CHECK(openvrx_agc_rms_steps(&acc) > 2.6f);                        // the DC counted as signal
+
+    // Rows: claim from the nearest claimed row, limits around the vendor code.
+    openvrx_dc_rows_t rows;
+    openvrx_dc_rows_reset(&rows);
+    int trim[2], applied[2];
+    bool limited[2];
+    const int base[2] = {256, 20};
+    int st[2] = {5, -3};
+    openvrx_dc_rows_step(&rows, 70, base, st, applied, limited);
+    CHECK(applied[0] == 5 && applied[1] == -3 && !limited[0] && !limited[1]);
+    openvrx_dc_rows_claim(&rows, 74, trim);
+    CHECK(trim[0] == 5 && trim[1] == -3 && rows.have[74]);
+    st[0] = 200;
+    st[1] = -200;
+    openvrx_dc_rows_step(&rows, 70, base, st, applied, limited);
+    CHECK(rows.trim[70][0] == OPENVRX_DC_TRIM_MAX && rows.trim[70][1] == -20 && limited[0] && limited[1]);
+    CHECK(openvrx_dc_code(20, -40) == 0 && openvrx_dc_code(500, 40) == OPENVRX_DC_CODE_MAX);
+    openvrx_dc_rows_claim(&rows, 200, trim);
+    CHECK(trim[0] == 0 && trim[1] == 0);
+
+    openvrx_dc_servo_t s;
+    float worst;
+
+    // Crash flight: I +216, Q +136 of 512, noise about one step, an FM
+    // carrier at the gain loop's level (RMS 0.55 of full scale per axis).
+    // Within 3 s the DC is under a quarter step and the clipping falls to
+    // what the carrier's own peaks cost.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 216; p.dc0[1] = 136; p.slope[0] = 12; p.slope[1] = 10; p.noise = 60; p.carrier = 300;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    const float clip_before = dc_clip_now(&p, &rows, 70);
+    CHECK(clip_before > 0.10f);
+    worst = dc_run(&p, &s, &rows, 70, 1, 30, 10, 0.0f);
+    // Bound: the deadband, half a code plus two (inflated) standard errors.
+    CHECK(worst < 20.0f);
+    const float clip_after = dc_clip_now(&p, &rows, 70);
+    CHECK(clip_after < 0.25f * clip_before);
+    if (getenv("DC_TRACE")) printf("crash flight clip %.3f -> %.3f\n", (double)clip_before, (double)clip_after);
+    // Converged: little stepping on measurement noise over the next 5 s.
+    const uint32_t steps_before = s.steps;
+    worst = dc_run(&p, &s, &rows, 70, 1, 50, 50, 0.0f);
+    CHECK(worst < 20.0f && s.steps - steps_before <= 5u);
+    CHECK(s.flips == 0 && s.pol[0] == 1 && s.pol[1] == 1);
+
+    // Receiver noise under one step (no carrier, low gain): the IQ is one
+    // fixed point; the sign-bit bracket finds zero within one code.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 150; p.dc0[1] = -100; p.slope[0] = 12; p.slope[1] = 12; p.noise = 3;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 40, 1, 40, 10, 0.0f);
+    CHECK(worst <= 12.0f + 3.0f);
+    CHECK(s.flips == 0);
+
+    // Inverted DAC polarity: found and corrected, still converges.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 200; p.dc0[1] = -120; p.slope[0] = -12; p.slope[1] = -12; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 70, 1, 80, 10, 0.0f);
+    CHECK(worst < 20.0f);
+    CHECK(s.pol[0] == -1 && s.pol[1] == -1);
+
+    // Inverted polarity with a fixed point (no linear zone to learn from).
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 120; p.dc0[1] = 90; p.slope[0] = -10; p.slope[1] = -10; p.noise = 3;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 40, 1, 80, 10, 0.0f);
+    CHECK(worst <= 10.0f + 3.0f);
+
+    // One code moves a lot (45 ADC units): no hunting, within a code.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 216; p.dc0[1] = -150; p.slope[0] = 45; p.slope[1] = 45; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 70, 1, 40, 20, 0.0f);
+    CHECK(worst < 45.0f * 0.6f + 6.0f);
+
+    // One code moves little (3 ADC units): 50+ codes needed, within 6 s.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 180; p.dc0[1] = 150; p.slope[0] = 3; p.slope[1] = 3; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 70, 1, 60, 10, 0.0f);
+    CHECK(worst < 12.0f);
+
+    // Beyond the DAC's reach (96 codes x 3 = 288 < 450): the trim parks at
+    // its limit on the right side and stays there.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 450; p.dc0[1] = 0; p.slope[0] = 3; p.slope[1] = 3; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    (void)dc_run(&p, &s, &rows, 70, 1, 100, 1, 0.0f);
+    CHECK(rows.trim[70][0] == -OPENVRX_DC_TRIM_MAX);
+    CHECK(s.limits > 0);
+
+    // I/Q cross-coupling of 15 %, and a DC that wanders (C5VRX: 1-2 cells
+    // over seconds): tracked within a quarter step.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 120; p.dc0[1] = -90; p.slope[0] = 12; p.slope[1] = 12; p.cross = 0.15f; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 70, 1, 100, 70, 2.0f);
+    CHECK(worst < 20.0f);
+
+    // Row hops (the gain loop moving): each row converges, a new row starts
+    // from its neighbour's trim, and a row change forgets the last step.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.slope[0] = 12; p.slope[1] = 12; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    for (unsigned round = 0; round < 12; ++round)
+        for (unsigned r = 66; r <= 70; ++r) {
+            p.dc0[0] = 200.0f + 4.0f * (float)(r - 66);   // common shift, small per-row spread
+            p.dc0[1] = 130.0f - 3.0f * (float)(r - 66);
+            (void)dc_run(&p, &s, &rows, r, round * 8u + r, 3, 1, 0.0f);
+        }
+    for (unsigned r = 66; r <= 70; ++r) {
+        p.dc0[0] = 200.0f + 4.0f * (float)(r - 66);
+        p.dc0[1] = 130.0f - 3.0f * (float)(r - 66);
+        openvrx_dc_rows_claim(&rows, r, trim);
+        CHECK(fabsf(plant_dc(&p, trim, 0)) < 20.0f && fabsf(plant_dc(&p, trim, 1)) < 20.0f);
+    }
+    openvrx_dc_rows_claim(&rows, 71, trim);   // never visited: the neighbour's trim
+    CHECK(trim[0] == rows.trim[70][0] && trim[1] == rows.trim[70][1]);
+    CHECK(s.flips == 0);
+
+    // 8x8 (step 4 ADC units): same crash-flight offsets.
+    plant_init(&p, OPENVRX_PRESET_8X8);
+    p.dc0[0] = 216; p.dc0[1] = 136; p.slope[0] = 12; p.slope[1] = 10; p.noise = 60; p.carrier = 150;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    worst = dc_run(&p, &s, &rows, 70, 1, 30, 10, 0.0f);
+    CHECK(worst < 20.0f);
+
+    // Command.
+    char line[32] = "dc off";
+    openvrx_cmd_t cmd;
+    openvrx_err_t err;
+    const char *word;
+    CHECK(openvrx_cmd_parse(line, &cmd, &err, &word) && cmd.kind == OPENVRX_CMD_DC && !cmd.a.dc_on);
+    strcpy(line, "dc on");
+    CHECK(openvrx_cmd_parse(line, &cmd, &err, &word) && cmd.a.dc_on);
+    strcpy(line, "dc");
+    CHECK(!openvrx_cmd_parse(line, &cmd, &err, &word));
+}
+
+// ---------------------------------------------------------------- agc fades (C5-4)
+
+// FM carrier plus receiver noise ahead of the gain: both scale with the
+// gain's dB (db_per_index around G60). At sig_db 0 and G60 the carrier is
+// 400 ADC units (RMS 283, about the loop's 0.55 target on 4x4top).
+static void fade_plant(dc_plant_t *p, float sig_db, unsigned gain, float db_per_index)
+{
+    const float g = powf(10.0f, db_per_index * ((float)gain - 60.0f) / 20.0f);
+    p->carrier = 400.0f * powf(10.0f, sig_db / 20.0f) * g;
+    p->noise = 6.0f * g;
+}
+
+typedef struct {
+    unsigned gain;
+    unsigned writes;       // gain changes
+    unsigned clip_ticks;   // 5 ms ticks with 5 % or more clipped
+    int clear_ms;          // ms from the run's start to the first tick under 5 % (-1: none yet)
+} fade_result_t;
+
+// Share of 5 ms ticks whose batch an interference burst saturates.
+static float s_burst_rate;
+
+// Runs `ms` of 5 ms ticks at sig_db from state r; fast = the new loop.
+static void fade_run(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, uint32_t *t, uint32_t ms, float sig_db,
+                     float db_per_index, bool fast)
+{
+    static const int trim0[2] = {0, 0};
+    const uint32_t start = *t;
+    r->clear_ms = -1;
+    for (uint32_t end = *t + ms; *t < end; *t += OPENVRX_AGC_FAST_MS) {
+        fade_plant(p, sig_db, r->gain, db_per_index);
+        if (s_burst_rate > 0.0f && frand() < s_burst_rate) p->carrier = 3000.0f;   // a packet, rails both axes
+        openvrx_agc_acc_t acc;
+        unsigned next = r->gain;
+        if (*t % OPENVRX_AGC_PERIOD_MS == 0) {
+            plant_measure_n(p, trim0, &acc, OPENVRX_AGC_READS);
+            const float clip = openvrx_agc_clip_share(&acc), rms = openvrx_agc_rms_ac_steps(&acc);
+            next = fast ? openvrx_agc_slow(c, *t, r->gain, 0, 83, 4, clip, rms)
+                        : openvrx_agc_next(r->gain, 0, 83, 4, clip, rms);
+        } else {
+            plant_measure_n(p, trim0, &acc, OPENVRX_AGC_FAST_READS);
+            if (fast) next = openvrx_agc_fast(c, *t, r->gain, 0, openvrx_agc_clip_share(&acc));
+        }
+        if (openvrx_agc_clip_share(&acc) >= 0.05f) ++r->clip_ticks;
+        else if (r->clear_ms < 0) r->clear_ms = (int)(*t - start);
+        if (getenv("AGC_TICKS") && fast && sig_db > 0.0f && *t < 4300)
+            printf("t %u gain %u clip %.3f rms %.2f next %u\n", *t, r->gain, (double)openvrx_agc_clip_share(&acc),
+                   (double)openvrx_agc_rms_ac_steps(&acc), next);
+        if (next != r->gain) {
+            ++r->writes;
+            r->gain = next;
+        }
+    }
+}
+
+static void test_agc_fades(void)
+{
+    // Pure rules.
+    openvrx_agc_ctl_t c;
+    openvrx_agc_ctl_init(&c);
+    CHECK(openvrx_agc_fast(&c, 1000, 70, 0, 0.05f) == 70);                        // under the threshold
+    // Three hot batches in a row before the first attack.
+    CHECK(openvrx_agc_fast(&c, 1005, 70, 0, 0.50f) == 70);
+    CHECK(openvrx_agc_fast(&c, 1010, 70, 0, 0.50f) == 70);
+    CHECK(openvrx_agc_fast(&c, 1015, 70, 0, 0.50f) == 70 - OPENVRX_AGC_ATTACK_STEP);
+    CHECK(openvrx_agc_fast(&c, 1020, 64, 0, 0.50f) == 64);                        // within the gap
+    CHECK(openvrx_agc_fast(&c, 1025, 64, 0, 0.50f) == 64 - OPENVRX_AGC_ATTACK_STEP);
+    CHECK(openvrx_agc_fast(&c, 1100, 3, 0, 0.90f) == 0 && openvrx_agc_fast(&c, 1200, 0, 0, 0.90f) == 0);
+    CHECK(c.attacks == 3);
+    // Interference bursts (board 2026-11-04, no VTX): hot batches that do not
+    // last three in a row never attack.
+    {
+        openvrx_agc_ctl_t b;
+        openvrx_agc_ctl_init(&b);
+        static const float clips[] = {0.9f, 0.0f, 0.9f, 0.9f, 0.0f, 0.6f, 0.0f, 0.9f, 0.9f, 0.02f, 0.9f};
+        for (unsigned k = 0; k < sizeof(clips) / sizeof(clips[0]); ++k)
+            CHECK(openvrx_agc_fast(&b, 2000 + 5u * k, 83, 0, clips[k]) == 83);
+        CHECK(b.attacks == 0);
+    }
+    // Raise held off after an attack, lowering never.
+    CHECK(openvrx_agc_slow(&c, 1300, 50, 0, 83, 4, 0.0f, 1.0f) == 50);
+    CHECK(openvrx_agc_slow(&c, 1300, 50, 0, 83, 4, 0.9f, 7.0f) < 50);
+    CHECK(openvrx_agc_slow(&c, 1200 + OPENVRX_AGC_RAISE_HOLD_MS, 50, 0, 83, 4, 0.0f, 1.0f) > 50);
+    // Wrap-safe: an attack just before the uint32 ms wrap still holds raises after it.
+    openvrx_agc_ctl_init(&c);
+    (void)openvrx_agc_fast(&c, 0xFFFFFFE6u, 70, 0, 0.5f);
+    (void)openvrx_agc_fast(&c, 0xFFFFFFEBu, 70, 0, 0.5f);
+    CHECK(openvrx_agc_fast(&c, 0xFFFFFFF0u, 70, 0, 0.5f) < 70);
+    CHECK(openvrx_agc_slow(&c, 0x00000010u, 50, 0, 83, 4, 0.0f, 1.0f) == 50);
+
+    // Simulated fade recovery: settle weak (-20 dB), then +25 dB at once.
+    static const float dpi[2] = {0.5f, 2.0f};   // dB per index: the assumption, and much steeper
+    for (unsigned k = 0; k < 2; ++k) {
+        fade_result_t r_old = {.gain = 60}, r_new = {.gain = 60};
+        dc_plant_t p;
+        plant_init(&p, OPENVRX_PRESET_4X4TOP);
+        uint32_t t = 0;
+        openvrx_agc_ctl_init(&c);
+        fade_run(&p, &c, &r_old, &t, 4000, -20.0f, dpi[k], false);
+        t = 0;
+        fade_run(&p, &c, &r_new, &t, 4000, -20.0f, dpi[k], true);
+        if (getenv("AGC_TRACE"))
+            printf("settle -20 dB, %.1f dB/index: gain old %u new %u, writes old %u new %u, attacks %u\n",
+                   (double)dpi[k], r_old.gain, r_new.gain, r_old.writes, r_new.writes, c.attacks);
+        // Steady weak signal. With the assumed 0.5 dB per index the attack
+        // never fires. At 2 dB per index the old loop hunts (4 indexes = 8 dB
+        // steps against a 1.5 dB deadband: 40 writes in 4 s); the new one
+        // overshoots once, the attack catches it and the raise hold-off ends
+        // the hunting.
+        if (k == 0) CHECK(c.attacks == 0);
+        else CHECK(r_new.writes * 4 <= r_old.writes);
+        const unsigned settled_writes = r_new.writes;
+        r_old.writes = r_new.writes = r_old.clip_ticks = r_new.clip_ticks = 0;
+        uint32_t t_old = 4000, t_new = 4000;
+        fade_run(&p, &c, &r_old, &t_old, 1000, 5.0f, dpi[k], false);
+        fade_run(&p, &c, &r_new, &t_new, 1000, 5.0f, dpi[k], true);
+        const unsigned old_ms = r_old.clip_ticks * OPENVRX_AGC_FAST_MS, new_ms = r_new.clip_ticks * OPENVRX_AGC_FAST_MS;
+        if (getenv("AGC_TRACE"))
+            printf("fade +25 dB, %.1f dB/index: recovered old %d ms, new %d ms; clipped in 1 s old %u ms, "
+                   "new %u ms; writes old %u new %u (attacks %u, settle writes %u)\n",
+                   (double)dpi[k], r_old.clear_ms, r_new.clear_ms, old_ms, new_ms, r_old.writes, r_new.writes,
+                   c.attacks, settled_writes);
+        // Fade response (C5-4): 25 dB is 4 to 9 attacks 10 ms apart.
+        CHECK(r_new.clear_ms >= 0 && r_new.clear_ms <= 60);
+        CHECK(r_old.clear_ms < 0 || r_old.clear_ms >= 4 * r_new.clear_ms);
+        // Clipped time over the second, including any later overshoot of
+        // the 100 ms loop's raises when the dB per index is steeper than
+        // assumed (C5-3; each overshoot costs the 10 ms confirmation plus
+        // the attack): at most a third of the old loop's.
+        CHECK(new_ms * 3 <= old_ms);
+        CHECK(r_new.writes <= 15);
+        // Then steady at the new level: no pumping (at most a few writes in 3 s).
+        r_new.writes = 0;
+        fade_run(&p, &c, &r_new, &t_new, 3000, 5.0f, dpi[k], true);
+        CHECK(r_new.writes <= 4);
+    }
+
+    // Interference bursts on a weak steady signal (board: no VTX, the gain
+    // at the top). With one hot batch enough the board attacked about 2
+    // times a second, so about 1 % of its batches were hot; here 2 %
+    // (4 a second) are railed by a burst. Three in a row by chance is
+    // 8e-6 per tick: at most one in 5 s.
+    {
+        fade_result_t r = {.gain = 60};
+        dc_plant_t p;
+        plant_init(&p, OPENVRX_PRESET_4X4TOP);
+        uint32_t t = 0;
+        openvrx_agc_ctl_init(&c);
+        fade_run(&p, &c, &r, &t, 3000, -20.0f, 0.5f, true);   // settle without bursts
+        const unsigned settled = c.attacks;
+        s_burst_rate = 0.02f;
+        r.writes = 0;
+        fade_run(&p, &c, &r, &t, 5000, -20.0f, 0.5f, true);
+        if (getenv("AGC_TRACE"))
+            printf("bursts on a weak signal: attacks %u, writes %u in 5 s, gain %u\n", c.attacks - settled, r.writes,
+                   r.gain);
+        CHECK(c.attacks - settled <= 1);
+        // Fade recovery still works with the bursts on.
+        fade_result_t f = r;
+        f.clip_ticks = 0;
+        fade_run(&p, &c, &f, &t, 1000, 5.0f, 0.5f, true);
+        CHECK(f.clear_ms >= 0 && f.clear_ms <= 80);
+        s_burst_rate = 0.0f;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--tables") == 0) {
@@ -643,6 +1128,8 @@ int main(int argc, char **argv)
     test_slip();
     test_settings_gain();
     test_agc();
+    test_dc();
+    test_agc_fades();
     printf("%u checks, %u failures\n", s_checks, s_failures);
     return s_failures ? 1 : 0;
 }

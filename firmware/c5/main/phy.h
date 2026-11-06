@@ -4,7 +4,8 @@
 // 6bc9e4bbb5bef5948d42a065da27eae39315ad2d. Changes for OpenVRX: kept the
 // recursive PHY ownership, the analog filter, the fixed digital RX filter
 // and the 11p baseline; removed generations, actuator leases, observation
-// hooks and every DC DAC function; added an 11p "off" path that returns to
+// hooks and C5VRX's DC DAC searches (the DC hold came back in a smaller
+// form, phy_dco_*, for the per-row trims); added an 11p "off" path that returns to
 // the stock flags and fields captured at boot, and filter writes that know
 // whether 11p is on (the calibrated bytes differ).
 //
@@ -57,3 +58,28 @@ int phy_11p_hw_state(void);
 // Flags written before a channel setup so the vendor setup runs in the
 // requested mode.
 void phy_11p_prepare_setup(bool on);
+
+// RX DC DACs ahead of the ADC (C5VRX's recovered libphy facts, same pinned
+// archive): PBUS blocks 2 (I) and 3 (Q), bank 1 the vendor's coarse word
+// per RF stage, bank 2 the fine pair of the gain row in force. In work mode
+// every gain write replays the row's words from the AGC memory; a forced
+// pair holds only in PBUS debug mode, where nothing is replayed. So a hold
+// re-asserts the live gain and DC words (blocks 0, 1, 2, 3 and 8 only:
+// copying all eleven blocks killed the IQ on C5VRX's board), and must be
+// released before any gain write or channel setup (rf.c does). All refuse
+// without the pinned PHY.
+//
+// Live words (works held or not): bank 1 and bank 2, I then Q.
+bool phy_dco_read(int bank1[2], int bank2[2]);
+// Enters debug mode with the live words, bank 1 forced to bank1 (NULL:
+// as live, C5VRX's bank-1 pin), and bank 2 set to code. Verifies the read
+// back; on a mismatch it releases and returns ESP_ERR_INVALID_RESPONSE.
+// The live bank 2 before the hold (the vendor code of the row) goes to
+// vendor_out, the live bank 1 to bank1_out (either may be NULL).
+esp_err_t phy_dco_hold(const int bank1[2], const int code[2], int vendor_out[2], int bank1_out[2]);
+// While held: a new bank-2 pair, verified.
+esp_err_t phy_dco_set(const int code[2]);
+// Back to work mode with the forced gain re-asserted (phy_pbus_workmode
+// forces gain 50 for about 2 us). False when nothing was held.
+bool phy_dco_release(void);
+bool phy_dco_held(void);
