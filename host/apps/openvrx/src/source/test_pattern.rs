@@ -180,9 +180,43 @@ fn bench_ire(pattern: TestPattern, x: i32, row: i32) -> f32 {
     }
 }
 
+/// The resistor-ladder ESP32's colour patterns as the decoder should show
+/// them (R'G'B' 0..1, black 0): the same layout as `picture_ire` and
+/// `band_of` in tools/bench/att_ctl/ladder.cpp, on its 754 active samples
+/// (4 x fsc) by 240 field rows.
+fn ladder_rgb(pattern: TestPattern, nx: f32, ny: f32) -> [f32; 3] {
+    const ACTW: i32 = 754;
+    // 75 % bars: white, yellow, cyan, green, magenta, red, blue.
+    const BARS: [[f32; 3]; 7] = [
+        [0.75, 0.75, 0.75],
+        [0.75, 0.75, 0.0],
+        [0.0, 0.75, 0.75],
+        [0.0, 0.75, 0.0],
+        [0.75, 0.0, 0.75],
+        [0.75, 0.0, 0.0],
+        [0.0, 0.0, 0.75],
+    ];
+    const MULTI_MHZ: [f32; 5] = [0.5, 1.0, 2.0, 3.0, 4.0];
+    let x = ((nx * ACTW as f32) as i32).clamp(0, ACTW - 1);
+    let row = ((ny * 240.0) as i32).clamp(0, 239);
+    let bars = || BARS[(x * 7 / ACTW) as usize];
+    let grey = |y: f32| [y, y, y];
+    match (pattern, row) {
+        (TestPattern::BenchColourBars, _) | (_, 0..=119) => bars(),
+        (_, 120..=159) => {
+            let zone = (x * 5 / ACTW) as usize;
+            let cyc = MULTI_MHZ[zone] * 1e6 / (4.0 * 3_579_545.45);
+            grey(0.5 + 0.4 * (2.0 * std::f32::consts::PI * cyc * x as f32).sin())
+        }
+        (_, 160..=199) => grey(x as f32 / (ACTW - 1) as f32),
+        _ => grey(0.5),
+    }
+}
+
 /// One pattern pixel as RGB 0..1 (gamma coded).
 pub fn pattern_rgb(pattern: TestPattern, nx: f32, ny: f32, t: f32) -> [f32; 3] {
     match pattern {
+        TestPattern::BenchColourCard | TestPattern::BenchColourBars => ladder_rgb(pattern, nx, ny),
         TestPattern::BenchCard
         | TestPattern::BenchBars
         | TestPattern::BenchRamp
@@ -616,6 +650,23 @@ mod tests {
         assert_eq!(bench_ire(TestPattern::BenchGrey, 50, 100), 50.0);
         assert_eq!(TestPattern::bench("card"), Some(TestPattern::BenchCard));
         assert_eq!(TestPattern::bench("nope"), None);
+    }
+
+    #[test]
+    fn colour_card_matches_the_ladder() {
+        // Layout of band_of()/picture_ire() in tools/bench/att_ctl/ladder.cpp.
+        let c = |nx, row: f32| pattern_rgb(TestPattern::BenchColourCard, nx, (row + 0.5) / 240.0, 0.0);
+        assert_eq!(c(0.01, 0.0), [0.75, 0.75, 0.75]); // white bar
+        assert_eq!(c(0.99, 119.0), [0.0, 0.0, 0.75]); // blue bar
+        let m = c(0.3, 140.0)[0]; // multiburst stays within 0.1..0.9
+        assert!((0.1..=0.9).contains(&m));
+        assert!(c(0.0, 180.0)[0] < 0.01 && c(0.999, 180.0)[0] > 0.99); // ramp
+        assert_eq!(c(0.5, 220.0), [0.5, 0.5, 0.5]); // grey
+        // Colour bars fill the whole field.
+        assert_eq!(pattern_rgb(TestPattern::BenchColourBars, 0.78, 0.9, 0.0), [0.75, 0.0, 0.0]); // red, bar 5
+        assert_eq!(TestPattern::bench_on("card", "ladder"), Some(TestPattern::BenchColourCard));
+        assert_eq!(TestPattern::bench_on("card", "dac"), Some(TestPattern::BenchCard));
+        assert_eq!(TestPattern::bench_on("ramp", "ladder"), Some(TestPattern::BenchRamp));
     }
 
     #[test]

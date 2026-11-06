@@ -6,10 +6,22 @@
 //! openvrx-cli decode  REC [OUT_DIR] [FRAMES] [--steady-osd]
 //!                                             frames through the live DSP and video chain (raw preset;
 //!                                             --steady-osd: line-doubled fields as in the app's default)
+//! openvrx-cli decode  REC OUT_DIR FRAMES --live [--preset NAME] [--no-steady-osd]
+//!                                             the app's live video path instead: preset (default
+//!                                             low_latency), streaming, every line through the combiner
+//!                                             with host times from the byte position; saves displayed
+//!                                             fields (FRAMES 0: none) and prints lost lines once a second
+//!                                             and the combiner/assembler/repair counters (DSP-5)
 //! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G]
 //!                                             FX2-only capture, no window (bench scripts)
-//! openvrx-cli score   REC [--ref REC] [--frames N] [--skip K]
-//!                                             one JSON line: lock, C/N, clipping, frames, PSNR vs ref
+//! openvrx-cli score   REC [--ref REC] [--frames N] [--skip K] [--demod polar|lut|ls|pll|ekf]
+//!                     [--preset raw|low_latency|balanced|quality] [--ref-demod D]
+//!                                             one JSON line: lock, C/N, clipping, frames, PSNR vs ref,
+//!                                             DSP load and stage_ns (defaults: polar, raw; the
+//!                                             reference goes through the same chain)
+//! openvrx-cli timeline REC [--window S] [--demod polar|lut|ls|pll|ekf]
+//!                                             the whole recording in S-second rows (default 0.5):
+//!                                             lock, C/N, clipping, relocks, damaged share, USB gaps
 //! ```
 //! REC is any file of a recording (`NAME.openvrx.json`, `NAME.rx0.bin`) or its base path.
 
@@ -39,6 +51,13 @@ fn main() {
     let out = args.get(2).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("openvrx-out"));
     let result = match cmd {
         "inspect" => inspect(rec, &out),
+        "decode" if args.iter().any(|a| a == "--live") => decode_live(
+            rec,
+            &out,
+            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8),
+            opt(&args, "--preset").unwrap_or("low_latency"),
+            !args.iter().any(|a| a == "--no-steady-osd"),
+        ),
         "decode" => decode(
             rec,
             &out,
@@ -47,6 +66,7 @@ fn main() {
         ),
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
+        "timeline" => timeline(rec, &args[2..]),
         _ => Err(format!("unknown command {cmd}")),
     };
     if let Err(e) = result {
@@ -169,15 +189,23 @@ fn inspect(path: &str, out: &Path) -> Result<(), String> {
 /// Runs a recording through the live DSP and the raw video chain, handing
 /// each completed frame to `on_frame` until it returns false or the data
 /// ends. Returns the DSP line count and its final stats.
+///
+/// `preset` names the video cleanup (`VideoConfig::preset`); `raw` is the
+/// historical scoring chain. Other presets keep their colour, repair,
+/// deinterlace and denoise stages but still bypass the combiner (offline its
+/// waits run on host time) and always return finished frames.
 fn walk_frames(
     rec: &Recording,
     steady_osd: bool,
+    demod: openvrx_dsp::DemodKind,
+    preset: &str,
     mut on_frame: impl FnMut(&Frame) -> Result<bool, String>,
 ) -> Result<(u64, RxStats), String> {
     let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
     let cfg = RxDspConfig {
         sample_format: info.sample_format.clone(),
         standard: None,
+        demod,
         ..RxDspConfig::default()
     };
     let mut dsp = RxDsp::new(0, cfg);
@@ -197,7 +225,9 @@ fn walk_frames(
             total_lines += 1;
             let std = line.standard;
             if pipe.as_ref().is_none_or(|(s, _)| *s != std) {
-                let mut cfg = VideoConfig::raw(std);
+                let mut cfg = VideoConfig::preset(preset, std).ok_or(format!("unknown preset {preset}"))?;
+                cfg.combiner.mode = openvrx_video::CombineMode::Blend;
+                cfg.emit_frames = true;
                 if steady_osd {
                     cfg.deinterlace = DeinterlaceMethod::LineDouble;
                 }
@@ -219,7 +249,7 @@ fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(),
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let mut saved = 0;
-    let (total_lines, stats) = walk_frames(&rec, steady_osd, |f| {
+    let (total_lines, stats) = walk_frames(&rec, steady_osd, openvrx_dsp::DemodKind::Polar, "raw", |f| {
         if saved >= frames {
             return Ok(false);
         }
@@ -232,6 +262,105 @@ fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(),
     })?;
     println!("{total_lines} lines from the DSP; stats: {stats:?}");
     Ok(())
+}
+
+/// The app's live video path on a recording (DSP-5): the named preset with
+/// streaming on, every line through the combiner (`push_line`, not the
+/// bypass) with host times rebuilt from the byte position at the sample
+/// rate, 32 KB per block as the FX2 delivers them, and the gaps the
+/// recording's events name declared as the app does. A field is saved
+/// whenever the display would show a completed one (`current_frame()`
+/// after the bottom row updated). Prints the pipeline counters at the end.
+fn decode_live(path: &str, out: &Path, frames: usize, preset: &str, steady_osd: bool) -> Result<(), String> {
+    const BLOCK: usize = 32 * 1024;
+    let rec = Recording::open(path).map_err(|e| e.to_string())?;
+    let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
+    let cfg = RxDspConfig {
+        sample_format: info.sample_format.clone(),
+        standard: None,
+        ..RxDspConfig::default()
+    };
+    let word = info.sample_format.lanes.word_bytes.max(1) as u64;
+    let ns_per_byte = 1e9 / (info.sample_rate_hz * word as f64);
+    let mut dsp = RxDsp::new(0, cfg);
+    let mut r = rec.raw_reader(0).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let mut pipe: Option<(openvrx_core::VideoStandard, VideoPipeline)> = None;
+    let mut lines: Vec<LineRecord> = Vec::new();
+    let mut buf = vec![0u8; BLOCK];
+    let (mut byte, mut saved, mut fields) = (0u64, 0usize, 0u64);
+    'read: loop {
+        let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        byte += n as u64;
+        // The FX2 stamps a block when it completes: the time of its last byte.
+        let host_ns = (byte as f64 * ns_per_byte) as u64 + 1_000_000_000;
+        lines.clear();
+        dsp.push_bytes(&buf[..n], host_ns, &mut lines);
+        for line in lines.drain(..) {
+            let std = line.standard;
+            if pipe.as_ref().is_none_or(|(s, _)| *s != std) {
+                let mut vc = VideoConfig::preset(preset, std).ok_or(format!("unknown preset {preset}"))?;
+                vc.combiner.mode = openvrx_video::CombineMode::Blend;
+                if steady_osd {
+                    vc.deinterlace = DeinterlaceMethod::LineDouble;
+                }
+                vc.streaming = true;
+                vc.emit_frames = false;
+                pipe = Some((std, VideoPipeline::new(&vc)));
+            }
+            let Some((_, p)) = pipe.as_mut() else { continue };
+            let o = p.push_line(line);
+            let Some(rows) = o.updated_rows else { continue };
+            let f = p.current_frame();
+            if rows.end + 1 < f.height {
+                continue;
+            }
+            fields += 1;
+            // Once a second of signal: lines the display lost per field
+            // (assembler missing + late, combiner late), as the app's
+            // health check sees them.
+            if fields % 60 == 0 {
+                let s = p.stats();
+                let lost = s.assembler.missing_lines + s.assembler.late_lines + s.combiner.late_lines;
+                println!(
+                    "health t={:6.2}s lost_total={lost} missing={} asm_late={} comb_late={}",
+                    byte as f64 * ns_per_byte * 1e-9,
+                    s.assembler.missing_lines,
+                    s.assembler.late_lines,
+                    s.combiner.late_lines
+                );
+            }
+            if saved < frames {
+                let img =
+                    image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba8()).ok_or("frame size")?;
+                let path = out.join(format!("{}-live{saved:04}.png", rec.name()));
+                img.save(&path).map_err(|e| e.to_string())?;
+                saved += 1;
+            } else if frames > 0 {
+                break 'read;
+            }
+        }
+    }
+    let st = pipe.as_ref().map(|(_, p)| p.stats());
+    println!("{fields} displayed fields, {saved} saved; dsp {:?}", dsp.stats().lock);
+    if let Some(s) = st {
+        println!("combiner {:?}", s.combiner);
+        println!("assembler {:?}", s.assembler);
+        println!("repair {:?}", s.repair);
+    }
+    Ok(())
+}
+
+/// `--demod` (or another option name) as a demodulator, `default` if absent.
+fn parse_demod(args: &[String], name: &str, default: openvrx_dsp::DemodKind) -> Result<openvrx_dsp::DemodKind, String> {
+    let Some(v) = opt(args, name) else { return Ok(default) };
+    openvrx_dsp::DemodKind::ALL
+        .into_iter()
+        .find(|d| d.name() == v)
+        .ok_or(format!("{name} {v}: polar, lut, ls, pll or ekf"))
 }
 
 /// Value of `--name VALUE` in `args`.
@@ -326,12 +455,18 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
 type Lumas = (Vec<Vec<f32>>, f64, u64, RxStats);
 
 /// Luma of the frames of a recording, after skipping `skip` frames.
-fn lumas(rec: &Recording, skip: usize, frames: usize) -> Result<Lumas, String> {
+fn lumas(
+    rec: &Recording,
+    skip: usize,
+    frames: usize,
+    demod: openvrx_dsp::DemodKind,
+    preset: &str,
+) -> Result<Lumas, String> {
     let mut out = Vec::new();
     let mut seen = 0usize;
     let mut damage = 0u64;
     let mut pixels = 0u64;
-    let (lines, stats) = walk_frames(rec, false, |f| {
+    let (lines, stats) = walk_frames(rec, false, demod, preset, |f| {
         seen += 1;
         if seen > skip {
             damage += f.damage.iter().filter(|&&d| d != 0).count() as u64;
@@ -348,16 +483,25 @@ fn lumas(rec: &Recording, skip: usize, frames: usize) -> Result<Lumas, String> {
 /// each frame's luma against the reference recording's mean luma (a static
 /// scene recorded at a strong, clean level), so no known test picture is
 /// needed.
+///
+/// `--demod` picks the FM demodulator and `--preset` the video cleanup
+/// (default polar and raw, the historical numbers). The reference goes
+/// through the same chain, so PSNR measures the damage noise does to that
+/// chain's output; `--ref-demod` decodes the reference with another
+/// demodulator instead (to expose a demodulator's systematic distortion).
 fn score(path: &str, args: &[String]) -> Result<(), String> {
     let frames: usize = opt_num(args, "--frames", 30)?;
     let skip: usize = opt_num(args, "--skip", 10)?;
+    let demod = parse_demod(args, "--demod", openvrx_dsp::DemodKind::Polar)?;
+    let ref_demod = parse_demod(args, "--ref-demod", demod)?;
+    let preset = opt(args, "--preset").unwrap_or("raw");
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
-    let (ys, damaged, lines, stats) = lumas(&rec, skip, frames)?;
+    let (ys, damaged, lines, stats) = lumas(&rec, skip, frames, demod, preset)?;
 
     let mut psnr = Vec::new();
     if let Some(r) = opt(args, "--ref") {
         let reference = Recording::open(r).map_err(|e| e.to_string())?;
-        let (ref_ys, _, _, _) = lumas(&reference, skip, frames)?;
+        let (ref_ys, _, _, _) = lumas(&reference, skip, frames, ref_demod, preset)?;
         if let Some(first) = ref_ys.first() {
             let size = first.len();
             let mut mean = vec![0f32; size];
@@ -377,10 +521,17 @@ fn score(path: &str, args: &[String]) -> Result<(), String> {
     let median = psnr.get(psnr.len() / 2).copied();
     let duration = rec.duration_s();
     let fmt_opt = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.2}"));
+    // Per-stage DSP cost (ns per input sample) by stage name.
+    let stage_ns: Vec<String> = openvrx_dsp::STAGES
+        .iter()
+        .zip(&stats.stage_ns)
+        .map(|(name, ns)| format!("\"{name}\":{ns:.3}"))
+        .collect();
     println!(
         "{{\"rec\":\"{}\",\"seconds\":{duration:.2},\"lines\":{lines},\"line_rate_hz\":{:.1},\
          \"frames\":{},\"damaged\":{damaged:.4},\"lock\":\"{:?}\",\"cn_db\":{:.2},\"clip_pct\":{:.2},\
-         \"power_db\":{:.2},\"psnr_median\":{},\"psnr_min\":{}}}",
+         \"power_db\":{:.2},\"psnr_median\":{},\"psnr_min\":{},\
+         \"demod\":\"{}\",\"ref_demod\":\"{}\",\"preset\":\"{preset}\",\"load\":{:.4},\"stage_ns\":{{{}}}}}",
         rec.name(),
         stats.line_rate_hz,
         ys.len(),
@@ -389,7 +540,97 @@ fn score(path: &str, args: &[String]) -> Result<(), String> {
         stats.clip_pct,
         stats.power_db,
         fmt_opt(median),
-        fmt_opt(psnr.first().copied())
+        fmt_opt(psnr.first().copied()),
+        stats.demod.name(),
+        ref_demod.name(),
+        stats.load,
+        stage_ns.join(",")
     );
+    Ok(())
+}
+
+/// Health of a whole recording over time, one row per `--window` seconds
+/// (default 0.5): where a flight lost its picture and why. Time is the
+/// position in the raw file (samples recorded), so a USB gap does not shift
+/// later rows; `gap_ms` is the radio time lost in gaps that began in the
+/// window. The other columns come from the same DSP and video chain as
+/// `score`: lock and C/N and clipping as they stand at the window's end,
+/// relocks during it, and the damaged share of the frames finished in it.
+fn timeline(path: &str, args: &[String]) -> Result<(), String> {
+    let window: f64 = opt_num(args, "--window", 0.5)?;
+    if !(window > 0.0) {
+        return Err("--window must be above 0".into());
+    }
+    let rec = Recording::open(path).map_err(|e| e.to_string())?;
+    let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
+    let byte_rate = info.byte_rate();
+    let win_bytes = ((byte_rate * window) as usize).max(1);
+
+    let mut gap_ms: BTreeMap<u64, f64> = BTreeMap::new();
+    for e in &rec.events().events {
+        if let (Some(byte), openvrx_format::EventKind::UsbGap { lost_bytes, .. }) = (e.byte, &e.kind) {
+            *gap_ms.entry(byte / win_bytes as u64).or_default() += *lost_bytes as f64 / byte_rate * 1e3;
+        }
+    }
+
+    let demod = parse_demod(args, "--demod", openvrx_dsp::DemodKind::Polar)?;
+    let cfg = RxDspConfig {
+        sample_format: info.sample_format.clone(),
+        standard: None,
+        demod,
+        ..RxDspConfig::default()
+    };
+    let mut dsp = RxDsp::new(0, cfg);
+    let mut r = rec.raw_reader(0).map_err(|e| e.to_string())?;
+    let mut pipe: Option<(openvrx_core::VideoStandard, VideoPipeline)> = None;
+    let mut lines: Vec<LineRecord> = Vec::new();
+    let mut buf = vec![0u8; win_bytes.min(1 << 18)];
+    let mut relocks_before = 0u64;
+    println!("    t_s  lock       cn_db  clip%  relocks  damaged%  frames  gap_ms");
+    for w in 0u64.. {
+        let (mut damaged, mut pixels, mut frames, mut left, mut eof) = (0u64, 0u64, 0u32, win_bytes, false);
+        while left > 0 {
+            let take = left.min(buf.len());
+            let n = r.read(&mut buf[..take]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            left -= n;
+            lines.clear();
+            dsp.push_bytes(&buf[..n], 0, &mut lines);
+            for line in lines.drain(..) {
+                let std = line.standard;
+                if pipe.as_ref().is_none_or(|(s, _)| *s != std) {
+                    pipe = Some((std, VideoPipeline::new(&VideoConfig::raw(std))));
+                }
+                let Some((_, p)) = pipe.as_mut() else { continue };
+                // One receiver: bypass the combiner, as in walk_frames.
+                for f in p.push_combined_line(&line).frames_completed {
+                    damaged += f.damage.iter().filter(|&&d| d != 0).count() as u64;
+                    pixels += f.damage.len() as u64;
+                    frames += 1;
+                }
+            }
+        }
+        if left == win_bytes {
+            break; // nothing read: end of the recording
+        }
+        let s = dsp.stats();
+        let dmg = if pixels > 0 { format!("{:8.1}", 100.0 * damaged as f64 / pixels as f64) } else { "       -".into() };
+        let gap = gap_ms.get(&w).map_or("      -".to_string(), |ms| format!("{ms:7.0}"));
+        println!(
+            "{:7.2}  {:<9}  {:5.1}  {:5.1}  {:7}  {dmg}  {frames:6}  {gap}",
+            w as f64 * window,
+            format!("{:?}", s.lock),
+            s.cn_db,
+            s.clip_pct,
+            s.relocks - relocks_before
+        );
+        relocks_before = s.relocks;
+        if eof {
+            break;
+        }
+    }
     Ok(())
 }

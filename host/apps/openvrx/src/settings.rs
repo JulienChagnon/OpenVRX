@@ -642,11 +642,16 @@ pub enum TestPattern {
     BenchGrey,
     BenchBlack,
     BenchWhite,
+    /// The colour card and colour bars of the resistor-ladder output
+    /// (tools/bench/att_ctl/ladder.cpp, the default since 2026-11-04); its
+    /// other patterns match the DAC ones above.
+    BenchColourCard,
+    BenchColourBars,
 }
 
 impl TestPattern {
     #[cfg(test)]
-    pub const ALL: [TestPattern; 12] = [
+    pub const ALL: [TestPattern; 14] = [
         TestPattern::Mix,
         TestPattern::Bars,
         TestPattern::ZonePlate,
@@ -659,6 +664,8 @@ impl TestPattern {
         TestPattern::BenchGrey,
         TestPattern::BenchBlack,
         TestPattern::BenchWhite,
+        TestPattern::BenchColourCard,
+        TestPattern::BenchColourBars,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -674,7 +681,19 @@ impl TestPattern {
             TestPattern::BenchGrey => "bench grey",
             TestPattern::BenchBlack => "bench black",
             TestPattern::BenchWhite => "bench white",
+            TestPattern::BenchColourCard => "bench colour card",
+            TestPattern::BenchColourBars => "bench colour bars",
         }
+    }
+    /// A bench pattern by its att_ctl name as the ESP32 output `out` draws
+    /// it (`ladder`, the default, or `dac`, the old monochrome P25 output).
+    pub fn bench_on(name: &str, out: &str) -> Option<TestPattern> {
+        let p = TestPattern::bench(name)?;
+        Some(match (p, out) {
+            (TestPattern::BenchCard, "ladder") => TestPattern::BenchColourCard,
+            (TestPattern::BenchBars, "ladder") => TestPattern::BenchColourBars,
+            _ => p,
+        })
     }
     /// A bench ESP32 pattern by its att_ctl name (card, bars, ramp, check,
     /// grey, black, white).

@@ -69,6 +69,10 @@ pub struct Args {
     #[arg(long, value_name = "PATTERN", default_value = "card",
           value_parser = ["card", "bars", "ramp", "check", "grey", "black", "white"])]
     pub compare_pattern: String,
+    /// The ESP32's video output the comparison draws: `ladder` (colour,
+    /// att_ctl's default) or `dac` (the old monochrome P25 patterns).
+    #[arg(long, value_name = "OUT", default_value = "ladder", value_parser = ["ladder", "dac"])]
+    pub compare_out: String,
     /// Start in the side-by-side comparison (key X toggles it).
     #[arg(long)]
     pub compare: bool,

@@ -269,6 +269,9 @@ fn dsp_loop(mut c: DspCtx, cfg: RxDspConfig) {
     let mut lines: Vec<LineRecord> = Vec::with_capacity(256);
     let mut next_byte: Option<u64> = None;
     let mut last_stats = 0u64;
+    // Drop report (DSP-5): lines the video views could not take, so the next
+    // picture loss says whether the DSP or the video side ran short.
+    let (mut last_drop_log, mut drops_logged) = (0u64, 0u64);
     while !c.stop.load(Ordering::Relaxed) {
         while let Ok(cmd) = c.cmds.try_recv() {
             match cmd {
@@ -307,6 +310,22 @@ fn dsp_loop(mut c: DspCtx, cfg: RxDspConfig) {
         if now - last_stats >= STATUS_NS {
             *c.shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(dsp.stats());
             last_stats = now;
+        }
+        if now - last_drop_log >= 5_000_000_000 {
+            let dropped = c.shared.lines_dropped.load(Ordering::Relaxed);
+            if dropped > drops_logged {
+                let s = dsp.stats();
+                eprintln!(
+                    "openvrx: rx{} {} lines dropped in 5 s (video queue full); dsp lines_out {} load {:.2} lock {:?}",
+                    c.rx,
+                    dropped - drops_logged,
+                    s.lines_out,
+                    s.load,
+                    s.lock
+                );
+                drops_logged = dropped;
+            }
+            last_drop_log = now;
         }
     }
 }
@@ -363,14 +382,112 @@ impl Drop for VideoWorker {
     }
 }
 
+/// Video-path health of one view (DSP-5), written by its video thread and
+/// read into the view's status.
+#[derive(Default)]
+struct VideoHealth {
+    /// Lines the display lost since the view opened: the assembler's missing
+    /// and late lines plus the combiner's late lines, over every rebuild.
+    lost_lines: AtomicU64,
+    /// Pipeline rebuilds by the health check.
+    rebuilds: AtomicU64,
+    last_rebuild_ns: AtomicU64,
+}
+
+/// Lost lines per field above which a second counts as unhealthy, and the
+/// run of such seconds that rebuilds the pipeline. Calibrated on the
+/// 2026-11-04 flights (live path replayed with `openvrx-cli decode --live`):
+/// range-edge relocks reach 17.5 lines per field for single seconds, at
+/// most two in a row; the persistent black-row fault lasted minutes.
+const HEALTH_LOST_PER_FIELD: f64 = 4.0;
+const HEALTH_BAD_SECONDS: u32 = 5;
+const HEALTH_WINDOW_FIELDS: u64 = 60;
+
+/// One second's verdict: the new run of unhealthy seconds and whether it
+/// calls for a rebuild.
+fn health_verdict(bad_seconds: u32, lost_per_field: f64) -> (u32, bool) {
+    let bad = if lost_per_field > HEALTH_LOST_PER_FIELD { bad_seconds + 1 } else { 0 };
+    (bad, bad >= HEALTH_BAD_SECONDS)
+}
+
+/// Rows that stop arriving every field (the black bars of 2026-11-04,
+/// DSP-5) are state in the pipeline: the same recording replays clean. A
+/// sustained loss rebuilds the pipeline, which resets the combiner, the
+/// field assembler and the repair/deinterlace histories, as an app restart
+/// did; it is logged on stderr so the next occurrence leaves evidence.
+struct HealthCheck {
+    fields: u64,
+    lost_at_window: u64,
+    bad_seconds: u32,
+    logged_ns: u64,
+}
+
+impl HealthCheck {
+    fn new() -> HealthCheck {
+        HealthCheck {
+            fields: 0,
+            lost_at_window: 0,
+            bad_seconds: 0,
+            logged_ns: 0,
+        }
+    }
+
+    fn lost(p: &VideoPipeline) -> u64 {
+        let s = p.stats();
+        s.assembler.missing_lines + s.assembler.late_lines + s.combiner.late_lines
+    }
+
+    /// Called after each displayed field; true when the pipeline must be rebuilt.
+    fn field_done(&mut self, p: &VideoPipeline, health: &VideoHealth) -> bool {
+        self.fields += 1;
+        if self.fields % HEALTH_WINDOW_FIELDS != 0 {
+            return false;
+        }
+        let lost = Self::lost(p);
+        let window = lost.saturating_sub(self.lost_at_window);
+        health.lost_lines.fetch_add(window, Ordering::Relaxed);
+        self.lost_at_window = lost;
+        let per_field = window as f64 / HEALTH_WINDOW_FIELDS as f64;
+        let now = now_ns();
+        if per_field > 1.0 && now.saturating_sub(self.logged_ns) > 10_000_000_000 {
+            let s = p.stats();
+            eprintln!(
+                "openvrx: video lost {per_field:.1} lines/field (combiner {:?}; assembler {:?}; \
+                 stages {:.2} ms per field)",
+                s.combiner,
+                s.assembler,
+                s.average.total_ns() as f64 * 1e-6
+            );
+            self.logged_ns = now;
+        }
+        let rebuild;
+        (self.bad_seconds, rebuild) = health_verdict(self.bad_seconds, per_field);
+        if !rebuild {
+            return false;
+        }
+        let s = p.stats();
+        eprintln!(
+            "openvrx: video lost more than {HEALTH_LOST_PER_FIELD} lines/field for {HEALTH_BAD_SECONDS} s \
+             (last {per_field:.1}); rebuilding the video pipeline. combiner {:?}; assembler {:?}",
+            s.combiner, s.assembler
+        );
+        health.rebuilds.fetch_add(1, Ordering::Relaxed);
+        health.last_rebuild_ns.store(now, Ordering::Relaxed);
+        *self = HealthCheck::new();
+        true
+    }
+}
+
 fn video_loop(
     lines: MpscReceiver<LineRecord>,
     settings: Arc<Mutex<VideoSettings>>,
     mut producer: FrameProducer,
     stop: Arc<AtomicBool>,
+    health: Arc<VideoHealth>,
 ) {
     let mut current = settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut pipe: Option<(VideoStandard, VideoPipeline)> = None;
+    let mut check = HealthCheck::new();
     while !stop.load(Ordering::Relaxed) {
         let line = match lines.recv_timeout(Duration::from_millis(100)) {
             Ok(l) => l,
@@ -392,6 +509,7 @@ fn video_loop(
         }
         if pipe.as_ref().is_none_or(|(s, _)| *s != standard) {
             pipe = Some((standard, VideoPipeline::new(&video_config(&current, standard))));
+            check = HealthCheck::new();
         }
         let Some((_, p)) = pipe.as_mut() else {
             continue;
@@ -411,6 +529,11 @@ fn video_loop(
                     newest_line_ns: stamp,
                 },
             );
+            if field_done && check.field_done(p, &health) {
+                // The display keeps its texture; the new pipeline rewrites
+                // every row as its lines arrive.
+                *p = VideoPipeline::new(&video_config(&current, standard));
+            }
         }
     }
 }
@@ -418,6 +541,7 @@ fn video_loop(
 struct LiveView {
     rxs: Vec<RxId>,
     status: Arc<StatusCell<SourceStatus>>,
+    health: Arc<VideoHealth>,
 }
 
 // ---------------------------------------------------------------------
@@ -874,13 +998,15 @@ fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSour
     }));
     let (tx, rx) = mpsc::sync_channel(LINE_QUEUE);
     let stop = Arc::new(AtomicBool::new(false));
+    let health = Arc::new(VideoHealth::default());
     let thread = {
         let producer = exchange.producer();
         let settings = Arc::clone(&st.video);
         let stop = Arc::clone(&stop);
+        let health = Arc::clone(&health);
         std::thread::Builder::new()
             .name(format!("openvrx-video-{view}"))
-            .spawn(move || video_loop(rx, settings, producer, stop))
+            .spawn(move || video_loop(rx, settings, producer, stop, health))
     };
     let thread = match thread {
         Ok(t) => t,
@@ -910,6 +1036,7 @@ fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSour
         *slot = Some(LiveView {
             rxs: use_rx,
             status,
+            health,
         });
     }
     ctx.emit(BackendEvent::ViewOpened {
@@ -1159,7 +1286,17 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
         let lock = best.map_or(LockState::NoSignal, |s| lock_state(s.lock));
         let freq = mine.first().map(|p| p.1.freq_mhz);
         let preset = st.video.lock().unwrap_or_else(|e| e.into_inner()).effective_preset();
+        let lost = view.health.lost_lines.load(Ordering::Relaxed);
+        let rebuilds = view.health.rebuilds.load(Ordering::Relaxed);
+        let since = now_ns().saturating_sub(view.health.last_rebuild_ns.load(Ordering::Relaxed));
+        // View-only warnings (the backend-wide ones reach the OSD on their own).
+        let mut view_warnings = Vec::new();
+        if rebuilds > 0 && since < 10_000_000_000 {
+            view_warnings.push(format!("video rows lost: pipeline reset ({rebuilds}x)"));
+        }
         view.status.publish(|s| {
+            s.dropped_lines = lost;
+            s.warnings = view_warnings;
             s.label = freq.map_or_else(|| "LIVE".into(), crate::channels::label);
             s.standard = best.and_then(|b| b.standard);
             s.lock = lock;
@@ -1258,6 +1395,28 @@ mod tests {
     fn recording_names() {
         let p = recording_base(Path::new("rec"), "2026-10-29T21:14:03Z");
         assert_eq!(p, Path::new("rec").join("openvrx-20261029-211403"));
+    }
+
+    #[test]
+    fn health_ignores_range_edge_and_catches_persistent_loss() {
+        let run = |per_second: &[f64]| {
+            let mut bad = 0;
+            per_second.iter().any(|&v| {
+                let (b, rebuild) = health_verdict(bad, v);
+                bad = b;
+                rebuild
+            })
+        };
+        // 2026-11-04 range test (231926), lost lines per field per second
+        // through the live path: never a rebuild.
+        let range = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.4, 0.0, 17.5, 4.3, 0.0, 0.0, 17.5, 0.0];
+        assert!(!run(&range));
+        // Four bad seconds, a good one, four more: still not persistent.
+        assert!(!run(&[9.0, 9.0, 9.0, 9.0, 0.0, 9.0, 9.0, 9.0, 9.0]));
+        // Rows lost every field for five seconds: rebuild.
+        assert!(run(&[0.0, 12.0, 12.0, 12.0, 12.0, 12.0]));
+        assert_eq!(health_verdict(4, 12.0), (5, true));
+        assert_eq!(health_verdict(4, 4.0), (0, false));
     }
 
     #[test]

@@ -120,7 +120,8 @@ fn main() -> ExitCode {
     let source = args.source;
     let run_for = args.run_for;
     let note = loaded.note;
-    let compare_pattern = settings::TestPattern::bench(&args.compare_pattern).unwrap_or(settings::TestPattern::BenchCard);
+    let compare_pattern = settings::TestPattern::bench_on(&args.compare_pattern, &args.compare_out)
+        .unwrap_or(settings::TestPattern::BenchColourCard);
     let compare = args.compare;
     let bench_control = args.bench_control;
     let result = eframe::run_native(
