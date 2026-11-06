@@ -144,7 +144,9 @@ static const char *set_and_confirm(char cmd, uint16_t value, TrampState *st, Don
     if (done(*st)) return nullptr;
     send(cmd, value);
     delay(GAP_MS);
-    if (!query_status(st)) return "no answer after the set";
+    // The VTX sometimes misses the first read right after a change
+    // (seen leaving pit mode, 2026-11-04): ask once more.
+    if (!query_status(st) && !query_status(st)) return "no answer after the set";
   }
   return done(*st) ? nullptr : "the VTX did not take it";
 }

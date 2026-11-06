@@ -51,6 +51,10 @@
 
 #include <Arduino.h>
 
+#include <Preferences.h>
+
+#include "ladder.h"
+#include "net.h"
 #include "tramp.h"
 #include "video.h"
 
@@ -92,7 +96,7 @@ static void pit_guard()
   const char *err = tramp_set_pit(true, &st);  // reads first, sends only if needed
   static bool reported = false;
   if (!err && !reported) {
-    Serial.println("EVT vtx pit on (no bench run)");
+    OUT.println("EVT vtx pit on (no bench run)");
     reported = true;
   }
   if (err) reported = false;  // VTX off or not answering: say so again when it is back
@@ -101,18 +105,18 @@ static void pit_guard()
 static void vtx_reply(const char *err, const TrampState &st)
 {
   if (err) {
-    Serial.printf("ERR vtx %s\n", err);
+    OUT.printf("ERR vtx %s\n", err);
     return;
   }
-  Serial.print("OK vtx");
+  OUT.print("OK vtx");
   if (st.have_status)
-    Serial.printf(" mhz=%u conf_mw=%u actual_mw=%u pit=%d lock=%d", st.mhz, st.conf_mw, st.actual_mw,
+    OUT.printf(" mhz=%u conf_mw=%u actual_mw=%u pit=%d lock=%d", st.mhz, st.conf_mw, st.actual_mw,
                   st.pit ? 1 : 0, st.race_lock ? 1 : 0);
-  if (st.have_limits) Serial.printf(" min_mhz=%u max_mhz=%u max_mw=%u", st.min_mhz, st.max_mhz, st.max_mw);
-  if (st.have_temp) Serial.printf(" temp=%d", st.temp);
-  if (lease_active()) Serial.printf(" guard=active left_s=%ld", (long)((lease_until_ms - millis()) / 1000));
-  else Serial.print(" guard=pit");
-  Serial.println();
+  if (st.have_limits) OUT.printf(" min_mhz=%u max_mhz=%u max_mw=%u", st.min_mhz, st.max_mhz, st.max_mw);
+  if (st.have_temp) OUT.printf(" temp=%d", st.temp);
+  if (lease_active()) OUT.printf(" guard=active left_s=%ld", (long)((lease_until_ms - millis()) / 1000));
+  else OUT.print(" guard=pit");
+  OUT.println();
 }
 
 static void vtx_command(String arg)
@@ -127,7 +131,7 @@ static void vtx_command(String arg)
   } else if (sub == "mhz" || sub == "ch") {
     long mhz = sub == "mhz" ? val.toInt() : (val.length() == 2 ? tramp_band_mhz(val[0], val[1] - '0') : 0);
     if (mhz < 5000 || mhz > 6100) {
-      Serial.println("ERR vtx mhz 5000..6100, or ch like R8 (bands A B E F R)");
+      OUT.println("ERR vtx mhz 5000..6100, or ch like R8 (bands A B E F R)");
       return;
     }
     vtx_reply(tramp_set_mhz((uint16_t)mhz, &st), st);
@@ -136,11 +140,11 @@ static void vtx_command(String arg)
     long mw = (sp2 < 0 ? val : val.substring(0, sp2)).toInt();
     bool force = sp2 > 0 && val.substring(sp2 + 1) == "force";
     if (mw < 1 || mw > 1000) {
-      Serial.println("ERR vtx mw 1..1000");
+      OUT.println("ERR vtx mw 1..1000");
       return;
     }
     if (mw > VTX_MW_SAFE && !force) {
-      Serial.printf("ERR vtx mw above %d needs 'force' (airflow, attenuator chain first)\n", VTX_MW_SAFE);
+      OUT.printf("ERR vtx mw above %d needs 'force' (airflow, attenuator chain first)\n", VTX_MW_SAFE);
       return;
     }
     vtx_reply(tramp_set_mw((uint16_t)mw, &st), st);
@@ -149,7 +153,7 @@ static void vtx_command(String arg)
   } else if (sub == "active") {
     long s = val.toInt();
     if (s < 0 || s > LEASE_MAX_S || (s == 0 && val != "0")) {
-      Serial.printf("ERR vtx active 0..%ld seconds\n", LEASE_MAX_S);
+      OUT.printf("ERR vtx active 0..%ld seconds\n", LEASE_MAX_S);
       return;
     }
     lease_on = s > 0;
@@ -157,16 +161,54 @@ static void vtx_command(String arg)
     next_guard_ms = millis() + GUARD_PERIOD_MS;
     vtx_reply(tramp_set_pit(!lease_on, &st), st);
   } else {
-    Serial.println("ERR vtx [mhz N | ch R8 | mw N [force] | pit on|off | active S]");
+    OUT.println("ERR vtx [mhz N | ch R8 | mw N [force] | pit on|off | active S]");
   }
+}
+
+// Video output: the 6-bit resistor ladder (colour, ladder.cpp) or the
+// built-in DAC on GPIO25 (monochrome, video.cpp). Both use I2S0, so only one
+// runs. Saved in flash; the ladder is the default since it was built.
+static bool use_ladder = true;
+
+// Nominal VTX deviation (the DSP's deviation_scale 1.0, measured
+// 2026-11-04): the ladder's swing is set by its load, the DAC's by amp.
+static int default_amp()
+{
+  return use_ladder ? 1600 : 1000;
+}
+
+static void load_output()
+{
+  Preferences p;
+  p.begin("att_ctl", true);
+  use_ladder = p.getBool("ladder", true);
+  p.end();
+  vamp_mv = default_amp();
+}
+
+static void save_output()
+{
+  Preferences p;
+  p.begin("att_ctl", false);
+  p.putBool("ladder", use_ladder);
+  p.end();
+}
+
+static void video_off()
+{
+  ladder_stop();
+  video_stop();
 }
 
 // Restarts the video with the current settings and replies for cmd.
 static void video_reply(const char *cmd)
 {
-  const char *err = video_start(vpattern, vamp_mv);
-  if (err) Serial.printf("ERR %s %s\n", cmd, err);
-  else Serial.printf("OK %s video=on pattern=%s amp_mv=%d\n", cmd, ntsc_pattern_name(vpattern), vamp_mv);
+  video_off();
+  const char *err = use_ladder ? ladder_start(vpattern, vamp_mv) : video_start(vpattern, vamp_mv);
+  if (err) OUT.printf("ERR %s %s\n", cmd, err);
+  else
+    OUT.printf("OK %s video=on out=%s pattern=%s amp_mv=%d\n", cmd, use_ladder ? "ladder" : "dac",
+               ntsc_pattern_name(vpattern), vamp_mv);
 }
 
 static void drive(int pin, bool on) {
@@ -201,10 +243,12 @@ void setup() {
     drive(PIN_MINUS, false);
   }
   Serial.begin(115200);
-  Serial.println(PIN_MINUS >= 0 ? "att_ctl ready (send 'step', then 'home' or 'at')"
+  OUT.println(PIN_MINUS >= 0 ? "att_ctl ready (send 'step', then 'home' or 'at')"
                                 : "att_ctl ready, + relay only (send 'step', set the LEDs by hand, then 'at')");
-  video_reply("video");
+  load_output();
+  video_reply("video");  // before Wi-Fi: the frame needs the big contiguous block
   tramp_begin();
+  net_begin();
 }
 
 static void handle(String line) {
@@ -218,87 +262,87 @@ static void handle(String line) {
   if (cmd == "step") {
     int u = quarters(arg);
     if (u != 1 && u != 2 && u != 4 && u != 40) {
-      Serial.println("ERR step one of 0.25 0.5 1 10");
+      OUT.println("ERR step one of 0.25 0.5 1 10");
       return;
     }
     unit = u;
-    Serial.printf("OK step db=%.2f\n", unit / 4.0f);
+    OUT.printf("OK step db=%.2f\n", unit / 4.0f);
   } else if (cmd == "home") {
     if (PIN_MINUS < 0) {
-      Serial.println("ERR home needs the - relay: set 0 dB by hand, then send at 0");
+      OUT.println("ERR home needs the - relay: set 0 dB by hand, then send at 0");
       return;
     }
     press(PIN_MINUS, (QUARTERS_MAX + unit - 1) / unit + 3);
     position = 0;
-    Serial.println("OK home db=0");
+    OUT.println("OK home db=0");
   } else if (cmd == "at") {
     int q = quarters(arg);
     if (q < 0 || q > QUARTERS_MAX) {
-      Serial.println("ERR at range 0..31.75");
+      OUT.println("ERR at range 0..31.75");
       return;
     }
     position = q;
-    Serial.printf("OK at db=%.2f\n", position / 4.0f);
+    OUT.printf("OK at db=%.2f\n", position / 4.0f);
   } else if (cmd == "set") {
     if (position < 0) {
-      Serial.println("ERR set position unknown, send home or at");
+      OUT.println("ERR set position unknown, send home or at");
       return;
     }
     int want = quarters(arg);
     if (want < 0 || want > QUARTERS_MAX) {
-      Serial.println("ERR set range 0..31.75");
+      OUT.println("ERR set range 0..31.75");
       return;
     }
     int diff = want - position;
     if (diff % unit != 0) {
-      Serial.printf("ERR set %.2f dB is not on the %.2f dB step grid from %.2f\n",
+      OUT.printf("ERR set %.2f dB is not on the %.2f dB step grid from %.2f\n",
                     want / 4.0f, unit / 4.0f, position / 4.0f);
       return;
     }
     if (diff < 0 && PIN_MINUS < 0) {
-      Serial.printf("ERR set down: no - relay, set %.2f dB by hand, then send at\n", want / 4.0f);
+      OUT.printf("ERR set down: no - relay, set %.2f dB by hand, then send at\n", want / 4.0f);
       return;
     }
     if (diff > 0) press(PIN_PLUS, diff / unit);
     if (diff < 0) press(PIN_MINUS, -diff / unit);
     position = want;
-    Serial.printf("OK set db=%.2f\n", position / 4.0f);
+    OUT.printf("OK set db=%.2f\n", position / 4.0f);
   } else if (cmd == "get") {
     const char *minus = PIN_MINUS >= 0 ? "yes" : "no";
-    if (position < 0) Serial.printf("OK get db=unknown step=%.2f minus=%s\n", unit / 4.0f, minus);
-    else Serial.printf("OK get db=%.2f step=%.2f minus=%s\n", position / 4.0f, unit / 4.0f, minus);
+    if (position < 0) OUT.printf("OK get db=unknown step=%.2f minus=%s\n", unit / 4.0f, minus);
+    else OUT.printf("OK get db=%.2f step=%.2f minus=%s\n", position / 4.0f, unit / 4.0f, minus);
   } else if (cmd == "press") {
     int n = 1;
     int sp2 = arg.indexOf(' ');
     if (sp2 > 0) n = arg.substring(sp2 + 1).toInt();
     bool plus = arg.startsWith("+");
     if (!plus && PIN_MINUS < 0) {
-      Serial.println("ERR press no - relay");
+      OUT.println("ERR press no - relay");
       return;
     }
     press(plus ? PIN_PLUS : PIN_MINUS, n);
     if (position >= 0) position = constrain(position + (plus ? n : -n) * unit, 0, QUARTERS_MAX);
-    Serial.printf("OK press %s %d\n", plus ? "+" : "-", n);
+    OUT.printf("OK press %s %d\n", plus ? "+" : "-", n);
   } else if (cmd == "timing") {
     int sp2 = arg.indexOf(' ');
     if (sp2 > 0) {
       press_ms = arg.substring(0, sp2).toInt();
       gap_ms = arg.substring(sp2 + 1).toInt();
     }
-    Serial.printf("OK timing press_ms=%d gap_ms=%d\n", press_ms, gap_ms);
+    OUT.printf("OK timing press_ms=%d gap_ms=%d\n", press_ms, gap_ms);
   } else if (cmd == "video") {
     if (arg == "on") {
       video_reply("video");
     } else if (arg == "off") {
-      video_stop();
-      Serial.println("OK video video=off");
+      video_off();
+      OUT.println("OK video video=off");
     } else {
-      Serial.println("ERR video on or off");
+      OUT.println("ERR video on or off");
     }
   } else if (cmd == "pattern") {
     int p = ntsc_pattern_from_name(arg.c_str());
     if (p < 0) {
-      Serial.println("ERR pattern one of card bars ramp check grey black white");
+      OUT.println("ERR pattern one of card bars ramp check grey black white");
       return;
     }
     vpattern = (ntsc_pattern_t)p;
@@ -306,22 +350,40 @@ static void handle(String line) {
   } else if (cmd == "amp") {
     int mv = arg.toInt();
     if (mv < VAMP_MIN || mv > VAMP_MAX) {
-      Serial.printf("ERR amp range %d..%d mV\n", VAMP_MIN, VAMP_MAX);
+      OUT.printf("ERR amp range %d..%d mV\n", VAMP_MIN, VAMP_MAX);
       return;
     }
     vamp_mv = mv;
     video_reply("amp");
   } else if (cmd == "vtx") {
     vtx_command(arg);
+  } else if (cmd == "out") {
+    if (arg != "ladder" && arg != "dac") {
+      OUT.printf("ERR out ladder or dac (now %s)\n", use_ladder ? "ladder" : "dac");
+      return;
+    }
+    use_ladder = arg == "ladder";
+    save_output();
+    vamp_mv = default_amp();
+    video_reply("out");
   } else if (cmd == "vget") {
-    bool on = video_running();
-    float hz = video_measure_line_hz(1000);
-    Serial.printf("OK vget video=%s pattern=%s amp_mv=%d rate_hz=%u line_hz=", on ? "on" : "off",
-                  ntsc_pattern_name(vpattern), vamp_mv, NTSC_SAMPLE_HZ);
-    if (hz > 0.0f) Serial.printf("%.1f\n", hz);
-    else Serial.println(on ? "unmeasured" : "0");
+    if (use_ladder) {
+      const bool on = ladder_running();
+      const float fs = ladder_sample_hz();
+      OUT.printf("OK vget video=%s out=ladder pattern=%s amp_mv=%d rate_hz=%.0f line_hz=%.1f\n", on ? "on" : "off",
+                 ntsc_pattern_name(vpattern), vamp_mv, fs, fs / 910.0f);
+    } else {
+      bool on = video_running();
+      float hz = video_measure_line_hz(1000);
+      OUT.printf("OK vget video=%s out=dac pattern=%s amp_mv=%d rate_hz=%u line_hz=", on ? "on" : "off",
+                 ntsc_pattern_name(vpattern), vamp_mv, NTSC_SAMPLE_HZ);
+      if (hz > 0.0f) OUT.printf("%.1f\n", hz);
+      else OUT.println(on ? "unmeasured" : "0");
+    }
+  } else if (net_command(cmd, arg)) {
+    // wifissid, wifipass, wifi
   } else {
-    Serial.printf("ERR %s unknown\n", cmd.c_str());
+    OUT.printf("ERR %s unknown\n", cmd.c_str());
   }
 }
 
@@ -332,11 +394,12 @@ void loop() {
     if (c == '\n' || c == '\r') {
       handle(buf);
       buf = "";
-    } else if (buf.length() < 64) {
+    } else if (buf.length() < 128) {
       buf += c;
     }
   }
+  net_poll(handle);
   // Between commands only (a check blocks up to about half a second; the
-  // UART buffers what arrives meanwhile).
-  if (buf.length() == 0 && !Serial.available()) pit_guard();
+  // UART and the TCP socket buffer what arrives meanwhile).
+  if (buf.length() == 0 && !Serial.available() && !net_line_pending()) pit_guard();
 }
