@@ -57,10 +57,31 @@ pub fn atan2(y: f32, x: f32) -> f32 {
 }
 
 
+/// `x.floor()` without a libm call. Baseline x86-64 has no `roundss`
+/// (SSE4.1), so `f32::floor` and `f32::round` become calls through the GOT,
+/// which cost the serial PLL and EKF loops most of their time. Adding and
+/// subtracting 2^23 to |x| rounds it to nearest in the FPU; the compare
+/// turns that into a floor. At |x| >= 2^23 every f32 is already whole.
+#[inline(always)]
+pub fn floor(x: f32) -> f32 {
+    const TWO23: f32 = 8_388_608.0;
+    let r = ((x.abs() + TWO23) - TWO23).copysign(x);
+    let r = r - if r > x { 1.0 } else { 0.0 };
+    if x.abs() < TWO23 { r } else { x }
+}
+
 /// Wraps an angle to [-pi, pi).
 #[inline(always)]
 pub fn wrap_pi(x: f32) -> f32 {
-    x - std::f32::consts::TAU * (x * (1.0 / std::f32::consts::TAU) + 0.5).floor()
+    x - std::f32::consts::TAU * floor(x * (1.0 / std::f32::consts::TAU) + 0.5)
+}
+
+/// [`wrap_pi`] for |x| < 3 pi (one step of 2 pi at most): a compare and an
+/// add, for serial loops whose angle is known to be close.
+#[inline(always)]
+pub fn wrap_pi_near(x: f32) -> f32 {
+    let t = std::f32::consts::TAU;
+    x + if x >= PI { -t } else if x < -PI { t } else { 0.0 }
 }
 
 /// Wraps an f64 angle to [-pi, pi).
@@ -75,7 +96,9 @@ pub fn sin_cos(x: f32) -> (f32, f32) {
     // Reduce to [-pi, pi] with a two-part 2*pi for accuracy.
     const TAU_HI: f32 = 6.283_185_5;
     const TAU_LO: f32 = -1.748_455_5e-7;
-    let k = (x * (1.0 / std::f32::consts::TAU)).round();
+    // Nearest multiple; which one at a tie does not matter (the fold
+    // below covers |r| <= pi).
+    let k = floor(x * (1.0 / std::f32::consts::TAU) + 0.5);
     let r = (x - k * TAU_HI) - k * TAU_LO;
     // Fold to [-pi/2, pi/2]: sin(pi - r) = sin r, cos(pi - r) = -cos r.
     let hi = r > FRAC_PI_2;
@@ -152,5 +175,26 @@ mod tests {
         assert!((wrap_pi(-3.5) - (-3.5 + std::f32::consts::TAU)).abs() < 1e-6);
         assert!((wrap_pi(1.0) - 1.0).abs() < 1e-7);
         assert!((wrap_pi64(7.0) - (7.0 - std::f64::consts::TAU)).abs() < 1e-12);
+        assert_eq!(wrap_pi(std::f32::consts::PI), -std::f32::consts::PI);
+        for k in -3000..=3000 {
+            let x = k as f32 * (2.99 * PI / 3000.0);
+            assert!((wrap_pi_near(x) - wrap_pi(x)).abs() < 1e-6, "x={x}");
+        }
+    }
+
+    #[test]
+    fn floor_matches_std() {
+        let mut vals = vec![0.0f32, -0.0, 0.5, -0.5, 1.0, -1.0, 2.5, -2.5, 0.999_999_94, -0.999_999_94];
+        vals.extend([4_194_303.5, -4_194_303.5, 8_388_607.5, -8_388_607.5, 8_388_608.0, 8_388_609.0, -1e9, 1e30]);
+        vals.extend([f32::INFINITY, f32::NEG_INFINITY]);
+        let mut s = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            vals.push(f32::from_bits(s) % 1e7);
+        }
+        for x in vals.into_iter().filter(|x| !x.is_nan()) {
+            assert_eq!(floor(x), x.floor(), "x={x}");
+        }
+        assert!(floor(f32::NAN).is_nan());
     }
 }

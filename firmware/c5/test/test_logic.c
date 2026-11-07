@@ -801,22 +801,39 @@ static void test_dc(void)
     CHECK(fabsf(openvrx_agc_rms_ac_steps(&acc) - 1.0f) < 1e-3f);     // +-1 step around each mean
     CHECK(openvrx_agc_rms_steps(&acc) > 2.6f);                        // the DC counted as signal
 
-    // Rows: claim from the nearest claimed row, limits around the vendor code.
+    // Rows: claim from the nearest claimed row, the code window around the
+    // vendor code.
     openvrx_dc_rows_t rows;
     openvrx_dc_rows_reset(&rows);
     int trim[2], applied[2];
     bool limited[2];
-    const int base[2] = {256, 20};
+    const int base[2] = {256, 40};
     int st[2] = {5, -3};
     openvrx_dc_rows_step(&rows, 70, base, st, applied, limited);
     CHECK(applied[0] == 5 && applied[1] == -3 && !limited[0] && !limited[1]);
     openvrx_dc_rows_claim(&rows, 74, trim);
     CHECK(trim[0] == 5 && trim[1] == -3 && rows.have[74]);
-    st[0] = 200;
+    st[0] = 300;
     st[1] = -200;
     openvrx_dc_rows_step(&rows, 70, base, st, applied, limited);
-    CHECK(rows.trim[70][0] == OPENVRX_DC_TRIM_MAX && rows.trim[70][1] == -20 && limited[0] && limited[1]);
-    CHECK(openvrx_dc_code(20, -40) == 0 && openvrx_dc_code(500, 40) == OPENVRX_DC_CODE_MAX);
+    CHECK(rows.trim[70][0] == OPENVRX_DC_CODE_MAX - 256 && rows.trim[70][1] == OPENVRX_DC_CODE_MIN - 40);
+    CHECK(applied[0] == OPENVRX_DC_CODE_MAX - 256 - 5 && limited[0] && limited[1]);
+    CHECK(openvrx_dc_code(40, -40) == OPENVRX_DC_CODE_MIN && openvrx_dc_code(480, 40) == OPENVRX_DC_CODE_MAX);
+    // A vendor code outside the window: trim 0 keeps it, a step only moves
+    // it inwards.
+    CHECK(openvrx_dc_code(5, 0) == 5 && openvrx_dc_code(5, -3) == 5 && openvrx_dc_code(510, 0) == 510);
+    {
+        openvrx_dc_rows_t r2;
+        openvrx_dc_rows_reset(&r2);
+        const int b2[2] = {5, 510};
+        int s2[2] = {-4, 4};
+        openvrx_dc_rows_step(&r2, 10, b2, s2, applied, limited);
+        CHECK(applied[0] == 0 && applied[1] == 0 && limited[0] && limited[1]);
+        s2[0] = 30;
+        s2[1] = -30;
+        openvrx_dc_rows_step(&r2, 10, b2, s2, applied, limited);
+        CHECK(applied[0] == 30 && applied[1] == -30 && !limited[0] && !limited[1]);
+    }
     openvrx_dc_rows_claim(&rows, 200, trim);
     CHECK(trim[0] == 0 && trim[1] == 0);
 
@@ -888,14 +905,25 @@ static void test_dc(void)
     worst = dc_run(&p, &s, &rows, 70, 1, 60, 10, 0.0f);
     CHECK(worst < 12.0f);
 
-    // Beyond the DAC's reach (96 codes x 3 = 288 < 450): the trim parks at
-    // its limit on the right side and stays there.
+    // A board's Q on 2026-11-05: still about +100 with the trim parked at
+    // the old -96 window. Here +400 at 3 ADC units per code needs about
+    // 133 codes: reached within the 20..500 code window.
     plant_init(&p, OPENVRX_PRESET_4X4TOP);
-    p.dc0[0] = 450; p.dc0[1] = 0; p.slope[0] = 3; p.slope[1] = 3; p.noise = 60;
+    p.dc0[0] = 10; p.dc0[1] = 400; p.slope[0] = 3; p.slope[1] = 3; p.noise = 60;
     openvrx_dc_servo_init(&s);
     openvrx_dc_rows_reset(&rows);
-    (void)dc_run(&p, &s, &rows, 70, 1, 100, 1, 0.0f);
-    CHECK(rows.trim[70][0] == -OPENVRX_DC_TRIM_MAX);
+    worst = dc_run(&p, &s, &rows, 70, 1, 100, 20, 0.0f);
+    CHECK(worst < 20.0f);
+    CHECK(rows.trim[70][1] < -96 && s.flips == 0);
+
+    // Beyond the DAC's reach (236 codes x 1 = 236 < 450): the trim parks at
+    // its limit on the right side and stays there.
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.dc0[0] = 450; p.dc0[1] = 0; p.slope[0] = 1; p.slope[1] = 1; p.noise = 60;
+    openvrx_dc_servo_init(&s);
+    openvrx_dc_rows_reset(&rows);
+    (void)dc_run(&p, &s, &rows, 70, 1, 150, 1, 0.0f);
+    CHECK(rows.trim[70][0] == OPENVRX_DC_CODE_MIN - 256);
     CHECK(s.limits > 0);
 
     // I/Q cross-coupling of 15 %, and a DC that wanders (C5VRX: 1-2 cells

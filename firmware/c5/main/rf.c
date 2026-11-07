@@ -452,7 +452,8 @@ esp_err_t rf_dc_step(uint8_t gain, const int step[2], int applied[2], bool limit
     phy_begin();
     const bool live = phy_dco_held() && gain == s_cfg.gain;
     // A row not in force: its vendor code is not known here, so only the
-    // trim window bounds it (the DAC range is applied at its next hold).
+    // code window around mid-scale bounds it (the real one applies at its
+    // next hold).
     static const int mid[2] = {OPENVRX_DC_CODE_MAX / 2, OPENVRX_DC_CODE_MAX / 2};
     openvrx_dc_rows_step(&s_dc_rows, gain, live ? s_dc_base : mid, step, applied, limited);
     esp_err_t err = ESP_OK;

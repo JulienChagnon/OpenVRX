@@ -116,7 +116,7 @@ Added fields and arguments; nothing above changes meaning.
 - DC correction: `EVT dc state=error cause=<hold|set|row> ...` when a hold or a
   trim write did not read back (the correction stays off until `dc on` or the
   next retune); `EVT dc limit gain=<g> i=<adc> q=<adc>` the first time (then
-  every 64th) a trim reaches its limit (96 codes from the vendor code), i.e.
+  every 64th) a trim reaches its limit (DAC code 20 or 500), i.e.
   a DC the DAC cannot reach; `EVT dc bank1 moved stage=<s> pin=<i/q>
   live=<i/q>` once when the vendor's bank 1 changed under a pin (C5VRX saw this
   move every row of a stage beyond the trim range; the pin is kept).

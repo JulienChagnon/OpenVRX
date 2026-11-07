@@ -252,6 +252,33 @@ fn independent_field_counters_dead_receiver_and_waiting() {
 }
 
 #[test]
+fn lone_receiver_survives_bunched_host_times() {
+    // DSP-5: a USB stall makes the stream thread reap a backlog of
+    // transfers at once, so every line of the stall carries nearly the same
+    // host time. The relock used to map the lone receiver onto a field
+    // already emitted and drop its lines as late until the stall's end.
+    let clean = clean_lines(24, 0.0, 0);
+    let t0 = clean[0].host_ns;
+    let (a, b) = (t0 + 200_000_000, t0 + 300_000_000);
+    let mut c = Combiner::new(STD, &CombinerConfig::default());
+    let mut out = Vec::new();
+    for l in &clean {
+        let mut l = l.clone();
+        if l.host_ns >= a && l.host_ns < b {
+            l.host_ns = b;
+        }
+        out.extend(c.push(l));
+    }
+    out.extend(c.flush());
+    assert!(c.stats().relocks > 0, "the stall should disturb the mapping");
+    assert_eq!(c.stats().late_lines, 0);
+    assert_eq!(out.len(), clean.len());
+    for w in out.windows(2) {
+        assert!((w[0].field_seq, w[0].field_line) < (w[1].field_seq, w[1].field_line));
+    }
+}
+
+#[test]
 fn sub_sample_alignment() {
     let clean = clean_lines(2, 0.0, 0);
     let shifted = clean_lines(2, 0.4, 1);

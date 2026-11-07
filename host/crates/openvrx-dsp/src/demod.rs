@@ -9,10 +9,10 @@
 //! phase-difference estimator has) are reported by [`Demod::extra_delay`].
 
 use crate::config::{DemodKind, EkfConfig, LsConfig, PllConfig};
-use crate::fastmath::{atan2, sin_cos, wrap_pi};
+use crate::fastmath::{atan2, wrap_pi, wrap_pi_near};
 use crate::vmath::polar;
 use openvrx_core::lanes::LaneFormat;
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 /// Signal conditions the tracking demodulators adapt to.
 #[derive(Copy, Clone, Debug)]
@@ -289,35 +289,52 @@ impl Demod {
         }
     }
 
+    /// arg z[k] into self.ar (vectorised), NaN where z = 0. The trackers'
+    /// phase detector arg(z e^-j th) is wrap(arg z - th), so the one atan2
+    /// per sample leaves the serial loop and the NCO's sin/cos goes away.
+    /// The NaN keeps the old atan2(0, 0) = 0 detector output for z = 0.
+    fn angles(&mut self, re: &[f32], im: &[f32]) {
+        let n = re.len();
+        self.ar.resize(n, 0.0);
+        crate::fastmath::atan2_slice(im, re, &mut self.ar);
+        for k in 0..n {
+            if re[k] == 0.0 && im[k] == 0.0 {
+                self.ar[k] = f32::NAN;
+            }
+        }
+    }
+
     fn pll_run(&mut self, re: &[f32], im: &[f32], out: &mut [f32]) {
+        self.angles(re, im);
         let s = &mut self.pll;
         let (kp, ki, kc) = (s.kp, s.ki, s.kc);
         let (mut th, mut om, mut al) = (s.theta, s.omega, s.alpha);
         let mut prev = s.post;
-        for k in 0..re.len() {
-            let (sn, cs) = sin_cos(th);
-            // z * exp(-j th)
-            let xr = re[k] * cs + im[k] * sn;
-            let xi = im[k] * cs - re[k] * sn;
-            let e = atan2(xi, xr);
+        for (o, &a) in out.iter_mut().zip(&self.ar) {
+            // a and th are both in [-pi, pi]: one 2 pi step at most.
+            let e = wrap_pi_near(a - th);
+            let e = if e.is_nan() { 0.0 } else { e };
             al += kc * e;
-            om += al + ki * e;
+            // The loop frequency cannot exceed pi. Bounding it here (not
+            // only per block) also bounds post + om below 3 pi (kp < 1), so
+            // th needs one 2 pi step at most.
+            om = (om + al + ki * e).clamp(-PI, PI);
             // Output: the step between successive posterior phase
             // estimates. The loop increment `om + kp e` is a one-sample
             // prediction and overshoots (2x gain at 4 MHz video).
-            let post = wrap_pi(th + kp * e);
-            out[k] = wrap_pi(post - prev);
+            let post = th + kp * e;
+            *o = wrap_pi(post - prev);
             prev = post;
-            th = wrap_pi(post + om);
+            th = wrap_pi_near(post + om);
         }
-        s.post = prev;
-        // Keep the integrators bounded (the loop frequency cannot exceed pi).
+        s.post = wrap_pi(prev);
         s.theta = th;
-        s.omega = om.clamp(-std::f32::consts::PI, std::f32::consts::PI);
+        s.omega = om;
         s.alpha = al.clamp(-1.0, 1.0);
     }
 
     fn ekf_run(&mut self, re: &[f32], im: &[f32], ch: ChannelState, out: &mut [f32]) {
+        self.angles(re, im);
         let st = &mut self.ekf;
         let c = ch.cn.max(0.05);
         let a2 = (ch.power * c / (1.0 + c)).max(1e-9);
@@ -335,9 +352,10 @@ impl Demod {
         let (mut phi, mut w, mut a) = (st.phi, st.w, st.a);
         let mut prev = st.post;
         let [mut p00, mut p01, mut p02, mut p11, mut p12, mut p22] = st.p;
-        for k in 0..re.len() {
-            // Predict.
-            phi = wrap_pi(phi + w + 0.5 * a);
+        for (o, &ang) in out.iter_mut().zip(&self.ar) {
+            // Predict (no wrap: phi is wrapped below and the innovation is
+            // wrapped anyway).
+            phi += w + 0.5 * a;
             w += a;
             let n00 = p00 + 2.0 * p01 + p02 + p11 + p12 + 0.25 * p22 + q[0];
             let n01 = p01 + p02 + p11 + 1.5 * p12 + 0.5 * p22 + q[1];
@@ -349,8 +367,8 @@ impl Demod {
             // tangential innovation Im(z e^-j phi)/A saturates beyond 90
             // degrees of prediction error, which every sync edge reaches at
             // 13.33 MS/s; the wrapped angle stays linear to +-180 degrees.
-            let (sn, cs) = sin_cos(phi);
-            let y = atan2(im[k] * cs - re[k] * sn, re[k] * cs + im[k] * sn);
+            let y = wrap_pi(ang - phi);
+            let y = if y.is_nan() { 0.0 } else { y };
             let s = n00 + r;
             let is = 1.0 / s;
             let (k0, k1, k2) = (n00 * is, n01 * is, n02 * is);
@@ -368,7 +386,7 @@ impl Demod {
             // is the derivative at the sample, half a sample ahead of the
             // other discriminators, and extrapolates).
             phi = wrap_pi(phi);
-            out[k] = wrap_pi(phi - prev);
+            *o = wrap_pi(phi - prev);
             prev = phi;
         }
         st.phi = wrap_pi(phi);
@@ -432,6 +450,27 @@ mod tests {
         for k in 10..4000 {
             let expect = (0.75 * fr[k - 2] + fr[k - 1] + 0.75 * fr[k]) / 2.5;
             assert!((out[k] as f64 - expect).abs() < 1e-3, "k={k}");
+        }
+    }
+
+    #[test]
+    fn pll_gain_kp_below_one() {
+        // pll_run's single-step wrap of th needs |post + om| < 3 pi, which
+        // holds for 0 < kp < 1 with om bounded by pi.
+        for order in [2u8, 3] {
+            for hz in [1e3f32, 1e5, 1e6, 6e6, 2e7, 1e9] {
+                for damping in [0.0f32, 0.3, 0.8, 0.999, 2.0] {
+                    let d = Demod::new(
+                        DemodKind::Pll,
+                        13.333e6,
+                        None,
+                        &LsConfig::default(),
+                        &PllConfig { order, natural_hz: hz, damping },
+                        &EkfConfig::default(),
+                    );
+                    assert!(d.pll.kp > 0.0 && d.pll.kp < 1.0, "order {order} {hz} Hz damping {damping}: kp {}", d.pll.kp);
+                }
+            }
         }
     }
 

@@ -278,13 +278,24 @@ impl Combiner {
             st.mismatches = 0;
         }
         // Establish a mapping: find a known field with this parity and a
-        // matching start time.
+        // matching start time. A receiver alone has nothing to align with:
+        // a field already emitted would only drop its lines as late (host
+        // times bunch up when the USB thread reaps a backlog of transfers
+        // at once, DSP-5), so it continues the sequence instead.
+        let alone = !self.rx.iter().any(|(&k, s)| {
+            k != rec.rx && s.offset.is_some() && s.last_line >= self.newest_line - self.cfg.stale_lines as i64
+        });
+        let emitted = self.last_emitted.map(|(f, _)| f);
         let found = self
             .fields
             .iter()
             .rev()
             .take(16)
-            .find(|(_, fr)| fr.parity == rec.parity && (fr.start_ns - start).abs() < tol)
+            .find(|(&c, fr)| {
+                fr.parity == rec.parity
+                    && (fr.start_ns - start).abs() < tol
+                    && !(alone && emitted.is_some_and(|e| c <= e))
+            })
             .map(|(&c, _)| c);
         let c = match found {
             Some(c) => c,

@@ -39,7 +39,12 @@ void openvrx_dc_rows_claim(openvrx_dc_rows_t *rows, unsigned row, int trim[2])
     trim[1] = rows->trim[row][1];
 }
 
-int openvrx_dc_code(int base, int trim) { return clampi(base + trim, 0, OPENVRX_DC_CODE_MAX); }
+// Code window around a vendor code: OPENVRX_DC_CODE_MIN..MAX, widened to
+// include the vendor code itself.
+static int code_lo(int base) { return base < OPENVRX_DC_CODE_MIN ? base : OPENVRX_DC_CODE_MIN; }
+static int code_hi(int base) { return base > OPENVRX_DC_CODE_MAX ? base : OPENVRX_DC_CODE_MAX; }
+
+int openvrx_dc_code(int base, int trim) { return clampi(base + trim, code_lo(base), code_hi(base)); }
 
 void openvrx_dc_rows_step(openvrx_dc_rows_t *rows, unsigned row, const int base[2], const int step[2], int applied[2],
                           bool limited[2])
@@ -50,10 +55,7 @@ void openvrx_dc_rows_step(openvrx_dc_rows_t *rows, unsigned row, const int base[
         applied[a] = 0;
         limited[a] = false;
         if (row >= OPENVRX_DC_ROWS) continue;
-        // Trim window and DAC range, both around the vendor code.
-        const int lo = clampi(-OPENVRX_DC_TRIM_MAX, -base[a], OPENVRX_DC_CODE_MAX - base[a]);
-        const int hi = clampi(OPENVRX_DC_TRIM_MAX, -base[a], OPENVRX_DC_CODE_MAX - base[a]);
-        const int next = clampi(trim[a] + step[a], lo, hi);
+        const int next = clampi(trim[a] + step[a], code_lo(base[a]) - base[a], code_hi(base[a]) - base[a]);
         applied[a] = next - trim[a];
         limited[a] = applied[a] != step[a];
         rows->trim[row][a] = (int16_t)next;

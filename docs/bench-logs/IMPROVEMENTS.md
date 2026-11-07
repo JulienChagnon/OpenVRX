@@ -70,6 +70,11 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   `i_dc=8 q_dc=109 dco=231/163 trim=-15/-96`: I centred, Q still far off with its trim at -96 (it was
   -28 to -30 with q_dc about +22 on Nov 4). Either still converging, near the trim limit, or the
   one-axis runaway below. Poll `status` for a minute next session before trusting a sweep.
+- 2026-11-06: trim window widened from +-96 codes to DAC codes 20..500 (logic/openvrx_dc.h
+  OPENVRX_DC_CODE_MIN/MAX, after libphy's phy_pbus_rx_dco_cal; a vendor code outside widens the
+  window to itself). Host test: Q +400 at 3 ADC units per code now converges (trim about -133).
+  Not yet flashed. If Q still parks at a limit or barely moves over 100+ codes, the Q DAC has
+  lost authority (or the I/Q labels are swapped) and range was not the cause.
 - Watch for on hardware: IQ dead or railing right after a hold (the owned-word set; C5VRX saw it
   when all eleven PBUS blocks were copied), `EVT phy cause=dco` repeating, `EVT dc limit`, and a
   trim that runs away on one axis (would mean the I/Q DAC labels are swapped).
@@ -224,6 +229,12 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   carries the total and the OSD shows "video rows lost: pipeline reset (Nx)" for 10 s after one.
   `vrx` keeps stderr in ~/.local/state/openvrx/vrx-*.log (last 20). Test:
   `health_ignores_range_edge_and_catches_persistent_loss`.
+- 2026-11-06: one combiner wedge found and fixed. A USB stall makes the stream thread reap a
+  backlog at once, so the stall's lines share one host time; the relock then mapped the lone
+  receiver onto a field already emitted and dropped every line as late until the stall's end
+  (100 ms stall: 1050 late lines, 300 ms: 4200). A lone receiver now never maps onto an emitted
+  field. Test `lone_receiver_survives_bunched_host_times`. Does not explain the 2026-11-05 face
+  (lines missing before the combiner).
 - Next time it happens: the OSD message and the log show whether the rebuild fixed it. If the bars
   survive a rebuild the state is upstream (DSP per receiver); if no loss is counted at all while
   bars show, rows are written black (repair/deinterlace or the display), not dropped.
@@ -244,7 +255,12 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   lines stay at 0 through VTX restarts and no bars appear.
 
 ### DSP-6: PLL and EKF demods are 3x too slow for live and show no threshold gain
-- Status: open
+- Status: speed fixed 2026-11-06 (threshold gain still open)
+- 2026-11-06: the trackers' detector arg(z e^-j th) is now computed as wrap(arg z - th), with arg z
+  vectorised ahead of the serial loop (no per-sample sin/cos or atan2 in it), and fastmath
+  `wrap_pi`/`sin_cos` no longer call libm floorf/roundf (baseline x86-64 has no roundss). Output
+  equal to the old code within 1e-6 rad. Isolated demod at 26.67 MS/s: PLL 73 to 15 ns/sample,
+  EKF 72 to 26; bench.rs demod stage at 13.33 MS/s 7x7: PLL 76 to 16, EKF 75 to 28.
 - Evidence ([2026-11-04-demod-compare.md](2026-11-04-demod-compare.md)): demod stage 92 ns (PLL) and
   96 ns (EKF) per sample against 2.2 ns for polar; whole DSP about 120 ns per sample, load 2.9 on one
   core at 26.67 MS/s (the budget is 37.5 ns). On the colour ladder PLL tracks polar to step 13 then

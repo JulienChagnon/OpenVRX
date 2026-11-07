@@ -46,10 +46,15 @@ extern "C" {
 
 // Gain rows (>= ARC_VENDOR_GAIN_MAX + 1).
 #define OPENVRX_DC_ROWS 96u
-// DAC code range and how far a trim may move from the vendor code (C5VRX
-// DCO_RANGE: board trims of the edge rows were 13 to 48 codes).
-#define OPENVRX_DC_CODE_MAX 511
-#define OPENVRX_DC_TRIM_MAX 96
+// DAC code window a trim may move the vendor code within. The PBUS DC DAC
+// is 9 bits; libphy's own DC calibration (phy_pbus_rx_dco_cal, pinned
+// libphy disassembly) keeps its codes within 20..500, so the servo does
+// too. A vendor code outside the window widens it to that code (trim 0 is
+// always allowed). The earlier +-96 trim window (after C5VRX DCO_RANGE,
+// board trims of 13 to 48 codes) parked the Q trim of a board at -96 with
+// q_dc still about +100 (2026-11-05).
+#define OPENVRX_DC_CODE_MIN 20
+#define OPENVRX_DC_CODE_MAX 500
 // Sign share beyond which the cloud is on one side of zero.
 #define OPENVRX_DC_SAT_SHARE 0.03f
 // Linear zone: hold while |mean| is under the largest of this many ADC
@@ -105,11 +110,11 @@ void openvrx_dc_rows_reset(openvrx_dc_rows_t *rows);
 // claimed row (the DC shift after a channel setup is common to the rows;
 // C5VRX board 2026-10-19), or 0, and is claimed.
 void openvrx_dc_rows_claim(openvrx_dc_rows_t *rows, unsigned row, int trim[2]);
-// The DAC code for a vendor base code and a trim, within 0..511.
+// The DAC code for a vendor base code and a trim, within the code window.
 int openvrx_dc_code(int base, int trim);
-// Adds step to a row's trim, within +-OPENVRX_DC_TRIM_MAX and the DAC range
-// around base. applied: the change made; limited: an axis whose request
-// was cut short. The row is claimed first.
+// Adds step to a row's trim, keeping the code within the window around
+// base. applied: the change made; limited: an axis whose request was cut
+// short. The row is claimed first.
 void openvrx_dc_rows_step(openvrx_dc_rows_t *rows, unsigned row, const int base[2], const int step[2], int applied[2],
                           bool limited[2]);
 
