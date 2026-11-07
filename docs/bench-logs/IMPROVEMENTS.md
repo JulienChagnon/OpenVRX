@@ -302,9 +302,22 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   colours constrained to pass unchanged (the free fit desaturated colour, MSE shrinkage). Shipped as
   `host/apps/openvrx-cli/filters/denoise-4x4top.json`; `openvrx-cli render REC OUT.mp4` decodes
   (raw preset, as the training) and writes x264 through ffmpeg, about 13 frames/s on the laptop.
-- Next: a ground-truth flight (camera CVBS recorded on the quad) to score it for real; more scenes
-  and C/N values in training; a neural network trained on the same simulated pairs (needs a GPU);
-  mask-aware repair of the torn lines (openvrx-restore already rebuilds flagged pixels).
+- Next: ground-truth bench pairs (camera CVBS on the MS2107 next to an FX2 recording, BENCH.md
+  "Ground truth") to score it for real; more scenes and C/N values in training; mask-aware repair of
+  the torn lines (openvrx-restore already rebuilds flagged pixels).
+- Plan for a first neural model, budget 3 to 10 USD of rented GPU (one RTX 4090 class card on a
+  community cloud, roughly 0.3 to 0.7 USD an hour at the time of writing):
+  - Model: a small residual CNN (about 8 conv layers, 32 to 64 channels, 0.1 to 0.3 M parameters)
+    over the same 3 frames x Y/Cb/Cr as the linear filter, predicting a correction to the middle
+    frame. Small enough to run on the laptop CPU after a flight (order of a second per frame;
+    slower than `render` today, fine for a final video).
+  - Data: the simulated pairs `denoise_filter.py simulate` already makes, plus the bench pairs once
+    they exist; 128x128 crops, flat colour kept as a constraint or a loss term (the linear fit's
+    desaturation).
+  - Spend: write and debug the training script on CPU with a few hundred crops first, so rented
+    time goes only to real runs; then about 1 to 2 hours per run on the GPU, 5 or so runs.
+  - Pass mark: beats the linear filter on the unseen simulated scene and on the bench ground truth
+    by at least 1 dB, with no colour shift on flat areas; otherwise the linear filter stays.
 
 ### DSP-6: PLL and EKF demods are 3x too slow for live and show no threshold gain
 - Status: speed fixed 2026-11-06 (threshold gain still open)

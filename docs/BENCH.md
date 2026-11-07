@@ -270,6 +270,61 @@ replays one frame, so relay presses never disturb it.
   `tools/bench/att_ctl/test/ntsc_frame_test.c` checks the frame on the PC
   (build line in the file).
 
+## Ground truth: the camera's CVBS on an MS2107 (planned, not yet run)
+
+The P25 pattern has no colour and little detail, and the strongest sweep
+step still carries receiver noise. The camera's own analog signal, taken
+off its video wire before the VTX, is the picture the receiver should
+reproduce: the first real reference for the post-flight denoise
+(IMPROVEMENTS.md DSP-7) and its training data.
+
+Wiring: in parallel with the VTX input, nothing cut. The MS2107's yellow
+RCA input takes the video on its centre pin and ground on its outer ring;
+an RCA female to bare-wire pigtail (or a cut RCA cable: core is video,
+braid is ground) is enough.
+
+```
+camera video out --+--> VTX video in   (as now)
+                   +--> RCA centre pin
+camera/VTX GND ------> RCA outer ring   (ground pad next to the video pad)
+```
+
+- Video and ground only, short wires kept together. Battery off while
+  soldering; never the VBAT or 5 V pads.
+- The card terminates the line (75 ohm), which can lower the level at the
+  VTX: the sent picture may be darker or lower in contrast with the card
+  on. Pair recordings made with the card connected only with each other;
+  do not judge flight settings from them. A small video buffer or
+  splitter fixes it if it matters.
+- Rolling dark bars on the capture only: a ground loop between the PC's
+  USB and the quad's supply. Power the quad from a supply not grounded
+  through the same PC, or shorten the ground lead.
+
+Capture on the Fedora host (`sudo dnf install ffmpeg-free v4l-utils`). The
+card is a plain UVC device:
+
+```
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/video0 --list-formats-ext
+ffmpeg -f v4l2 -input_format yuyv422 -video_size 720x480 -i /dev/video0 -c:v ffv1 truth.mkv
+```
+
+- Pick an uncompressed format (YUYV) over MJPEG, or the ground truth
+  carries its own compression blocks; `ffv1` stores it losslessly. Note
+  the frame rate it offers (30 or 60) and whether it deinterlaces.
+- Record the radio side at the same time, from a second terminal:
+  `openvrx-cli record bench-runs/truth-<time> --lanes 4x4top --clk 9
+  --mhz 5880 --seconds 60`.
+- The two start at different moments. Wave a hand or a bright card in front
+  of the lens right after both are running, and again before stopping:
+  the alignment uses those motion events. Then a scene with detail and
+  colour, some slow pans by hand, and a stretch of flat colour (a wall, a
+  sheet of card): the flat areas are where the speckle shows.
+- Repeat at a few attenuator steps (strong, typical, near threshold) so
+  the pairs cover the C/N range of a flight. Keep the folder of each run
+  (both files plus the step) under `D:\FPV\OPENVRX\bench\` or the Fedora
+  equivalent; like every recording it stays local.
+
 ## Bench host on Fedora
 
 The laptop has one working USB port, so the automated bench runs on a
