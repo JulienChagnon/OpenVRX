@@ -11,3 +11,5 @@ openvrx-dsp = { path = "../../crates/openvrx-dsp" }
 openvrx-video = { path = "../../crates/openvrx-video" }
 openvrx-hw = { path = "../../crates/openvrx-hw" }
 image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1.10"
+serde_json = "1"

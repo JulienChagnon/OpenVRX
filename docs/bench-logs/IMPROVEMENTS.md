@@ -277,6 +277,35 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
 - Verify: reproduce with the replay or on the bench (VTX power cycles, USB gaps); after a fix, late
   lines stay at 0 through VTX restarts and no bars appear.
 
+### DSP-7: post-flight picture: speckle on flat areas, learned denoise filter
+- Status: implemented 2026-11-07 (`openvrx-cli render`); checked on simulated scenes and by eye on
+  the 2026-11-06 flight, not yet on a ground-truth capture
+- Evidence (2026-11-06 indoor flight, 022457): per-line SNR at the C5 (Rician moments over one line,
+  4-bit samples) median 11 to 18 dB, 5 to 25 % of lines under 5 dB in the indoor fades, and never
+  above about 21 dB (the 4x4top quantisation floor). Clipping at most 3 %, I/Q DC centred (C5-1
+  works). The `timeline` C/N column bottoms out at -10 dB there and is not usable for this. The
+  visible fault in the typical stretch is FM noise, which rises with frequency and lands in the
+  chroma band: coloured blotches on flat areas, plus fine luma grain. Tears only in the fades.
+- Simulator bench (`tools/denoise/denoise_filter.py`, clips of real flight footage, 4x4top clk 9,
+  deviation 0.69, p11, clean sampling, no DC offset): luma PSNR of the raw decode falls about 1 dB
+  per dB of C/N from 20 down to 9 dB, no sharp threshold. 8-bit lanes gain about 2 dB at 16 dB.
+  The reference must be the mean of several 20 dB runs: a near-noiseless 4-bit run draws rainbow
+  stripes (quantisation without noise to dither it), the same stripes as the Oct 31 clipped
+  capture. The simulator's 8x8 preset decodes with heavy rainbow artefacts even at 60 dB with clean
+  sampling: not looked into (simulator or decoder).
+- Results on a scene the filter was not trained on (RGB PSNR, raw decode -> filtered): 9 dB C/N
+  17.9 -> 24.0, 12 dB 18.8 -> 24.9, 16 dB 22.0 -> 26.5, 20 dB 24.5 -> 27.3. Classical denoise
+  (ffmpeg atadenoise, the best of hqdn3d, nlmeans, atadenoise) at 16 dB: 22.2 -> 25.2, mostly
+  chroma; the `quality` preset is no better than raw by PSNR. On the real flight by eye: the
+  blotches go, edges stay, some luma grain is left.
+- Built: a linear filter, 5x5 pixels x 3 frames over Y/Cb/Cr, fitted by least squares with flat
+  colours constrained to pass unchanged (the free fit desaturated colour, MSE shrinkage). Shipped as
+  `host/apps/openvrx-cli/filters/denoise-4x4top.json`; `openvrx-cli render REC OUT.mp4` decodes
+  (raw preset, as the training) and writes x264 through ffmpeg, about 13 frames/s on the laptop.
+- Next: a ground-truth flight (camera CVBS recorded on the quad) to score it for real; more scenes
+  and C/N values in training; a neural network trained on the same simulated pairs (needs a GPU);
+  mask-aware repair of the torn lines (openvrx-restore already rebuilds flagged pixels).
+
 ### DSP-6: PLL and EKF demods are 3x too slow for live and show no threshold gain
 - Status: speed fixed 2026-11-06 (threshold gain still open)
 - 2026-11-06: the trackers' detector arg(z e^-j th) is now computed as wrap(arg z - th), with arg z

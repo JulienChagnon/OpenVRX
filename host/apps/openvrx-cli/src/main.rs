@@ -22,9 +22,18 @@
 //! openvrx-cli timeline REC [--window S] [--demod polar|lut|ls|pll|ekf]
 //!                                             the whole recording in S-second rows (default 0.5):
 //!                                             lock, C/N, clipping, relocks, damaged share, USB gaps
+//! openvrx-cli render  REC OUT.mp4 [--filter FILE | --no-filter] [--start S] [--seconds N]
+//!                     [--crf Q] [--x264-preset P]
+//!                                             post-flight video: the raw decode through the learned
+//!                                             denoise filter (default: the built-in 4x4top filter,
+//!                                             tools/denoise), one frame per field, x264 via ffmpeg
+//!                                             (on PATH); defaults crf 16, preset medium
 //! ```
 //! REC is any file of a recording (`NAME.openvrx.json`, `NAME.rx0.bin`) or its base path.
 
+mod denoise;
+
+use denoise::{DenoiseFilter, Planes};
 use openvrx_core::{Frame, LanePreset, LineRecord};
 use openvrx_dsp::{RxDsp, RxDspConfig, RxStats};
 use openvrx_format::{ReceiverInfo, Recording, RecordingSource, RecordingWriter, Sidecar, WriterOptions};
@@ -44,7 +53,7 @@ fn main() {
     let (cmd, rec) = match (args.first(), args.get(1)) {
         (Some(c), Some(r)) => (c.as_str(), r.as_str()),
         _ => {
-            eprintln!("usage: openvrx-cli inspect|decode|record|score ... (see the source header)");
+            eprintln!("usage: openvrx-cli inspect|decode|record|score|timeline|render ... (see the source header)");
             std::process::exit(2);
         }
     };
@@ -67,6 +76,7 @@ fn main() {
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
         "timeline" => timeline(rec, &args[2..]),
+        "render" => render(rec, &args[2..]),
         _ => Err(format!("unknown command {cmd}")),
     };
     if let Err(e) = result {
@@ -261,6 +271,112 @@ fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(),
         Ok(saved < frames)
     })?;
     println!("{total_lines} lines from the DSP; stats: {stats:?}");
+    Ok(())
+}
+
+/// Post-flight video: every frame of the raw decode (as `decode` saves
+/// them, which is what the filter was trained on) through the denoise
+/// filter and into ffmpeg/x264. The first and last frames of the range
+/// lack temporal context and are written unfiltered.
+fn render(path: &str, args: &[String]) -> Result<(), String> {
+    let out = args.first().filter(|a| !a.starts_with("--")).ok_or("render: REC OUT.mp4")?;
+    let filter = if args.iter().any(|a| a == "--no-filter") {
+        None
+    } else {
+        let text = match opt(args, "--filter") {
+            Some(f) => std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?,
+            None => denoise::DEFAULT_FILTER.to_string(),
+        };
+        Some(DenoiseFilter::from_json(&text)?)
+    };
+    let start: f64 = opt_num(args, "--start", 0.0)?;
+    let seconds: f64 = opt_num(args, "--seconds", f64::INFINITY)?;
+    let crf: u32 = opt_num(args, "--crf", 16)?;
+    let x264_preset = opt(args, "--x264-preset").unwrap_or("medium");
+    let rec = Recording::open(path).map_err(|e| e.to_string())?;
+    let time = filter.as_ref().map_or(0, |f| f.time());
+
+    let mut ffmpeg: Option<(std::process::Child, std::process::ChildStdin)> = None;
+    let mut hist: std::collections::VecDeque<Planes> = std::collections::VecDeque::new();
+    let mut index = 0usize;
+    let written = std::cell::Cell::new(0usize);
+    let (mut first, mut last) = (usize::MAX, usize::MAX);
+    let t0 = Instant::now();
+    let write = |ff: &mut Option<(std::process::Child, std::process::ChildStdin)>, p: &Planes| -> Result<(), String> {
+        use std::io::Write;
+        let (_, stdin) = ff.as_mut().ok_or("ffmpeg not started")?;
+        stdin.write_all(&p.to_rgb8()).map_err(|e| format!("ffmpeg: {e}"))?;
+        written.set(written.get() + 1);
+        Ok(())
+    };
+    let (_, stats) = walk_frames(&rec, false, openvrx_dsp::DemodKind::Polar, "raw", |f| {
+        let hz = f.meta.standard.map_or(60_000.0 / 1001.0, |s| s.params().field_hz);
+        if first == usize::MAX {
+            first = (start * hz).round() as usize;
+            last = if seconds.is_finite() { first + (seconds * hz).round() as usize } else { usize::MAX };
+        }
+        index += 1;
+        if index - 1 < first {
+            return Ok(true);
+        }
+        if index - 1 >= last {
+            return Ok(false);
+        }
+        if ffmpeg.is_none() {
+            let mut child = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s"])
+                .arg(format!("{}x{}", f.width, f.height))
+                .args(["-r", &format!("{hz:.6}"), "-i", "-", "-c:v", "libx264", "-preset", x264_preset, "-crf"])
+                .arg(crf.to_string())
+                .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+                .arg(out)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("cannot start ffmpeg (is it on PATH?): {e}"))?;
+            let stdin = child.stdin.take().ok_or("ffmpeg stdin")?;
+            ffmpeg = Some((child, stdin));
+        }
+        hist.push_back(Planes::from_rgba8(f.width, f.height, &f.to_rgba8()));
+        match &filter {
+            None => write(&mut ffmpeg, &hist.pop_front().expect("frame"))?,
+            Some(flt) => {
+                if hist.len() <= time {
+                    write(&mut ffmpeg, &hist[hist.len() - 1])?;
+                } else if hist.len() == 2 * time + 1 {
+                    let window: Vec<&Planes> = hist.iter().collect();
+                    write(&mut ffmpeg, &flt.apply(&window))?;
+                    hist.pop_front();
+                }
+            }
+        }
+        let n = written.get();
+        if n > 0 && n % 600 == 0 {
+            eprintln!("{n} frames ({:.0} s of video) in {:.0} s", n as f64 / hz, t0.elapsed().as_secs_f64());
+        }
+        Ok(true)
+    })?;
+    // The last frames of the range have no later context.
+    if filter.is_some() {
+        for p in hist.iter().skip(time) {
+            write(&mut ffmpeg, p)?;
+        }
+    }
+    let Some((mut child, stdin)) = ffmpeg else {
+        return Err("no frames decoded in that range".into());
+    };
+    drop(stdin);
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed: {status}"));
+    }
+    println!(
+        "{} frames -> {out} ({}, {:.0} s); dsp lock {:?}, C/N {:.1} dB",
+        written.get(),
+        if filter.is_some() { "denoise filter" } else { "no filter" },
+        t0.elapsed().as_secs_f64(),
+        stats.lock,
+        stats.cn_db
+    );
     Ok(())
 }
 

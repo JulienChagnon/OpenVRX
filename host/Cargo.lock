@@ -2597,6 +2597,8 @@ dependencies = [
  "openvrx-format",
  "openvrx-hw",
  "openvrx-video",
+ "rayon",
+ "serde_json",
 ]
 
 [[package]]
