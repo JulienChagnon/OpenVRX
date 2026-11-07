@@ -297,7 +297,8 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   17.9 -> 24.0, 12 dB 18.8 -> 24.9, 16 dB 22.0 -> 26.5, 20 dB 24.5 -> 27.3. Classical denoise
   (ffmpeg atadenoise, the best of hqdn3d, nlmeans, atadenoise) at 16 dB: 22.2 -> 25.2, mostly
   chroma; the `quality` preset is no better than raw by PSNR. On the real flight by eye: the
-  blotches go, edges stay, some luma grain is left.
+  blotches go, edges stay, some luma grain is left
+  ([2026-11-06 flight, raw decode left, filtered right](../images/denoise-flight-compare.png)).
 - Built: a linear filter, 5x5 pixels x 3 frames over Y/Cb/Cr, fitted by least squares with flat
   colours constrained to pass unchanged (the free fit desaturated colour, MSE shrinkage). Shipped as
   `host/apps/openvrx-cli/filters/denoise-4x4top.json`; `openvrx-cli render REC OUT.mp4` decodes
