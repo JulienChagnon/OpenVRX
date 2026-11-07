@@ -36,13 +36,17 @@ use openvrx_hw::receiver::{auto_pair, LivePairIo, Receiver, ReceiverConfig, Rece
 use openvrx_video::{CombineMode, DeinterlaceMethod, VideoConfig, VideoPipeline};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver as MpscReceiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use crossbeam_channel::{RecvTimeoutError, TrySendError};
+use std::sync::mpsc::{self, Receiver as MpscReceiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Lines buffered between the DSP and a view's video thread.
 const LINE_QUEUE: usize = 2048;
+/// Queued lines beyond which the video thread drops its backlog and
+/// restarts at the next field (about 65 ms behind, see `video_loop`).
+const LINE_BACKLOG: usize = LINE_QUEUE / 2;
 /// Raw blocks buffered toward the recorder.
 const REC_QUEUE: usize = 1024;
 /// Minimum agreement for pairing a C5 with an FX2 by self-test pattern.
@@ -208,7 +212,7 @@ enum DspCmd {
 }
 
 /// Where a receiver's lines go: (view, sender, receivers of the view).
-type Routes = Mutex<Vec<(usize, SyncSender<LineRecord>, Vec<RxId>)>>;
+type Routes = Mutex<Vec<(usize, crossbeam_channel::Sender<LineRecord>, Vec<RxId>)>>;
 
 /// Recorder input shared by all DSP threads.
 #[derive(Default)]
@@ -284,8 +288,8 @@ fn dsp_loop(mut c: DspCtx, cfg: RxDspConfig) {
         }
         let block = match c.blocks.recv_timeout(Duration::from_millis(100)) {
             Ok(b) => b,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
         if let Some(expected) = next_byte {
             if block.first_byte > expected {
@@ -479,7 +483,7 @@ impl HealthCheck {
 }
 
 fn video_loop(
-    lines: MpscReceiver<LineRecord>,
+    lines: crossbeam_channel::Receiver<LineRecord>,
     settings: Arc<Mutex<VideoSettings>>,
     mut producer: FrameProducer,
     stop: Arc<AtomicBool>,
@@ -488,7 +492,32 @@ fn video_loop(
     let mut current = settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut pipe: Option<(VideoStandard, VideoPipeline)> = None;
     let mut check = HealthCheck::new();
+    let (mut catchups, mut catchup_logged_ns) = (0u64, 0u64);
     while !stop.load(Ordering::Relaxed) {
+        // Fields short of lines cost this thread about twice a full one
+        // (colour and repair still run over the lost lines), so once it
+        // falls behind it stays behind with the queue full and most rows
+        // missing (black bars of 2026-11-06, laptop on battery, weak
+        // signal; the recording replays clean). Dropping the backlog and
+        // restarting at the next field gets back to full fields.
+        if lines.len() > LINE_BACKLOG {
+            let dropped = lines.try_iter().take(LINE_QUEUE).count() as u64;
+            health.lost_lines.fetch_add(dropped, Ordering::Relaxed);
+            health.rebuilds.fetch_add(1, Ordering::Relaxed);
+            health.last_rebuild_ns.store(now_ns(), Ordering::Relaxed);
+            catchups += 1;
+            let now = now_ns();
+            if now.saturating_sub(catchup_logged_ns) > 10_000_000_000 {
+                eprintln!(
+                    "openvrx: video thread behind, dropped {dropped} queued lines and restarted the pipeline \
+                     ({catchups} times so far); stages {:.2} ms per field",
+                    pipe.as_ref().map_or(0.0, |(_, p)| p.stats().average.total_ns() as f64 * 1e-6)
+                );
+                catchup_logged_ns = now;
+            }
+            pipe = None;
+            continue;
+        }
         let line = match lines.recv_timeout(Duration::from_millis(100)) {
             Ok(l) => l,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -996,7 +1025,7 @@ fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSour
         lock: LockState::Searching,
         ..SourceStatus::default()
     }));
-    let (tx, rx) = mpsc::sync_channel(LINE_QUEUE);
+    let (tx, rx) = crossbeam_channel::bounded(LINE_QUEUE);
     let stop = Arc::new(AtomicBool::new(false));
     let health = Arc::new(VideoHealth::default());
     let thread = {

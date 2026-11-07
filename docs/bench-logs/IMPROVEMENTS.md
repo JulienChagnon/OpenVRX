@@ -203,7 +203,30 @@ From bench sessions (see [README.md](README.md) for the format). Newest first wi
   like the crash flight's.
 
 ### DSP-5: black bars on some rows in the live app until it is restarted
-- Status: implemented (not verified): detection, self-heal and logging; root cause still unknown
+- Status: cause found 2026-11-06 (video thread overload that holds itself); catch-up built, not verified
+- 2026-11-06 (Windows laptop on battery, Balanced power plan, flight then hovering close by, FX2
+  only, 4x4top clk 9): the bars came back and stayed until the app closed. stderr had
+  `rx0 ~70000 lines dropped in 5 s (video queue full); dsp ... load 0.70 lock Locked` every 5 s and
+  a rebuild every 5 s that did not help (after each, about 27 lines per field reached the
+  combiner). Stage time had risen from 6.7 to 11 to 23 ms per field before (budget 16.7). The
+  recording taken while the bars showed (022948) replays clean through `decode --live`: 9 missing
+  lines in 9 s. The flight before it (022457) was weak most of the time (C/N -10 to 5 dB, 35 to 70 %
+  damaged).
+- Cause: a field short of lines costs the video thread about twice a full one, because colour and
+  repair still run over the lost lines (NTSC low_latency, synthetic: 8 ms per field with every
+  line, 17 to 20 ms with 50 to 90 % of lines missing; colour 3.0 to 6.4..8.5 ms, repair 0.3 to
+  6.4 ms). So once the thread falls behind (weak signal means more repair, a laptop on battery
+  runs slower), the queue stays full, most lines are dropped, and the starved fields keep it
+  behind. A rebuild restarts into the same full queue. Finishing starved fields on the worker
+  threads did not help (A/B, within noise). Fits the 2026-11-05 face too (11 lines per field from
+  the first field; `decode --live` needed 2.2 s CPU for 2 s there).
+- Built: the line queue is a crossbeam channel; when more than half of it (1024 lines, about 65 ms)
+  is queued the video thread drops the backlog, restarts the pipeline at the next field and logs
+  `video thread behind, dropped N queued lines` (at most every 10 s, with the stage time). The OSD
+  shows it as a pipeline reset. A short freeze instead of bars that stay.
+- Verify: same conditions; bars should clear within a field or two, and the log says how often it
+  caught up. If it catches up often, the stage cost itself is over budget on that machine (power
+  plan, preset); making lost lines cheap in colour and repair is the next step.
 - 2026-11-05 ([pit-ladder-battery](2026-11-05-pit-ladder-battery.md), `bench.py --live`): a different
   face of it, from the first field: only about 11 lines per field reached the video pipeline
   (combiner `lines_in` 643 per 60 fields, 230 to 250 of 262 missing), every 5 s a rebuild that did
