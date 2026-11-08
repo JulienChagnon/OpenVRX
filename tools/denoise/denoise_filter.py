@@ -12,6 +12,7 @@ undithered quantisation draws rainbow stripes).
 
     denoise_filter.py simulate --clip VIDEO --scene NAME --data DIR
                                [--cn 9,12,16,20] [--ref-runs 8] [--seed 41] [--jobs 4]
+                               [--damage] [--keep-ref] [--steady-osd]
     denoise_filter.py train    --data DIR --scenes A,B --out FILTER.json
     denoise_filter.py eval     --data DIR --scene NAME --filter FILTER.json [--out EVAL.json]
     denoise_filter.py apply    --filter FILTER.json --frames DIR --out DIR
@@ -30,6 +31,7 @@ host/target/release (or --bin DIR). Needs numpy and Pillow.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -38,14 +40,25 @@ import numpy as np
 from PIL import Image
 
 RADIUS = 2  # spatial radius (5x5)
-TIME = 1  # temporal radius (3 frames)
+TIME = 1  # temporal radius (3 frames) of the symmetric filter; also the frames scoring skips
+# Frames the filter reads, relative to the one it outputs: the post-flight
+# filter looks one frame ahead; a live filter must not (it would add a frame
+# of latency), so `train --offsets -2,-1,0` fits a causal one.
+OFFSETS = (-1, 0, 1)
 OSD_SHARE = 0.7  # rows below this share of the height hold the OSD
 EXE = '.exe' if os.name == 'nt' else ''
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def frame_key(name):
+    """Sort key by the number in the name: `openvrx-cli decode` writes
+    -frame00 .. -frame99, -frame100 ..., which a plain sort puts as frame10,
+    frame100, frame101, ... frame11 (scrambling every decode over 100 fields)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', name)]
+
+
 def frames(d):
-    return [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith('.png')]
+    return [os.path.join(d, f) for f in sorted(os.listdir(d), key=frame_key) if f.endswith('.png')]
 
 
 def to_ycc(path):
@@ -63,12 +76,17 @@ def to_rgb(x):
     return np.clip(np.stack([r, g, b], -1) + 0.5, 0, 255).astype(np.uint8)
 
 
-def features(seq, k, rows, cols):
+def window_ok(k, n, offs):
+    """Frame k of n has every frame the filter reads."""
+    return 0 <= k + min(offs) and k + max(offs) < n
+
+
+def features(seq, k, rows, cols, offs=OFFSETS):
     """Neighbourhood of pixels (rows, cols) in frame k: for each frame
     offset, plane, dy and dx (in that order), then a constant 1. The Rust
     filter in openvrx-cli uses the same order."""
     f = []
-    for dt in range(-TIME, TIME + 1):
+    for dt in offs:
         fr = seq[k + dt]
         for c in range(3):
             pl = fr[c]
@@ -89,7 +107,7 @@ def align(ref, seq):
         e = np.mean([np.mean((ref[k][0] - seq[k + off][0]) ** 2) for k in ks])
         if best is None or e < best[0]:
             best = (e, off)
-    return best[1]
+    return best[1] if best else 0  # too few frames to compare: no shift
 
 
 def psnr(a, b):
@@ -99,7 +117,7 @@ def psnr(a, b):
 # ---------------------------------------------------------------------------
 
 
-def run_sim(bin_dir, cfg, clip, out_base, cn, seed):
+def run_sim(bin_dir, cfg, clip, out_base, cn, seed, damage=False, steady=False):
     sim = os.path.join(bin_dir, 'openvrx-sim' + EXE)
     cli = os.path.join(bin_dir, 'openvrx-cli' + EXE)
     subprocess.run([sim, '--config', cfg, '-o', out_base, '--seconds', '1.6', '--standard', 'ntsc',
@@ -108,7 +126,9 @@ def run_sim(bin_dir, cfg, clip, out_base, cn, seed):
                     '--overwrite', '--seed', str(seed)], check=True, capture_output=True)
     dec = out_base + '-dec'
     shutil.rmtree(dec, ignore_errors=True)
-    subprocess.run([cli, 'decode', out_base, dec, '95'], check=True, capture_output=True)
+    shutil.rmtree(dec + '-damage', ignore_errors=True)
+    extra = (['--damage', dec + '-damage'] if damage else []) + (['--steady-osd'] if steady else [])
+    subprocess.run([cli, 'decode', out_base, dec, '95'] + extra, check=True, capture_output=True)
     for ext in ('.rx0.bin', '.truth.f32'):
         if os.path.exists(out_base + ext):
             os.remove(out_base + ext)
@@ -130,27 +150,41 @@ def cmd_simulate(a):
     with open(cfg, 'w') as f:
         json.dump(conf, f)
     clip = os.path.abspath(a.clip)
-    jobs = [('ref', 20, 100 + i) for i in range(a.ref_runs)]
+    out = os.path.join(scene_dir, 'ref')
+    keep_ref = a.keep_ref and os.path.isdir(out) and frames(out)
+    jobs = [] if keep_ref else [('ref', 20, 100 + i) for i in range(a.ref_runs)]
     jobs += [(f'cn{cn}', cn, a.seed) for cn in a.cn]
     with ThreadPoolExecutor(a.jobs) as ex:
-        decs = list(ex.map(lambda j: (j[0], run_sim(bin_dir, cfg, clip, os.path.join(work, f'{j[0]}-{j[2]}'), j[1], j[2])), jobs))
-    # Reference: the aligned mean of the ref runs.
+        decs = list(ex.map(lambda j: (j[0], run_sim(bin_dir, cfg, clip, os.path.join(work, f'{j[0]}-{j[2]}'), j[1], j[2],
+                                                    damage=a.damage and j[0] != 'ref', steady=a.steady_osd)), jobs))
     refs = [[to_ycc(p) for p in frames(d)] for name, d in decs if name == 'ref']
-    offs = [0] + [align(refs[0], s) for s in refs[1:]]
-    out = os.path.join(scene_dir, 'ref')
-    shutil.rmtree(out, ignore_errors=True)
-    os.makedirs(out)
-    lo = max(0, -min(offs)) + TIME
-    hi = min(len(s) - o for s, o in zip(refs, offs)) - TIME
-    for k in range(lo, hi):
-        m = sum(s[k + o] for s, o in zip(refs, offs)) / len(refs)
-        Image.fromarray(to_rgb(m)).save(os.path.join(out, f'f{k:04d}.png'))
+    if refs:
+        # Reference: the aligned mean of the ref runs.
+        offs = [0] + [align(refs[0], s) for s in refs[1:]]
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        lo = max(0, -min(offs)) + TIME
+        hi = min(len(s) - o for s, o in zip(refs, offs)) - TIME
+        for k in range(lo, hi):
+            m = sum(s[k + o] for s, o in zip(refs, offs)) / len(refs)
+            Image.fromarray(to_rgb(m)).save(os.path.join(out, f'f{k:04d}.png'))
+        for name, d in decs:
+            if name == 'ref':
+                shutil.rmtree(d, ignore_errors=True)
     for name, d in decs:
         if name != 'ref':
             dst = os.path.join(scene_dir, name)
             shutil.rmtree(dst, ignore_errors=True)
             shutil.move(d, dst)
-    print(f'{a.scene}: reference from {len(refs)} runs (offsets {offs}), noisy runs {[n for n, _ in decs if n != "ref"]}')
+            # Damage masks (same file names) in SCENE/damage/RUN, outside the
+            # cn* pattern that pairs() lists as runs.
+            mdst = os.path.join(scene_dir, 'damage', name)
+            shutil.rmtree(mdst, ignore_errors=True)
+            if os.path.isdir(d + '-damage'):
+                os.makedirs(os.path.dirname(mdst), exist_ok=True)
+                shutil.move(d + '-damage', mdst)
+    print(f'{a.scene}: ' + (f'reference from {len(refs)} runs (offsets {offs}), ' if refs else 'reference kept, ')
+          + f'noisy runs {[n for n, _ in decs if n != "ref"]}' + (' with damage masks' if a.damage else ''))
 
 
 def pairs(scene_dir):
@@ -161,20 +195,27 @@ def pairs(scene_dir):
 
 def cmd_train(a):
     rng = np.random.default_rng(0)
+    offs = a.offsets
+    if list(offs) != list(range(offs[0], offs[-1] + 1)) or not offs[0] <= 0 <= offs[-1]:
+        raise SystemExit('--offsets: consecutive frames that include 0, for example -1,0,1 or -2,-1,0')
     A, B = [], []
     for scene in a.scenes:
         ref_dir, runs = pairs(os.path.join(a.data, scene))
+        if a.runs:
+            runs = [r for r in runs if os.path.basename(r) in a.runs]
         ref = [to_ycc(p) for p in frames(ref_dir)]
         h, w = ref[0].shape[1:]
         for run in runs:
             seq = [to_ycc(p) for p in frames(run)]
             off = align(ref, seq)
-            for k in range(0, len(ref), 2):
-                if not (TIME <= k + off < len(seq) - TIME):
+            # Every frame: fields alternate parity, so a step of 2 (as up to
+            # 2026-11-08) fitted on one parity only.
+            for k in range(len(ref)):
+                if not window_ok(k + off, len(seq), offs):
                     continue
                 rows = rng.integers(RADIUS + 8, int(h * OSD_SHARE), a.samples)
                 cols = rng.integers(RADIUS + 8, w - RADIUS - 8, a.samples)
-                A.append(features(seq, k + off, rows, cols))
+                A.append(features(seq, k + off, rows, cols, offs))
                 B.append(ref[k][:, rows, cols].T)
     A = np.concatenate(A).astype(np.float64)
     B = np.concatenate(B).astype(np.float64)
@@ -198,14 +239,18 @@ def cmd_train(a):
         d[o] = 1.0
         kkt = np.block([[G, C.T], [C, np.zeros((4, 4))]])
         coef[:, o] = np.linalg.solve(kkt, np.concatenate([A.T @ B[:, o], d]))[:n]
+    # Version 1 (symmetric, 'time') is what every openvrx-cli reads; version
+    # 2 lists the frame offsets instead, for the causal live filter.
+    sym = list(offs) == list(range(-offs[-1], offs[-1] + 1))
     out = {
         'format': 'openvrx-denoise-filter',
-        'version': 1,
+        'version': 1 if sym else 2,
         'radius': RADIUS,
-        'time': TIME,
+        **({'time': offs[-1]} if sym else {'offsets': list(offs)}),
         'planes': 'ycbcr (BT.601 from RGB8: y = .299 r + .587 g + .114 b, cb = .564 (b - y), cr = .713 (r - y))',
-        'order': 'per output plane: for dt, plane, dy, dx (each from -r to r), then bias',
-        'trained_on': {'scenes': a.scenes, 'pixels': int(A.shape[0])},
+        'order': 'per output plane: for dt (each frame offset, oldest first), plane, dy, dx (each from -r to r), '
+                 'then bias',
+        'trained_on': {'scenes': a.scenes, 'runs': a.runs or 'all', 'pixels': int(A.shape[0])},
         'coef': [coef[:, j].astype(float).round(7).tolist() for j in range(3)],
     }
     with open(a.out, 'w') as f:
@@ -213,31 +258,45 @@ def cmd_train(a):
     print(f'trained on {A.shape[0]} pixels of {", ".join(a.scenes)} -> {a.out}')
 
 
-def load_filter(path):
+def load_filter(path, symmetric=False):
+    """(coef as taps x 3, frame offsets) of a filter file (version 1 or 2).
+    symmetric=True: only the coef, for callers that pass [k-1, k, k+1]
+    windows (the comparison panels); a causal filter is refused there."""
     with open(path) as f:
         flt = json.load(f)
-    assert flt['radius'] == RADIUS and flt['time'] == TIME
-    return np.array(flt['coef'], dtype=np.float32).T
+    assert flt['radius'] == RADIUS
+    offs = tuple(flt['offsets']) if 'offsets' in flt else tuple(range(-flt['time'], flt['time'] + 1))
+    coef = np.array(flt['coef'], dtype=np.float32).T
+    if symmetric:
+        if offs != OFFSETS:
+            raise SystemExit(f'{path}: frames {offs}, this tool needs a {OFFSETS} filter')
+        return coef
+    return coef, offs
 
 
-def filter_seq(seq, coef):
+def filter_seq(seq, coef, offs=OFFSETS):
+    """Every frame through the filter; frames without the whole window are
+    kept as they are."""
     h, w = seq[0].shape[1:]
     rr, cc = np.mgrid[RADIUS:h - RADIUS, RADIUS:w - RADIUS]
     rr, cc = rr.ravel(), cc.ravel()
     out = []
     for k in range(len(seq)):
         y = seq[k].copy()
-        if TIME <= k < len(seq) - TIME:
-            y[:, rr, cc] = (features(seq, k, rr, cc) @ coef).T
+        if window_ok(k, len(seq), offs):
+            y[:, rr, cc] = (features(seq, k, rr, cc, offs) @ coef).T
         out.append(y)
     return out
 
 
-def score(ref, seq):
+def score(ref, seq, margin=TIME):
+    """PSNR of seq against ref over the scored area, skipping `margin` frames
+    at both ends of seq (filters leave those unfiltered; compare filters with
+    different windows at the same margin)."""
     off = align(ref, seq)
     h = ref[0].shape[1]
     cut = (slice(None), slice(8, int(h * OSD_SHARE)), slice(8, -8))
-    ks = [k for k in range(len(ref)) if TIME <= k + off < len(seq) - TIME]
+    ks = [k for k in range(len(ref)) if margin <= k + off < len(seq) - margin]
     r = lambda x: x[cut]
     s = {'y': np.mean([psnr(r(ref[k])[0], r(seq[k + off])[0]) for k in ks]),
          'c': np.mean([psnr(r(ref[k])[1:], r(seq[k + off])[1:]) for k in ks]),
@@ -245,29 +304,70 @@ def score(ref, seq):
     return {k: round(float(v), 2) for k, v in s.items()}
 
 
+def filter_frame(seq, k, coef, offs):
+    """Frame k of seq through the filter (border pixels kept)."""
+    h, w = seq[k].shape[1:]
+    rr, cc = np.mgrid[RADIUS:h - RADIUS, RADIUS:w - RADIUS]
+    rr, cc = rr.ravel(), cc.ravel()
+    y = seq[k].copy()
+    y[:, rr, cc] = (features(seq, k, rr, cc, offs) @ coef).T
+    return y
+
+
+def score_pairs(refs, outs):
+    """score() on frames already paired (no alignment search)."""
+    h = refs[0].shape[1]
+    cut = (slice(None), slice(8, int(h * OSD_SHARE)), slice(8, -8))
+    s = {'y': np.mean([psnr(r[cut][0], o[cut][0]) for r, o in zip(refs, outs)]),
+         'c': np.mean([psnr(r[cut][1:], o[cut][1:]) for r, o in zip(refs, outs)]),
+         'rgb': np.mean([psnr(to_rgb(r[cut]).astype(np.float32), to_rgb(o[cut]).astype(np.float32))
+                         for r, o in zip(refs, outs)])}
+    return {k: round(float(v), 2) for k, v in s.items()}
+
+
 def cmd_eval(a):
-    coef = load_filter(a.filter)
-    ref_dir, runs = pairs(os.path.join(a.data, a.scene))
+    """Every filter of --filter (comma separated) on every noisy run of the
+    scene, all scored on the same frames: every --every-th frame with the
+    whole window of the widest filter."""
+    flts = [(os.path.splitext(os.path.basename(p))[0], *load_filter(p)) for p in a.filter.split(',')]
+    margin = max(max(abs(o) for o in offs) for _, _, offs in flts)
+    sd = os.path.join(a.data, a.scene)
+    global OSD_SHARE
+    if os.path.exists(os.path.join(sd, 'build.json')):
+        OSD_SHARE = 1.0  # bench patterns have no OSD: score the whole picture
+    ref_dir, runs = pairs(sd)
+    if a.runs:
+        runs = [r for r in runs if os.path.basename(r) in a.runs]
     ref = [to_ycc(p) for p in frames(ref_dir)]
     res = {}
     for run in runs:
         seq = [to_ycc(p) for p in frames(run)]
-        raw, filt = score(ref, seq), score(ref, filter_seq(seq, coef))
-        res[os.path.basename(run)] = {'raw': raw, 'filtered': filt}
-        print(f"{os.path.basename(run):>5}  raw Y {raw['y']:5.2f} C {raw['c']:5.2f} RGB {raw['rgb']:5.2f}"
-              f"   filtered Y {filt['y']:5.2f} C {filt['c']:5.2f} RGB {filt['rgb']:5.2f}"
-              f"   ({filt['rgb'] - raw['rgb']:+.2f} dB RGB)")
+        if len(seq) < 2 * margin + 1:
+            continue
+        off = align(ref, seq)
+        # An odd step alternates the scored fields' parity (an even one
+        # scores only top or only bottom fields).
+        step = a.every if a.every % 2 else a.every + 1
+        ks = [k for k in range(len(ref)) if margin <= k + off < len(seq) - margin][::step]
+        refs = [ref[k] for k in ks]
+        r = {'raw': score_pairs(refs, [seq[k + off] for k in ks])}
+        for name, coef, offs in flts:
+            r[name] = score_pairs(refs, [filter_frame(seq, k + off, coef, offs) for k in ks])
+        res[os.path.basename(run)] = r
+        print(f"{os.path.basename(run):>15}  raw RGB {r['raw']['rgb']:5.2f}"
+              + "".join(f"   {n} RGB {r[n]['rgb']:5.2f} ({r[n]['rgb'] - r['raw']['rgb']:+.2f})" for n, _, _ in flts),
+              flush=True)
     if a.out:
         with open(a.out, 'w') as f:
-            json.dump({'scene': a.scene, 'filter': a.filter, 'psnr_db': res}, f, indent=1)
+            json.dump({'scene': a.scene, 'filter': a.filter, 'margin': margin, 'psnr_db': res}, f, indent=1)
 
 
 def cmd_apply(a):
-    coef = load_filter(a.filter)
+    coef, offs = load_filter(a.filter)
     paths = frames(a.frames)
     seq = [to_ycc(p) for p in paths]
     os.makedirs(a.out, exist_ok=True)
-    for p, y in zip(paths, filter_seq(seq, coef)):
+    for p, y in zip(paths, filter_seq(seq, coef, offs)):
         Image.fromarray(to_rgb(y)).save(os.path.join(a.out, os.path.basename(p)))
     print(f'{len(paths)} frames -> {a.out}')
 
@@ -284,15 +384,29 @@ def main():
     s.add_argument('--seed', type=int, default=41)
     s.add_argument('--jobs', type=int, default=4)
     s.add_argument('--bin')
+    s.add_argument('--damage', action='store_true',
+                   help='also write each noisy run\'s decoder damage masks to SCENE/damage/RUN')
+    s.add_argument('--keep-ref', action='store_true',
+                   help='keep an existing SCENE/ref (only add or redo the noisy runs)')
+    s.add_argument('--steady-osd', action='store_true',
+                   help="decode as the live app's default view (line-doubled fields on the same rows); "
+                        'use a separate --scene name: these frames sit half a line from the normal ones')
     t = sub.add_parser('train')
     t.add_argument('--data', required=True)
     t.add_argument('--scenes', type=lambda v: v.split(','), required=True)
     t.add_argument('--out', required=True)
-    t.add_argument('--samples', type=int, default=4000, help='pixels per frame pair')
+    t.add_argument('--samples', type=int, default=2000, help='pixels per frame pair (every frame is used)')
+    t.add_argument('--runs', type=lambda v: v.split(','),
+                   help='only these noisy runs of each scene (for example cn8,cn10,cn12,cn14,cn16,cn20)')
+    t.add_argument('--offsets', type=lambda v: tuple(int(x) for x in v.split(',')), default=OFFSETS,
+                   help='frames read, relative to the output one (default -1,0,1; live, no added latency: -2,-1,0)')
     e = sub.add_parser('eval')
     e.add_argument('--data', required=True)
     e.add_argument('--scene', required=True)
-    e.add_argument('--filter', required=True)
+    e.add_argument('--filter', required=True, help='one or more filter files, comma separated')
+    e.add_argument('--every', type=int, default=5,
+                   help='score every N-th frame (1: all; an even N is raised by one so both field parities count)')
+    e.add_argument('--runs', type=lambda v: v.split(','), help='only these runs (default: all)')
     e.add_argument('--out')
     ap = sub.add_parser('apply')
     ap.add_argument('--filter', required=True)
