@@ -57,6 +57,7 @@ import math
 import platform
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -269,7 +270,15 @@ class VtxGuard:
 
     def renew(self):
         stale = self.last is None or time.time() - self.last > self.LEASE_S - 5
-        reply = command(self.s, f"vtx active {self.LEASE_S}", "vtx", 8.0)
+        try:
+            # Tramp reads miss now and then: retry, and a renew
+            # that still fails is harmless while the lease has time left.
+            reply = command(self.s, f"vtx active {self.LEASE_S}", "vtx", 8.0, tries=3)
+        except RuntimeError as e:
+            if self.last is not None and time.time() - self.last < self.LEASE_S - 30:
+                print(f"  WARNING: lease renew failed ({e}); {self.LEASE_S - (time.time() - self.last):.0f} s left")
+                return ""
+            raise
         if stale:
             time.sleep(2.0)  # out of pit mode: let the VTX and the lock settle
         self.last = time.time()
@@ -278,9 +287,132 @@ class VtxGuard:
     def release(self):
         try:
             command(self.s, "vtx active 0", "vtx", 8.0)
+            self.last = None  # the next renew lets the VTX settle again
             print("  VTX back in pit mode")
         except Exception as e:
             print(f"  WARNING: could not put the VTX in pit mode ({e})")
+
+    def temp(self):
+        """VTX temperature (C) from Tramp, or None when the read fails."""
+        try:
+            m = re.search(r"\btemp=(-?\d+)", command(self.s, "vtx", "vtx", 5.0, tries=2))
+            return int(m.group(1)) if m else None
+        except RuntimeError:
+            return None
+
+    def cool_down(self, limit, margin=10.0, poll_s=15.0, max_wait_s=900.0):
+        """Pit mode until the VTX is `margin` under `limit`, then out again.
+        The attenuator is left where it is, so the sweep resumes at the same
+        step. Returns the seconds spent cooling."""
+        t0 = time.time()
+        self.release()
+        while time.time() - t0 < max_wait_s:
+            time.sleep(poll_s)
+            t = self.temp()
+            print(f"    cooling: VTX {t} C (resume under {limit - margin:g} C)")
+            if t is not None and t <= limit - margin:
+                break
+        self.renew()
+        return round(time.time() - t0, 1)
+
+
+class TruthCapture:
+    """Ground truth from a UVC capture card (MS2107) on the VTX video input,
+    recorded losslessly (ffv1) for the whole run. The card can drop off USB
+    and come back (2026-11-07): ffmpeg then ends, and a new segment starts as
+    soon as the device is back. truth.jsonl lists each segment with its
+    wall-clock start and end; results.jsonl gives each recording's t_start and
+    t_end on the same clock.
+
+    The card can also stall without leaving USB (2026-11-07: a segment open
+    137 s held 1.5 s of video): ffmpeg then sits in a read and never ends.
+    So the segment file is watched too, and when it has not grown for
+    `stall_s` seconds ffmpeg is stopped and a new segment started. The first
+    `start_grace_s` of a segment are not judged (opening the device and the
+    first Matroska cluster take a moment)."""
+
+    def __init__(self, dev, out, stall_s=3.0, start_grace_s=5.0, ffmpeg="ffmpeg"):
+        self.dev, self.out = dev, out
+        self.stall_s, self.start_grace_s, self.ffmpeg = stall_s, start_grace_s, ffmpeg
+        self.stop_flag = threading.Event()
+        self.proc = None
+        self.segments = self.stalls = self.drops = 0
+        self.index = open(os.path.join(out, "truth.jsonl"), "a")
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _stop_proc(self, wait_s=5.0):
+        """SIGINT first (ffmpeg closes the file cleanly), SIGKILL if it hangs
+        (a stalled v4l2 read may never return to see the signal)."""
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(wait_s)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        return self.proc.returncode if self.proc else None
+
+    def _watch(self, path):
+        """Waits for ffmpeg to end, the run to stop, or the file to stall.
+        Returns "exit", "stop" or "stall"."""
+        t0 = time.monotonic()
+        size, grew = -1, t0
+        while True:
+            if self.proc.poll() is not None:
+                return "exit"
+            if self.stop_flag.wait(0.5):
+                return "stop"
+            now = time.monotonic()
+            try:
+                s = os.path.getsize(path)
+            except OSError:
+                s = -1  # not created yet
+            if s != size:
+                size, grew = s, now
+            elif now - t0 >= self.start_grace_s and now - grew >= self.stall_s:
+                return "stall"
+
+    def _loop(self):
+        while not self.stop_flag.is_set():
+            if not os.path.exists(self.dev):
+                time.sleep(0.5)
+                continue
+            path = os.path.join(self.out, f"truth-{self.segments:03d}.mkv")
+            log = open(path[:-4] + ".log", "w")
+            t0 = time.time()
+            self.proc = subprocess.Popen(
+                [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin", "-f", "v4l2",
+                 "-input_format", "yuyv422", "-video_size", "720x480", "-framerate", "30",
+                 "-use_wallclock_as_timestamps", "1", "-i", self.dev, "-c:v", "ffv1", "-level", "3",
+                 "-y", path], stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            why = self._watch(path)
+            code = self._stop_proc() if why != "exit" else self.proc.returncode
+            log.close()
+            if why == "stall":
+                self.stalls += 1
+            elif why == "exit":
+                self.drops += 1
+            self.index.write(json.dumps({"file": os.path.basename(path), "t_start": t0, "t_end": time.time(),
+                                         "exit": code, "end": why}) + "\n")
+            self.index.flush()
+            self.segments += 1
+            if not self.stop_flag.is_set():
+                if why == "stall":
+                    print(f"  truth capture stalled ({path} did not grow for {self.stall_s:g} s); restarting")
+                else:
+                    print(f"  truth capture ended (exit {code}); restarting when {self.dev} is back")
+                time.sleep(1.0)
+
+    def close(self):
+        """Stops the capture; returns the counts for run.json."""
+        self.stop_flag.set()
+        self.thread.join(15)
+        self._stop_proc(10.0)  # in case the thread was stuck
+        self.index.close()
+        print(f"  truth capture: {self.segments} segment(s), {self.drops} ended by ffmpeg, "
+              f"{self.stalls} stalled")
+        return {"segments": self.segments, "ffmpeg_exits": self.drops, "stalls": self.stalls}
 
 
 def setup_vtx(args, att):
@@ -451,9 +583,33 @@ def main():
     ap.add_argument("--ok-psnr", type=float, default=None,
                     help="picture ok when PSNR median is at least this (dB) and half the frames decode; "
                          "default: within 3 dB of the reference's own PSNR")
+    ap.add_argument("--patterns", default=None,
+                    help="comma list of ESP32 patterns recorded at every step, e.g. card,bars,check: one "
+                         "upward pass gives a ladder per pattern (each scored against its own first step)")
+    ap.add_argument("--truth", default=None,
+                    help="UVC capture device on the VTX video input (MS2107), e.g. /dev/video0: recorded "
+                         "for the whole run as truth-NNN.mkv, restarted if the card drops off USB")
+    ap.add_argument("--truth-stall", type=float, default=3.0,
+                    help="restart the truth capture when its file has not grown for this many seconds "
+                         "(the MS2107 stalls without dropping off USB)")
+    ap.add_argument("--vtx-max-temp", type=float, default=None,
+                    help="out of pit mode only: when the VTX reports this temperature (C) after a step, "
+                         "put it in pit mode until it is 10 C cooler, then go on at the same step")
+    ap.add_argument("--show", action="store_true",
+                    help="when the run ends: contact sheets of every step (show.py run) opened in mpv")
     ap.add_argument("--demod", default=None, help="openvrx-cli score --demod (default: the DSP default)")
     ap.add_argument("--preset", default=None, help="openvrx-cli score --preset (default raw)")
     args = ap.parse_args()
+
+    # Idle suspend in the middle of a sweep cuts USB (the FX2 stream) and lets
+    # the VTX lease lapse (Atlas suspended during a long job, 2026-11-07). On
+    # Linux, run again under systemd-inhibit: suspend is blocked exactly as
+    # long as this process lives, with no power settings changed.
+    if (platform.system() == "Linux" and not os.environ.get("OPENVRX_INHIBITED")
+            and subprocess.run(["which", "systemd-inhibit"], capture_output=True).returncode == 0):
+        os.environ["OPENVRX_INHIBITED"] = "1"
+        os.execvp("systemd-inhibit", ["systemd-inhibit", "--what=sleep:idle", "--who=openvrx",
+                                      "--why=openvrx bench sweep", sys.executable] + sys.argv)
 
     if args.att_step not in (0.25, 0.5, 1.0, 10.0):
         sys.exit("--att-step must be 0.25, 0.5, 1 or 10")
@@ -462,6 +618,15 @@ def main():
     for g in gains:
         if g != "auto" and not g.isdigit():
             sys.exit(f"bad gain {g!r}: an index or auto")
+    if args.patterns:
+        args.patterns = [p.strip() for p in args.patterns.split(",")]
+        bad = [p for p in args.patterns if p not in PATTERNS]
+        if bad:
+            sys.exit(f"--patterns: unknown {bad}; choose from {', '.join(PATTERNS)}")
+        if args.live or args.ref or args.pattern:
+            sys.exit("--patterns does not go with --live, --ref or --pattern")
+        if not args.att.startswith("esp32:") and not args.video_port:
+            sys.exit("--patterns needs the ESP32: --att esp32:PORT or --video-port PORT")
     out = args.out or os.path.join(os.path.dirname(ROOT), "bench-runs", time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out, exist_ok=True)
     if not os.path.exists(args.cli):
@@ -491,6 +656,9 @@ def main():
     with open(os.path.join(out, "run.json"), "w") as f:
         json.dump(meta, f, indent=2)
     live = None
+    truth = TruthCapture(args.truth, out, stall_s=args.truth_stall) if args.truth else None
+    args.video_s = att.s if isinstance(att, Esp32Attenuator) else (
+        open_serial(args.video_port) if args.patterns and args.video_port else None)
     try:
         live = LiveApp(args.app, args, os.path.join(out, "app.log")) if args.live else None
         sweep(args, att, c5, live, guard, steps, gains, out)
@@ -499,6 +667,14 @@ def main():
             live.close()
         if guard:
             guard.release()
+        if truth:
+            meta["truth_capture"] = truth.close()
+            with open(os.path.join(out, "run.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+        if args.show:
+            # After the sweep, never during: decoding competes with the USB stream.
+            subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "show.py"),
+                            "run", out])
 
 
 def sweep(args, att, c5, live, guard, steps, gains, out):
@@ -507,7 +683,8 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
     jl = open(os.path.join(out, "results.jsonl"), "a")
     cf = open(os.path.join(out, "results.csv"), "a", newline="")
     fields = ["gain", "att_db", "rx_dbm", "frames", "psnr_median", "psnr_min", "damaged", "lock",
-              "cn_db", "clip_pct", "power_db", "picture"] + (list(C5_FIELDS.values()) if c5 else [])
+              "cn_db", "clip_pct", "power_db", "picture", "pattern", "vtx_temp", "t_start", "t_end"] + (
+                  list(C5_FIELDS.values()) if c5 else [])
     if c5 and args.dc:
         print(command(c5, f"dc {args.dc}", "dc", 2.0))
         time.sleep(2.0)   # a few servo updates before the first step
@@ -532,80 +709,104 @@ def sweep(args, att, c5, live, guard, steps, gains, out):
                 command(c5, f"gain {gain}", "gain", 3.0, tries=3)
             time.sleep(0.5)
         print(f"\n== gain {gain}: {len(steps)} steps, fixed {args.fixed_db:g} dB")
-        ref, ref_psnr, ref_frames, prev = None, None, None, None
+        # One ladder per pattern (None: the pattern is left as it is); each
+        # keeps its own reference (ref, ref_psnr, ref_frames) and previous step.
+        patterns = args.patterns or [None]
+        refs = {p: (None, None, None) for p in patterns}
+        prevs = {p: None for p in patterns}
         extra = (["--demod", args.demod] if args.demod else []) + (["--preset", args.preset] if args.preset else [])
         if args.ref:
             # External reference: its own score sets the frame count to expect.
-            ref = args.ref
-            r0 = json.loads(run([args.cli, "score", ref, "--ref", ref, "--frames", str(args.frames),
+            r0 = json.loads(run([args.cli, "score", args.ref, "--ref", args.ref, "--frames", str(args.frames),
                                  "--skip", "10"] + extra).strip().splitlines()[-1])
-            ref_psnr, ref_frames = r0["psnr_median"], max(r0["frames"], 1)
-            print(f"  reference {ref}: PSNR on itself {ref_psnr}, {r0['frames']} frames")
+            refs[None] = (args.ref, r0["psnr_median"], max(r0["frames"], 1))
+            print(f"  reference {args.ref}: PSNR on itself {r0['psnr_median']}, {r0['frames']} frames")
         for db in steps:
             att.set(db)
-            if guard:
-                guard.renew()  # keeps the VTX out of pit mode for this step
-            time.sleep(1.0)
-            base = os.path.join(out, f"g{gain}-att{db:05.2f}")
-            if live:
-                base = live.record(base, args.seconds)
-            else:
-                run([args.cli, "record", base, "--lanes", args.lanes, "--clk", str(args.clk),
-                     "--seconds", str(args.seconds), "--mhz", str(args.mhz),
-                     "--gain", "0" if gain == "auto" else gain])
-            score_cmd = [args.cli, "score", base, "--frames", str(args.frames), "--skip", "10"] + extra
-            if ref is None:
-                ref = base
-            score_cmd += ["--ref", ref]
-            r = json.loads(run(score_cmd).strip().splitlines()[-1])
-            if ref == base:
-                ref_psnr, ref_frames = r["psnr_median"], max(r["frames"], 1)
-            # Pit mode: the VTX power is unknown, so no absolute level.
-            rx = None if args.pit else round(args.vtx_dbm - args.fixed_db - args.extra_loss_db - db, 2)
-            r.update(gain=gain, att_db=db, rx_dbm=rx)
-            if c5:
-                r.update(c5_status(c5))
-            psnr_floor = args.ok_psnr if args.ok_psnr is not None else (
-                None if ref_psnr is None else ref_psnr - MAX_PSNR_DROP_DB)
-            ok = (r["frames"] >= MIN_FRAME_SHARE * ref_frames and r["psnr_median"] is not None
-                  and psnr_floor is not None and r["psnr_median"] >= psnr_floor)
-            r["picture"] = "ok" if ok else "lost"
-            # Leakage check: 10 dB more attenuation should cost about 10 dB of power
-            # while the C5 is in its linear range (no clipping, above the noise).
-            # Not with the gain loop on: it makes up the difference.
-            if gain != "auto" and prev and db - prev["att_db"] >= 8 and prev["clip_pct"] < 1 and r["clip_pct"] < 1:
-                drop = prev["power_db"] - r["power_db"]
-                expect = db - prev["att_db"]
-                if r["picture"] == "ok" and drop < 0.5 * expect:
-                    r["leak_warning"] = f"power fell {drop:.1f} dB for {expect:g} dB more attenuation"
-            jl.write(json.dumps(r) + "\n")
-            jl.flush()
-            cw.writerow(r)
-            cf.flush()
-            lvl = "rx ?  (pit)" if r["rx_dbm"] is None else f"rx ~{r['rx_dbm']:7.2f} dBm"
-            print(f"  att {db:5.2f} dB  {lvl}  frames {r['frames']:3d}  "
-                  f"psnr {r['psnr_median']}  C/N {r['cn_db']:.1f}  clip {r['clip_pct']:.1f}%  {r['picture']}"
-                  + (f"  LEAK? {r['leak_warning']}" if "leak_warning" in r else ""))
-            if r["picture"] == "ok":
-                summary[gain] = r["rx_dbm"] if r["rx_dbm"] is not None else f"att {db:g} dB"
-            if not args.keep and base != ref:
-                for ext in (".rx0.bin", ".openvrx.json", ".events.jsonl"):
-                    try:
-                        os.remove(base + ext)
-                    except OSError:
-                        pass
+            for pat in patterns:
+                if pat:
+                    command(args.video_s, f"pattern {pat}", "pattern", 3.0, tries=3)
+                if guard:
+                    guard.renew()  # keeps the VTX out of pit mode for this step
+                time.sleep(1.0)
+                base = os.path.join(out, f"g{gain}-att{db:05.2f}" + (f"-{pat}" if pat else ""))
+                t_start = time.time()
                 if live:
+                    base = live.record(base, args.seconds)
+                else:
+                    run([args.cli, "record", base, "--lanes", args.lanes, "--clk", str(args.clk),
+                         "--seconds", str(args.seconds), "--mhz", str(args.mhz),
+                         "--gain", "0" if gain == "auto" else gain])
+                t_end = time.time()
+                ref, ref_psnr, ref_frames = refs[pat]
+                score_cmd = [args.cli, "score", base, "--frames", str(args.frames), "--skip", "10"] + extra
+                if ref is None:
+                    ref = base
+                score_cmd += ["--ref", ref]
+                r = json.loads(run(score_cmd).strip().splitlines()[-1])
+                if ref == base:
+                    ref_psnr, ref_frames = r["psnr_median"], max(r["frames"], 1)
+                refs[pat] = (ref, ref_psnr, ref_frames)
+                # Pit mode: the VTX power is unknown, so no absolute level.
+                rx = None if args.pit else round(args.vtx_dbm - args.fixed_db - args.extra_loss_db - db, 2)
+                r.update(gain=gain, att_db=db, rx_dbm=rx, t_start=round(t_start, 3), t_end=round(t_end, 3))
+                if pat:
+                    r["pattern"] = pat
+                if c5:
+                    r.update(c5_status(c5))
+                psnr_floor = args.ok_psnr if args.ok_psnr is not None else (
+                    None if ref_psnr is None else ref_psnr - MAX_PSNR_DROP_DB)
+                ok = (r["frames"] >= MIN_FRAME_SHARE * ref_frames and r["psnr_median"] is not None
+                      and psnr_floor is not None and r["psnr_median"] >= psnr_floor)
+                r["picture"] = "ok" if ok else "lost"
+                # Leakage check: 10 dB more attenuation should cost about 10 dB of power
+                # while the C5 is in its linear range (no clipping, above the noise).
+                # Not with the gain loop on: it makes up the difference.
+                prev = prevs[pat]
+                if (gain != "auto" and prev and db - prev["att_db"] >= 8 and prev["clip_pct"] < 1
+                        and r["clip_pct"] < 1):
+                    drop = prev["power_db"] - r["power_db"]
+                    expect = db - prev["att_db"]
+                    if r["picture"] == "ok" and drop < 0.5 * expect:
+                        r["leak_warning"] = f"power fell {drop:.1f} dB for {expect:g} dB more attenuation"
+                if guard and args.vtx_max_temp is not None and pat == patterns[-1]:  # once per step
+                    r["vtx_temp"] = guard.temp()
+                jl.write(json.dumps(r) + "\n")
+                jl.flush()
+                cw.writerow(r)
+                cf.flush()
+                lvl = "rx ?  (pit)" if r["rx_dbm"] is None else f"rx ~{r['rx_dbm']:7.2f} dBm"
+                print(f"  att {db:5.2f} dB  {lvl}" + (f"  {pat:5s}" if pat else "") + f"  frames {r['frames']:3d}  "
+                      f"psnr {r['psnr_median']}  C/N {r['cn_db']:.1f}  clip {r['clip_pct']:.1f}%  {r['picture']}"
+                      + (f"  VTX {r['vtx_temp']} C" if r.get("vtx_temp") is not None else "")
+                      + (f"  LEAK? {r['leak_warning']}" if "leak_warning" in r else ""), flush=True)
+                if r["picture"] == "ok":
+                    summary[gain] = r["rx_dbm"] if r["rx_dbm"] is not None else f"att {db:g} dB"
+                if not args.keep and base != ref:
+                    for ext in (".rx0.bin", ".openvrx.json", ".events.jsonl"):
+                        try:
+                            os.remove(base + ext)
+                        except OSError:
+                            pass
+                    if live:
+                        try:
+                            os.rmdir(os.path.dirname(base))  # the step's -rec folder, now empty
+                        except OSError:
+                            pass
+                prevs[pat] = r
+                if r.get("vtx_temp") is not None and r["vtx_temp"] >= args.vtx_max_temp:
+                    print(f"  VTX at {r['vtx_temp']} C (limit {args.vtx_max_temp:g}): pit mode to cool down")
+                    waited = guard.cool_down(args.vtx_max_temp)
+                    with open(os.path.join(out, "bench-events.jsonl"), "a") as ev:
+                        ev.write(json.dumps({"event": "cool_down", "t": round(time.time(), 3), "att_db": db,
+                                             "after": pat, "seconds": waited}) + "\n")
+        if not args.keep and not args.ref:  # never delete an external reference
+            for ref, _, _ in refs.values():
+                if ref:
                     try:
-                        os.rmdir(os.path.dirname(base))  # the step's -rec folder, now empty
+                        os.remove(ref + ".rx0.bin")
                     except OSError:
                         pass
-            prev = r
-        if not args.keep and not args.ref:  # never delete an external reference
-            for ext in (".rx0.bin",):
-                try:
-                    os.remove(ref + ext)
-                except OSError:
-                    pass
 
     print("\nweakest level with a picture, per gain:")
     for g, dbm in summary.items():
