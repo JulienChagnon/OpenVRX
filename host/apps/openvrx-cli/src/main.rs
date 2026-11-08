@@ -3,9 +3,11 @@
 //!
 //! ```text
 //! openvrx-cli inspect REC [OUT_DIR]           lane activity, I/Q histograms, a sync-free FM strip image
-//! openvrx-cli decode  REC [OUT_DIR] [FRAMES] [--steady-osd]
+//! openvrx-cli decode  REC [OUT_DIR] [FRAMES] [--steady-osd] [--damage DIR]
 //!                                             frames through the live DSP and video chain (raw preset;
-//!                                             --steady-osd: line-doubled fields as in the app's default)
+//!                                             --steady-osd: line-doubled fields as in the app's default;
+//!                                             --damage: each frame's damage mask as a grey PNG of the
+//!                                             same name in DIR, for the denoise models)
 //! openvrx-cli decode  REC OUT_DIR FRAMES --live [--preset NAME] [--no-steady-osd]
 //!                                             the app's live video path instead: preset (default
 //!                                             low_latency), streaming, every line through the combiner
@@ -72,6 +74,7 @@ fn main() {
             &out,
             args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8),
             args.iter().any(|a| a == "--steady-osd"),
+            opt(&args, "--damage").map(PathBuf::from),
         ),
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
@@ -255,17 +258,29 @@ fn walk_frames(
     Ok((total_lines, dsp.stats()))
 }
 
-fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(), String> {
+fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool, damage: Option<PathBuf>) -> Result<(), String> {
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    if let Some(d) = &damage {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
     let mut saved = 0;
     let (total_lines, stats) = walk_frames(&rec, steady_osd, openvrx_dsp::DemodKind::Polar, "raw", |f| {
         if saved >= frames {
             return Ok(false);
         }
         let img = image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba8()).ok_or("frame size")?;
-        let path = out.join(format!("{}-frame{saved:02}.png", rec.name()));
+        let name = format!("{}-frame{saved:02}.png", rec.name());
+        let path = out.join(&name);
         img.save(&path).map_err(|e| e.to_string())?;
+        if let Some(d) = &damage {
+            // The frame's damage byte per pixel (openvrx_core::quality::damage:
+            // 0 clean, 64 noisy, 96 repaired click, 160 click, 224 no carrier,
+            // 255 lost), same name as the picture, in its own folder so
+            // tools that read every PNG of OUT_DIR still see only pictures.
+            let m = image::GrayImage::from_raw(f.width as u32, f.height as u32, f.damage.clone()).ok_or("damage size")?;
+            m.save(d.join(&name)).map_err(|e| e.to_string())?;
+        }
         println!("saved {} (field {} parity {:?})", path.display(), f.meta.field_seq, f.meta.parity);
         saved += 1;
         Ok(saved < frames)
@@ -294,7 +309,9 @@ fn render(path: &str, args: &[String]) -> Result<(), String> {
     let crf: u32 = opt_num(args, "--crf", 16)?;
     let x264_preset = opt(args, "--x264-preset").unwrap_or("medium");
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
-    let time = filter.as_ref().map_or(0, |f| f.time());
+    // The filter's window: `before` frames are written unfiltered first,
+    // then each new frame completes a window whose frame `before` is output.
+    let (before, window) = filter.as_ref().map_or((0, 1), |f| (f.before(), f.before() + f.after() + 1));
 
     let mut ffmpeg: Option<(std::process::Child, std::process::ChildStdin)> = None;
     let mut hist: std::collections::VecDeque<Planes> = std::collections::VecDeque::new();
@@ -340,9 +357,9 @@ fn render(path: &str, args: &[String]) -> Result<(), String> {
         match &filter {
             None => write(&mut ffmpeg, &hist.pop_front().expect("frame"))?,
             Some(flt) => {
-                if hist.len() <= time {
+                if hist.len() <= before {
                     write(&mut ffmpeg, &hist[hist.len() - 1])?;
-                } else if hist.len() == 2 * time + 1 {
+                } else if hist.len() == window {
                     let window: Vec<&Planes> = hist.iter().collect();
                     write(&mut ffmpeg, &flt.apply(&window))?;
                     hist.pop_front();
@@ -355,9 +372,10 @@ fn render(path: &str, args: &[String]) -> Result<(), String> {
         }
         Ok(true)
     })?;
-    // The last frames of the range have no later context.
+    // The last `after` frames of the range have no later context (none for a
+    // causal filter: every frame went out as it came in).
     if filter.is_some() {
-        for p in hist.iter().skip(time) {
+        for p in hist.iter().skip(before) {
             write(&mut ffmpeg, p)?;
         }
     }

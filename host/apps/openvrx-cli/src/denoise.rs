@@ -16,7 +16,11 @@ pub const DEFAULT_FILTER: &str = include_str!("../filters/denoise-4x4top.json");
 
 pub struct DenoiseFilter {
     radius: usize,
-    time: usize,
+    /// Frames read before and after the output frame: 1 and 1 for the
+    /// post-flight filter (version 1, `time`), 2 and 0 for a causal one that
+    /// adds no latency live (version 2, `offsets` -2,-1,0).
+    before: usize,
+    after: usize,
     /// Per output plane: taps in (dt, plane, dy, dx) order, then the bias.
     coef: [Vec<f32>; 3],
 }
@@ -28,9 +32,22 @@ impl DenoiseFilter {
             return Err("filter: not an openvrx-denoise-filter file".into());
         }
         let radius = v["radius"].as_u64().ok_or("filter: radius")? as usize;
-        let time = v["time"].as_u64().ok_or("filter: time")? as usize;
+        let (before, after) = match v["offsets"].as_array() {
+            Some(offs) => {
+                let offs: Vec<i64> = offs.iter().map(|x| x.as_i64().ok_or("filter: offsets")).collect::<Result<_, _>>()?;
+                let consecutive = offs.windows(2).all(|w| w[1] == w[0] + 1);
+                match (offs.first(), offs.last()) {
+                    (Some(&lo), Some(&hi)) if consecutive && lo <= 0 && hi >= 0 => ((-lo) as usize, hi as usize),
+                    _ => return Err("filter: offsets must be consecutive frames including 0".into()),
+                }
+            }
+            None => {
+                let time = v["time"].as_u64().ok_or("filter: time")? as usize;
+                (time, time)
+            }
+        };
         let side = 2 * radius + 1;
-        let taps = (2 * time + 1) * 3 * side * side + 1;
+        let taps = (before + after + 1) * 3 * side * side + 1;
         let plane = |k: usize| -> Result<Vec<f32>, String> {
             let c: Vec<f32> = v["coef"][k]
                 .as_array()
@@ -45,20 +62,27 @@ impl DenoiseFilter {
         };
         Ok(DenoiseFilter {
             radius,
-            time,
+            before,
+            after,
             coef: [plane(0)?, plane(1)?, plane(2)?],
         })
     }
 
-    /// Frames of context on each side.
-    pub fn time(&self) -> usize {
-        self.time
+    /// Frames read before the output frame.
+    pub fn before(&self) -> usize {
+        self.before
     }
 
-    /// Filters the middle frame of `frames` (2 * time + 1 of them). Pixels
-    /// within `radius` of the border are kept as they are.
+    /// Frames read after the output frame (the latency it adds, in fields).
+    pub fn after(&self) -> usize {
+        self.after
+    }
+
+    /// Filters frame `before` of `frames` (before + after + 1 of them, oldest
+    /// first). Pixels within `radius` of the border are kept as they are.
     pub fn apply(&self, frames: &[&Planes]) -> Planes {
-        let cur = frames[self.time];
+        assert_eq!(frames.len(), self.before + self.after + 1, "filter window");
+        let cur = frames[self.before];
         let (w, h, r) = (cur.width, cur.height, self.radius);
         let side = 2 * r + 1;
         let mut out = cur.clone();
@@ -150,13 +174,35 @@ mod tests {
         let (w, h) = (32, 24);
         let rgba: Vec<u8> = (0..w * h).flat_map(|_| [120u8, 100, 80, 255]).collect();
         let p = Planes::from_rgba8(w, h, &rgba);
-        let frames: Vec<&Planes> = (0..2 * f.time() + 1).map(|_| &p).collect();
+        let frames: Vec<&Planes> = (0..f.before() + f.after() + 1).map(|_| &p).collect();
         let out = f.apply(&frames).to_rgb8();
         // A flat colour is what the filter should leave alone (within a
         // few codes: it is fitted, not constrained).
         for px in out.chunks_exact(3) {
             assert!((px[0] as i32 - 120).abs() <= 4 && (px[1] as i32 - 100).abs() <= 4 && (px[2] as i32 - 80).abs() <= 4, "{px:?}");
         }
+    }
+
+    #[test]
+    fn causal_offsets_load_and_read_only_past_frames() {
+        // Version 2, frames -2,-1,0, radius 0: Y out = the newest frame's Y,
+        // the two older frames' taps zero, so they must not matter.
+        let mut y = vec![0.0; 3 * 3 + 1];
+        y[6] = 1.0; // dt 0, plane Y
+        let mut cb = vec![0.0; 10];
+        cb[7] = 1.0;
+        let mut cr = vec![0.0; 10];
+        cr[8] = 1.0;
+        let json = serde_json::json!({"format": "openvrx-denoise-filter", "version": 2, "radius": 0,
+                                      "offsets": [-2, -1, 0], "coef": [y, cb, cr]})
+        .to_string();
+        let f = DenoiseFilter::from_json(&json).unwrap();
+        assert_eq!((f.before(), f.after()), (2, 0));
+        let old = Planes::from_rgba8(1, 1, &[0, 0, 0, 255]);
+        let new = Planes::from_rgba8(1, 1, &[200, 50, 10, 255]);
+        assert_eq!(f.apply(&[&old, &old, &new]).to_rgb8(), vec![200, 50, 10]);
+        let bad = json.replace("[-2,-1,0]", "[-2,0]");
+        assert!(DenoiseFilter::from_json(&bad).is_err());
     }
 
     #[test]
