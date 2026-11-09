@@ -134,6 +134,9 @@ pub trait FrameSource: Send {
     /// Lines that may accumulate before the source wakes the display
     /// (field and frame ends always wake). 0 wakes on every update.
     fn set_wake_lines(&mut self, lines: u32);
+    /// Keep the last complete fields for the live filter (see
+    /// [`FrameExchange::set_history`]); sources without history ignore it.
+    fn set_history(&mut self, _on: bool) {}
 }
 
 /// A value shared between a producer thread and the display, with a
@@ -218,6 +221,9 @@ impl FrameSource for ExchangeSource {
     }
     fn set_wake_lines(&mut self, lines: u32) {
         self.exchange.set_wake_lines(lines);
+    }
+    fn set_history(&mut self, on: bool) {
+        self.exchange.set_history(on);
     }
 }
 

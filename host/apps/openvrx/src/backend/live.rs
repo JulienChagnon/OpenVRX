@@ -101,7 +101,7 @@ pub fn dsp_config(r: &ReceiverSettings, standard: Option<VideoStandard>) -> RxDs
 
 /// Video pipeline configuration for the app's video settings.
 pub fn video_config(v: &VideoSettings, standard: VideoStandard) -> VideoConfig {
-    let mut cfg = VideoConfig::preset(v.effective_preset().name(), standard)
+    let mut cfg = VideoConfig::preset(v.effective_preset().pipeline_name(), standard)
         .unwrap_or_else(|| VideoConfig::raw(standard));
     cfg.combiner.mode = match v.diversity {
         DiversityMode::Select => CombineMode::Select,

@@ -90,6 +90,8 @@ pub struct OpenvrxApp {
     compare_saved: Option<(ViewLayout, ViewSource)>,
     /// Bench control on stdin (`--bench-control`): lines in, messages out.
     bench_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Live learned filter as loaded: (on, steady OSD variant).
+    live_filter_applied: Option<(bool, bool)>,
 }
 
 impl OpenvrxApp {
@@ -152,7 +154,44 @@ impl OpenvrxApp {
             compare_pattern: TestPattern::BenchCard,
             compare_saved: None,
             bench_rx: None,
+            live_filter_applied: None,
         })
+    }
+
+    /// The "learned" preset: loads the live filter matching the steady OSD
+    /// setting (the field geometry it was fitted on) and switches the field
+    /// history and the GPU pass on for the shown views, off otherwise.
+    fn apply_live_filter(&mut self) {
+        let on = self.settings.video.effective_preset().gpu_filter();
+        let steady = self.settings.video.steady_osd;
+        if self.live_filter_applied != Some((on, steady)) {
+            let text = if steady {
+                crate::live_filter::FILTER_STEADY
+            } else {
+                crate::live_filter::FILTER_FIELDS
+            };
+            let filter = if on {
+                match crate::live_filter::LiveFilter::from_json(text) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        self.note(format!("learned filter not loaded: {e}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            self.gpu.set_filter(filter.as_ref());
+            self.live_filter_applied = Some((on, steady));
+        }
+        let n = self.settings.display.layout.count();
+        for (k, v) in self.views.iter_mut().enumerate() {
+            let use_it = on && k < n;
+            if let Some(src) = v.source.as_mut() {
+                src.set_history(use_it);
+            }
+            self.gpu.set_view_filter(k, use_it);
+        }
     }
 
     /// Side by side: view 1 stays the live picture, view 2 shows the bench
@@ -612,6 +651,7 @@ impl eframe::App for OpenvrxApp {
         let now = now_ns();
         self.pump_bench(&ctx);
         self.pump_backend();
+        self.apply_live_filter();
         self.poll_sources(now);
         if self.scheduler.due(now) {
             self.upload_pending();

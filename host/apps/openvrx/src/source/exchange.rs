@@ -134,6 +134,25 @@ pub struct UploadStaging {
     pub row_source: Vec<u8>,
     /// Rows to upload (coalesced, ascending).
     pub ranges: Vec<Range<u32>>,
+    /// With field history on (the live filter): the last complete fields,
+    /// slot = field number % HISTORY, and per row 1 when it already holds
+    /// the field in progress (0: still the previous field).
+    pub history: [HistoryField; HISTORY],
+    /// Complete fields so far (the newest is number history_count - 1).
+    pub history_count: u64,
+    /// Field numbers copied into `history` by the last take, oldest first.
+    pub history_new: Vec<u64>,
+    pub row_new: Vec<u8>,
+}
+
+/// Complete fields kept for the live filter (it reads k-3 .. k-1).
+pub const HISTORY: usize = 3;
+
+/// One complete field (planes as in [`UploadStaging`]).
+#[derive(Clone, Debug, Default)]
+pub struct HistoryField {
+    pub y: Vec<f16>,
+    pub uv: Vec<f16>,
 }
 
 impl UploadStaging {
@@ -175,6 +194,11 @@ struct Shared {
     field_seq: u64,
     frame_seq: u64,
     standard: Option<VideoStandard>,
+    /// Field history for the live filter (off: none of the below is kept).
+    history_on: bool,
+    history: [HistoryField; HISTORY],
+    history_count: u64,
+    row_new: Vec<u8>,
 }
 
 /// Shared frame with dirty-row tracking.
@@ -199,6 +223,20 @@ impl FrameExchange {
 
     pub fn set_waker(&self, waker: Waker) {
         *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+    }
+
+    /// Keeps the last complete fields and the per-row field flags (the
+    /// live filter's inputs): about 2 MB copied per field, so only when a
+    /// view uses them. Switching it on starts the history afresh.
+    pub fn set_history(&self, on: bool) {
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if s.history_on != on {
+            s.history_on = on;
+            s.history_count = 0;
+            let h = s.height;
+            s.row_new.clear();
+            s.row_new.resize(h, 0);
+        }
     }
 
     fn wake(&self) {
@@ -241,6 +279,24 @@ impl FrameExchange {
             staging.uv[2 * a * w..2 * b * w].copy_from_slice(&shared.uv[2 * a * w..2 * b * w]);
             staging.damage[a * w..b * w].copy_from_slice(&shared.damage[a * w..b * w]);
             staging.row_source[a..b].copy_from_slice(&shared.row_source[a..b]);
+        }
+        staging.history_new.clear();
+        if shared.history_on {
+            // Fields completed since the last take (at most HISTORY: older
+            // ones are gone), then the row flags.
+            if resized || staging.history_count > shared.history_count {
+                staging.history_count = 0;
+            }
+            let first = staging.history_count.max(shared.history_count.saturating_sub(HISTORY as u64));
+            for n in first..shared.history_count {
+                let slot = (n % HISTORY as u64) as usize;
+                let (src, dst) = (&shared.history[slot], &mut staging.history[slot]);
+                dst.y.clone_from(&src.y);
+                dst.uv.clone_from(&src.uv);
+                staging.history_new.push(n);
+            }
+            staging.history_count = shared.history_count;
+            staging.row_new.clone_from(&shared.row_new);
         }
         let info = UpdateInfo {
             width: shared.width,
@@ -309,6 +365,9 @@ impl FrameProducer {
                 s.row_source.resize(h, COMBINED);
                 s.dirty.resize(h);
                 s.resized = true;
+                s.history_count = 0;
+                s.row_new.clear();
+                s.row_new.resize(h, 0);
             }
             s.y[a * w..b * w].copy_from_slice(&self.y);
             s.uv[2 * a * w..2 * b * w].copy_from_slice(&self.uv);
@@ -322,6 +381,19 @@ impl FrameProducer {
             s.lines = s.lines.saturating_add(update.lines);
             if update.field_done {
                 s.fields += 1;
+            }
+            if s.history_on {
+                // These rows now hold the field in progress; at its last
+                // line the whole picture is that field: keep it.
+                s.row_new[a..b].fill(1);
+                if update.field_done {
+                    let slot = (s.history_count % HISTORY as u64) as usize;
+                    let sh = &mut *s;
+                    sh.history[slot].y.clone_from(&sh.y);
+                    sh.history[slot].uv.clone_from(&sh.uv);
+                    sh.history_count += 1;
+                    sh.row_new.fill(0);
+                }
             }
             if update.frame_done {
                 s.frames += 1;
@@ -512,6 +584,50 @@ mod tests {
         assert_eq!((st.width, st.height), (10, 4));
         assert_eq!(st.ranges, vec![0..4]);
         assert_eq!(st.y.len(), 40);
+    }
+
+    #[test]
+    fn history_keeps_complete_fields_and_row_flags() {
+        let ex = FrameExchange::new();
+        let mut p = ex.producer();
+        let mut st = UploadStaging::default();
+        let up = |rows: Range<usize>, field_done: bool| RowUpdate {
+            rows,
+            lines: 1,
+            field_done,
+            frame_done: false,
+            newest_line_ns: 0,
+        };
+        p.publish(&frame(4, 4, 0.0), up(0..4, true)); // sizes the exchange
+        ex.set_history(true);
+        let _ = ex.take(&mut st);
+        // Fields 0, 1, 2 (values 0.1, 0.2, 0.3), each in two halves.
+        for (n, val) in [0.1f32, 0.2, 0.3].iter().enumerate() {
+            p.publish(&frame(4, 4, *val), up(0..2, false));
+            p.publish(&frame(4, 4, *val), up(2..4, true));
+            if n == 0 {
+                let _ = ex.take(&mut st);
+                assert_eq!(st.history_new, vec![0]);
+            }
+        }
+        // Half of field 3 (0.4).
+        p.publish(&frame(4, 4, 0.4), up(0..2, false));
+        let _ = ex.take(&mut st).unwrap();
+        assert_eq!(st.history_new, vec![1, 2]);
+        assert_eq!(st.history_count, 3);
+        for (n, val) in [(0usize, 0.1f32), (1, 0.2), (2, 0.3)] {
+            let v = st.history[n % HISTORY].y[5].to_f32();
+            assert!((v - val).abs() < 1e-3, "field {n}: {v}");
+        }
+        assert_eq!(st.row_new, vec![1, 1, 0, 0]);
+        // More fields than slots between takes: only the newest HISTORY come.
+        for val in [0.5f32, 0.6, 0.7, 0.8] {
+            p.publish(&frame(4, 4, val), up(0..4, true));
+        }
+        let _ = ex.take(&mut st).unwrap();
+        assert_eq!(st.history_new, vec![4, 5, 6]);
+        assert!((st.history[6 % HISTORY].y[0].to_f32() - 0.8).abs() < 1e-3);
+        assert_eq!(st.row_new, vec![0, 0, 0, 0]);
     }
 
     #[test]

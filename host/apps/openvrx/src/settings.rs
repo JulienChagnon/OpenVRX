@@ -397,23 +397,42 @@ pub enum VideoPreset {
     Balanced,
     /// 3D comb / transform, motion-compensated denoise (past only).
     Quality,
+    /// Raw pipeline, then the learned linear filter on the GPU
+    /// (`live_filter.rs`): causal, no added latency.
+    Learned,
 }
 
 impl VideoPreset {
-    pub const ALL: [VideoPreset; 4] = [
+    pub const ALL: [VideoPreset; 5] = [
         VideoPreset::Raw,
         VideoPreset::LowLatency,
         VideoPreset::Balanced,
         VideoPreset::Quality,
+        VideoPreset::Learned,
     ];
-    /// Name used by `openvrx_video::VideoConfig::preset`.
+    /// Name shown and saved.
     pub fn name(self) -> &'static str {
         match self {
             VideoPreset::Raw => "raw",
             VideoPreset::LowLatency => "low_latency",
             VideoPreset::Balanced => "balanced",
             VideoPreset::Quality => "quality",
+            VideoPreset::Learned => "learned",
         }
+    }
+
+    /// Name of the `openvrx_video::VideoConfig::preset` it runs: the
+    /// learned filter was fitted on the raw pipeline's pictures.
+    pub fn pipeline_name(self) -> &'static str {
+        match self {
+            VideoPreset::Learned => "raw",
+            p => p.name(),
+        }
+    }
+
+    /// The live learned filter runs on the GPU after the pipeline.
+    pub fn gpu_filter(self) -> bool {
+        self == VideoPreset::Learned
     }
 }
 
@@ -1142,7 +1161,7 @@ mod tests {
         v.preset = VideoPreset::Raw;
         assert!(!v.cleanup_active());
         for p in VideoPreset::ALL {
-            let cfg = openvrx_video::VideoConfig::preset(p.name(), VideoStandard::Ntsc);
+            let cfg = openvrx_video::VideoConfig::preset(p.pipeline_name(), VideoStandard::Ntsc);
             assert!(cfg.is_some(), "{}", p.name());
         }
     }

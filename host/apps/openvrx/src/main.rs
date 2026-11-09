@@ -9,6 +9,7 @@ mod commands;
 mod gpu;
 mod keys;
 mod layout;
+mod live_filter;
 mod osd;
 mod panels;
 mod present;

@@ -56,6 +56,15 @@ its own power with the settings it saved, so tell the app what those are:
 The side panels (Tab) are the menu. In FX2-only mode the channel and gain
 controls there do nothing; change them on the C5 (below).
 
+Video presets (Tab, video): `raw` (demodulation, sync and bob only),
+`low_latency` (the default: comb filter, repair, edge-directed
+deinterlace), `balanced` (plus a light temporal denoise), `quality` (3D comb,
+motion-compensated denoise) and `learned`: the raw picture through the
+learned denoise filter on the GPU, the live version of the one `openvrx-cli
+render` uses. It reads only the current and the two previous fields, so it
+adds no delay; the app picks the filter that matches the steady OSD setting
+(I). Space still switches all cleanup off.
+
 ## The C5 radio head (`tools/c5cmd.py`, `tools/flash.py`)
 
 Plug the C5's USB-C into the PC (it shows as a COM port, COM9 here). Use
@@ -92,8 +101,7 @@ every plug-in.
 | `fx2_diag.exe --live` | pin levels every 0.5 s for 60 s, for re-seating wires |
 | `fx2_diag.exe --find-ifclk` | finds the IFCLK header pin (jumper it to PD1) |
 
-Wiring tables: `docs/HARDWARE.md`. Board pinouts: `docs/PINOUTS.md`. Test
-results so far: `docs/testing/README.md`.
+Wiring tables: `docs/HARDWARE.md`. Board pinouts: `docs/PINOUTS.md`.
 
 ## Offline and bench tools (`openvrx-cli`)
 
