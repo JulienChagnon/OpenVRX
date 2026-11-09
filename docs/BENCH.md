@@ -275,8 +275,8 @@ replays one frame, so relay presses never disturb it.
 The P25 pattern has no colour and little detail, and the strongest sweep
 step still carries receiver noise. The camera's own analog signal, taken
 off its video wire before the VTX, is the picture the receiver should
-reproduce: the first real reference for the post-flight denoise
-(IMPROVEMENTS.md DSP-7) and its training data.
+reproduce: the first real reference for the post-flight denoise and its
+training data.
 
 Wiring: in parallel with the VTX input, nothing cut. The MS2107's yellow
 RCA input takes the video on its centre pin and ground on its outer ring;

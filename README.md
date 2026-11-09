@@ -20,8 +20,7 @@ community Discord invite.
 Early but working on real hardware: a Seeed XIAO ESP32-C5 wired to an FX2
 board with the 4-bit 4x4top lane layout streams 26.67 MS/s over USB and the
 host decodes a sharp NTSC picture from a real quad. Multi-receiver diversity,
-the other lane layouts and the HD3 path still need bench time. Test results
-are kept in [docs/testing/README.md](docs/testing/README.md).
+the other lane layouts and the HD3 path still need bench time.
 
 ## Layout
 

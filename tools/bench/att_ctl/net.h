@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // OpenVRX bench: the att_ctl console over Wi-Fi as well as USB, so the ESP32
 // can run from a power bank with no cable to the PC (a USB cable joins the
-// VTX ground to the PC and the receiver: a leak path, docs/bench-logs BENCH-7).
+// VTX ground to the PC and the receiver: a leak path).
 //
 // TCP port 2323, one client at a time, the same line commands as USB
 // (pyserial: socket://openvrx-bench.local:2323). Wi-Fi settings live only in
