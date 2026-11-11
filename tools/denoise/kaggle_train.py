@@ -10,7 +10,7 @@ job's output, which `fetch` downloads.
 
     kaggle_train.py upload --dataset USER/SLUG --dir DIR
     kaggle_train.py push   --kernel USER/SLUG --dataset USER/SLUG --out MODEL.pt \\
-                           [--accelerator NvidiaTeslaT4] -- TRAIN ARGS...
+                           [--accelerator NvidiaTeslaT4] [--script enhance_cnn.py] -- TRAIN ARGS...
     kaggle_train.py status --kernel USER/SLUG
     kaggle_train.py fetch  --kernel USER/SLUG --to DIR [--wait]
 
@@ -18,7 +18,8 @@ upload: DIR holds the .npz files (dataset-metadata.json is written if
 missing); a dataset that exists gets a new version. A MODEL.pt.ckpt in DIR
 goes up too and the job copies it next to its output, so `-- ... --resume`
 continues a training that a job did not finish. push: TRAIN ARGS are
-denoise_cnn.py train arguments except --out; {data} in them is replaced by
+train arguments of --script (denoise_cnn.py, the default, or
+enhance_cnn.py) except --out; {data} in them is replaced by
 the dataset's folder on Kaggle (for example --train {data}/train.npz). The
 job stops at once if Kaggle gave it no GPU (an account without phone
 verification, or a missing --accelerator: with the Kaggle CLI 2.x,
@@ -39,13 +40,16 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCES = ("denoise_cnn.py", "denoise_filter.py")
+SOURCES = ("denoise_cnn.py", "denoise_filter.py", "enhance_cnn.py")
+# Any *_cnn.py model script beside this file can be trained; the chosen one is embedded with SOURCES.
+SCRIPTS = tuple(sorted(n for n in os.listdir(HERE) if n.endswith("_cnn.py")))
 
 RUN = r'''
 import base64, glob, os, subprocess, sys, time
 SRC = __SRC__
 ARGS = __ARGS__
 OUT = __OUT__
+SCRIPT = __SCRIPT__
 os.makedirs("/kaggle/working/src", exist_ok=True)
 for name, b in SRC.items():
     open(f"/kaggle/working/src/{name}", "wb").write(base64.b64decode(b))
@@ -65,7 +69,7 @@ for c in glob.glob(f"/kaggle/input/**/{OUT}.ckpt", recursive=True):
     shutil.copy(c, f"/kaggle/working/{OUT}.ckpt")
     print("checkpoint from the dataset:", c, flush=True)
     break
-cmd = [sys.executable, "/kaggle/working/src/denoise_cnn.py", "train", *args, "--out", f"/kaggle/working/{OUT}"]
+cmd = [sys.executable, f"/kaggle/working/src/{SCRIPT}", "train", *args, "--out", f"/kaggle/working/{OUT}"]
 print("$", " ".join(cmd), flush=True)
 with open("/kaggle/working/train.log", "w") as log:
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -94,20 +98,36 @@ def cmd_upload(a):
         print(kaggle("datasets", "version", "-p", a.dir, "-m", a.message or "new crops"))
     else:
         print(kaggle("datasets", "create", "-p", a.dir))  # private unless --public is passed
-    for _ in range(30):
+    # Right after `datasets version`, `datasets status` still reports the previous version as ready,
+    # so "ready" alone let a push start on the old files. Wait until the published file list holds
+    # every local data file at its local size.
+    want = {n: os.path.getsize(os.path.join(a.dir, n)) for n in os.listdir(a.dir)
+            if n != "dataset-metadata.json" and os.path.isfile(os.path.join(a.dir, n))}
+    for _ in range(90):
         if "ready" in kaggle("datasets", "status", a.dataset, check=False).lower():
-            print(f"{a.dataset} ready (private)")
-            return
-        time.sleep(10)
-    print(f"{a.dataset} still processing: check `kaggle datasets status {a.dataset}` before push")
+            listing = kaggle("datasets", "files", a.dataset, check=False)
+            have = {}
+            for line in listing.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    have[parts[0]] = int(parts[1])
+            missing = [n for n, size in want.items() if have.get(n) != size]
+            if not missing:
+                print(f"{a.dataset} ready (private), all {len(want)} files published")
+                return
+        time.sleep(20)
+    print(f"{a.dataset} still processing or files missing: check `kaggle datasets files {a.dataset}` before push")
+    sys.exit(1)
 
 
 def cmd_push(a):
     if any(x == "--out" for x in a.train):
         sys.exit("leave --out out of the train arguments: use push --out")
-    src = {n: base64.b64encode(open(os.path.join(HERE, n), "rb").read()).decode() for n in SOURCES}
+    src = {n: base64.b64encode(open(os.path.join(HERE, n), "rb").read()).decode()
+           for n in sorted(set(SOURCES) | {a.script})}
     with tempfile.TemporaryDirectory() as d:
-        code = RUN.replace("__SRC__", repr(src)).replace("__ARGS__", repr(a.train)).replace("__OUT__", repr(a.out))
+        code = (RUN.replace("__SRC__", repr(src)).replace("__ARGS__", repr(a.train)).replace("__OUT__", repr(a.out))
+                .replace("__SCRIPT__", repr(a.script)))
         open(os.path.join(d, "run.py"), "w").write(code)
         meta = {"id": a.kernel, "title": a.kernel.split("/")[1], "code_file": "run.py", "language": "python",
                 "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": False,
@@ -157,6 +177,7 @@ def main():
     p.add_argument("--dataset", required=True, help="USER/SLUG of the crops")
     p.add_argument("--out", required=True, help="model file name in the job output")
     p.add_argument("--accelerator", default="NvidiaTeslaT4")
+    p.add_argument("--script", default="denoise_cnn.py", choices=SCRIPTS, help="which model's train runs")
     p.add_argument("train", nargs=argparse.REMAINDER, help="-- then denoise_cnn.py train arguments")
     s = sub.add_parser("status")
     s.add_argument("--kernel", required=True)

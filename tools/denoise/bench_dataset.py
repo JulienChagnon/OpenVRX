@@ -193,16 +193,28 @@ def small_luma(png, step=4):
 
 def find_pass(means, slate):
     """First field after the first complete slate (black, white, black of
-    `slate` fields each, from the per-field mean brightness), or None. The
-    white part is what is searched: the brightest stretch of at least half
-    its length, with dark fields before and after it."""
-    m = np.asarray(means)
-    lo, hi = np.percentile(m, 5), m.max()
+    `slate` fields each, from the per-field mean brightness), or None.
+
+    Black and white are judged against the darkest and brightest fields
+    (1st and 99.9th percentile: a dark clip can fill far more than 5 % of the
+    fields with near-black). Fields at the slate's edges can be part one
+    picture, part the next (the source is not frame-locked to the fields),
+    so the white part is a bright stretch with dips of up to 3 fields closed,
+    about `slate` long, mostly dark on both sides; its middle places the pass
+    start (white start + 2 slate parts), so an edge glitch cannot move it."""
+    m = np.asarray(means, dtype=float)
+    lo, hi = np.percentile(m, 1), np.percentile(m, 99.9)
     if hi - lo < 40:  # no slate visible (lost picture)
         return None
-    white = m > lo + 0.75 * (hi - lo)
-    dark = m < lo + 0.25 * (hi - lo)
-    i, n = 0, len(m)
+    white = m > lo + 0.6 * (hi - lo)
+    dark = m < lo + 0.3 * (hi - lo)
+    n = len(m)
+    # Close short dips inside bright stretches.
+    idx = np.flatnonzero(white)
+    for a, b in zip(idx[:-1], idx[1:]):
+        if 1 < b - a <= 4:
+            white[a:b] = True
+    i = 0
     while i < n:
         if not white[i]:
             i += 1
@@ -210,14 +222,13 @@ def find_pass(means, slate):
         j = i
         while j < n and white[j]:
             j += 1
-        before = dark[max(0, i - slate // 2):i]
-        after = dark[j:j + slate // 2]
-        if j - i >= slate // 2 and len(before) and before.all() and len(after) == slate // 2 and after.all():
-            # Skip the black that follows the white.
-            k = j
-            while k < n and dark[k]:
-                k += 1
-            return k if k < n else None
+        length = j - i
+        before = dark[max(0, i - slate):i]
+        after = dark[j:j + slate]
+        if (abs(length - slate) <= max(2, slate // 5) and len(before) >= slate // 2 and before.mean() >= 0.6
+                and len(after) == slate and after.mean() >= 0.6):
+            start = int(round((i + j - 1) / 2 - (slate - 1) / 2)) + 2 * slate
+            return start if start < n else None
         i = j
     return None
 
