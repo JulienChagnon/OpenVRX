@@ -38,6 +38,11 @@ pub enum EventKind {
     Fx2Status(Map<String, Value>),
     /// Data lost on the way (USB overflow, dropped transfers).
     UsbGap { lost_bytes: u64, reason: String },
+    /// The FX2 FIFO was full at the pins since the last status block: samples
+    /// the C5 sent were dropped there and are missing from the file without a
+    /// position jump. `polls` counts the firmware loop's polls that found it
+    /// full (0.83 us each, so about polls x 0.83 us of samples lost).
+    FifoFull { polls: u64 },
     /// Every 64th bulk completion, for latency analysis.
     Transfer { bytes: u64 },
     /// User marker.
@@ -58,6 +63,7 @@ enum Known {
     Slip { count: u32 },
     Probe { score: f64, verdict: ProbeVerdict },
     UsbGap { lost_bytes: u64, reason: String },
+    FifoFull { polls: u64 },
     Transfer { bytes: u64 },
     Marker { text: String },
     C5 { line: String },
@@ -74,6 +80,7 @@ impl EventKind {
             EventKind::Probe { .. } => "probe",
             EventKind::Fx2Status(_) => "fx2_status",
             EventKind::UsbGap { .. } => "usb_gap",
+            EventKind::FifoFull { .. } => "fifo_full",
             EventKind::Transfer { .. } => "transfer",
             EventKind::Marker { .. } => "marker",
             EventKind::C5 { .. } => "c5",
@@ -89,6 +96,7 @@ impl EventKind {
             EventKind::Slip { count } => Known::Slip { count },
             EventKind::Probe { score, verdict } => Known::Probe { score, verdict },
             EventKind::UsbGap { lost_bytes, reason } => Known::UsbGap { lost_bytes, reason },
+            EventKind::FifoFull { polls } => Known::FifoFull { polls },
             EventKind::Transfer { bytes } => Known::Transfer { bytes },
             EventKind::Marker { text } => Known::Marker { text },
             EventKind::C5 { line } => Known::C5 { line },
@@ -104,6 +112,7 @@ impl EventKind {
             Known::Slip { count } => EventKind::Slip { count },
             Known::Probe { score, verdict } => EventKind::Probe { score, verdict },
             Known::UsbGap { lost_bytes, reason } => EventKind::UsbGap { lost_bytes, reason },
+            Known::FifoFull { polls } => EventKind::FifoFull { polls },
             Known::Transfer { bytes } => EventKind::Transfer { bytes },
             Known::Marker { text } => EventKind::Marker { text },
             Known::C5 { line } => EventKind::C5 { line },
@@ -217,7 +226,7 @@ impl Event {
                 m.remove("kind");
                 EventKind::Fx2Status(m)
             }
-            "gain" | "tune" | "clk" | "slip" | "probe" | "usb_gap" | "transfer" | "marker"
+            "gain" | "tune" | "clk" | "slip" | "probe" | "usb_gap" | "fifo_full" | "transfer" | "marker"
             | "c5" => {
                 let known: Known = serde_json::from_value(Value::Object(m))
                     .map_err(|e| format!("{kind_name}: {e}"))?;
@@ -333,6 +342,7 @@ mod tests {
                 lost_bytes: 1024,
                 reason: "overflow".into(),
             },
+            EventKind::FifoFull { polls: 115 },
             EventKind::Transfer { bytes: 16384 },
             EventKind::Marker { text: "lap 2".into() },
             EventKind::C5 {
@@ -389,7 +399,7 @@ mod tests {
         assert_eq!(log.events.len(), all_kinds().len());
         assert_eq!(log.skipped.len(), 1);
         assert_eq!(log.counts()["gain"], 1);
-        assert_eq!(log.for_rx(1).count(), 7);
+        assert_eq!(log.for_rx(1).count(), 8);
     }
 
     #[test]
