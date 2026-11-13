@@ -3,11 +3,17 @@
 //!
 //! ```text
 //! openvrx-cli inspect REC [OUT_DIR]           lane activity, I/Q histograms, a sync-free FM strip image
-//! openvrx-cli decode  REC [OUT_DIR] [FRAMES] [--steady-osd] [--damage DIR]
+//! openvrx-cli decode  REC [OUT_DIR] [FRAMES] [--steady-osd] [--damage DIR] [--side DIR [--side-only]]
 //!                                             frames through the live DSP and video chain (raw preset;
 //!                                             --steady-osd: line-doubled fields as in the app's default;
 //!                                             --damage: each frame's damage mask as a grey PNG of the
-//!                                             same name in DIR, for the denoise models)
+//!                                             same name in DIR, for the denoise models;
+//!                                             --side: what the receiver knew about each pixel and row,
+//!                                             in DIR: the I/Q envelope as a grey PNG per frame (same
+//!                                             name and geometry as the picture), rows.f32 (per frame
+//!                                             row: C/N, noise, sync score, timing error, clicks, line
+//!                                             flags) and side.json describing both; with --side-only
+//!                                             no pictures or masks are written, only DIR)
 //! openvrx-cli decode  REC OUT_DIR FRAMES --live [--preset NAME] [--no-steady-osd]
 //!                                             the app's live video path instead: preset (default
 //!                                             low_latency), streaming, every line through the combiner
@@ -75,6 +81,8 @@ fn main() {
             args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8),
             args.iter().any(|a| a == "--steady-osd"),
             opt(&args, "--damage").map(PathBuf::from),
+            opt(&args, "--side").map(PathBuf::from),
+            args.iter().any(|a| a == "--side-only"),
         ),
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
@@ -258,11 +266,241 @@ fn walk_frames(
     Ok((total_lines, dsp.stats()))
 }
 
-fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool, damage: Option<PathBuf>) -> Result<(), String> {
+/// Envelope range of the `decode --side` plane: dB relative to the mean
+/// |z| of the line, mapped linearly onto grey 0..255 (after the IRE trip
+/// through the video chain, see `walk_frames_side`).
+const SIDE_ENV_DB: (f32, f32) = (-18.0, 6.0);
+/// IRE levels the envelope range is mapped to before the video chain, away
+/// from both ends so nothing clips on the way to 0..1 luma.
+const SIDE_ENV_IRE: (f32, f32) = (20.0, 80.0);
+/// Row features of `decode --side`, in file order (f32 each, per frame row).
+const SIDE_ROWS: [&str; 6] = ["cn_db", "noise_ire", "sync_score", "timing_err", "clicks", "flags"];
+
+/// Linear interpolation of `buf` at position `p` (None outside it).
+fn lerp_at(buf: &[f32], p: f64) -> Option<f32> {
+    if p < 0.0 {
+        return None;
+    }
+    let i = p as usize;
+    if i + 1 >= buf.len() {
+        return None;
+    }
+    let f = (p - i as f64) as f32;
+    Some(buf[i] + f * (buf[i + 1] - buf[i]))
+}
+
+/// `walk_frames` (polar demod, raw preset) that also hands over an envelope
+/// picture of each frame. The DSP's video tap gives |z| aligned with the
+/// video the sync stage saw; each line's envelope is resampled onto the
+/// line's own grid (`src_position`, `src_line_len`), written as dB against
+/// the line's mean into a copy of the line record, and sent through a second
+/// video pipeline of the same configuration. That pipeline crops and
+/// deinterlaces exactly like the picture's, so pixel (x, y) of the envelope
+/// frame is the envelope of pixel (x, y) of the picture, with no geometry
+/// duplicated here. Returns the lines, the DSP stats, the mean correlation
+/// between the resampled tap video and the line samples (a check of the
+/// alignment: near 1) and the share of envelope samples the tap did not hold.
+fn walk_frames_side(
+    rec: &Recording,
+    steady_osd: bool,
+    mut on_frame: impl FnMut(&Frame, &Frame) -> Result<bool, String>,
+) -> Result<(u64, RxStats, f64, f64), String> {
+    let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
+    let cfg = RxDspConfig {
+        sample_format: info.sample_format.clone(),
+        standard: None,
+        ..RxDspConfig::default()
+    };
+    let mut dsp = RxDsp::new(0, cfg);
+    dsp.set_demod_tap(Some(openvrx_dsp::TapPoint::Video));
+    let mut r = rec.raw_reader(0).map_err(|e| e.to_string())?;
+    let mut pipe: Option<(openvrx_core::VideoStandard, VideoPipeline, VideoPipeline)> = None;
+    let mut lines: Vec<LineRecord> = Vec::new();
+    let mut buf = vec![0u8; 1 << 18];
+    let mut total_lines = 0u64;
+    // Rolling copy of the tap: mag[i] and vid[i] belong to input sample first + i.
+    let (mut first, mut mag, mut vid) = (0u64, Vec::<f32>::new(), Vec::<f32>::new());
+    const KEEP: usize = 1 << 22;
+    let (mut corr_sum, mut corr_n) = (0.0f64, 0u64);
+    let (mut missing, mut wanted) = (0u64, 0u64);
+    let (lo_db, hi_db) = SIDE_ENV_DB;
+    let (lo_ire, hi_ire) = SIDE_ENV_IRE;
+    'read: loop {
+        let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        lines.clear();
+        dsp.push_bytes(&buf[..n], 0, &mut lines);
+        if let Some(ch) = dsp.demod_tap() {
+            if ch.first_sample != first + mag.len() as u64 {
+                first = ch.first_sample;
+                mag.clear();
+                vid.clear();
+            }
+            mag.extend_from_slice(&ch.mag);
+            vid.extend_from_slice(&ch.freq_hz);
+        }
+        for line in lines.drain(..) {
+            total_lines += 1;
+            let std = line.standard;
+            if pipe.as_ref().is_none_or(|(s, _, _)| *s != std) {
+                let mut cfg = VideoConfig::preset("raw", std).ok_or("unknown preset raw")?;
+                cfg.combiner.mode = openvrx_video::CombineMode::Blend;
+                cfg.emit_frames = true;
+                if steady_osd {
+                    cfg.deinterlace = DeinterlaceMethod::LineDouble;
+                }
+                pipe = Some((std, VideoPipeline::new(&cfg), VideoPipeline::new(&cfg)));
+            }
+            let Some((_, p, pe)) = pipe.as_mut() else { continue };
+            let spl = line.samples.len();
+            let step = line.src_line_len / spl as f64;
+            // Video sample j of the tap represents input time j - 0.5 (as src_position says).
+            let p0 = line.src_position + 0.5 - first as f64;
+            let mut env = line.clone();
+            let e: Vec<Option<f32>> = (0..spl).map(|j| lerp_at(&mag, p0 + j as f64 * step)).collect();
+            let have = e.iter().flatten().count();
+            wanted += spl as u64;
+            missing += (spl - have) as u64;
+            let mean = e.iter().flatten().map(|&v| v as f64).sum::<f64>() / have.max(1) as f64;
+            for (s, v) in env.samples.iter_mut().zip(&e) {
+                let db = match v {
+                    Some(v) if mean > 0.0 => 20.0 * ((*v as f64 / mean).max(1e-6)).log10() as f32,
+                    Some(_) => lo_db,
+                    None => 0.0,
+                };
+                *s = lo_ire + (db.clamp(lo_db, hi_db) - lo_db) / (hi_db - lo_db) * (hi_ire - lo_ire);
+            }
+            // Alignment check on every 16th line: the tap's video, resampled the same way, against
+            // the line the DSP made from it (correlation: the level and gain do not matter).
+            if total_lines % 16 == 0 && have == spl {
+                let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for (j, &y) in line.samples.iter().enumerate() {
+                    let x = lerp_at(&vid, p0 + j as f64 * step).unwrap_or(0.0) as f64;
+                    let y = y as f64;
+                    sx += x;
+                    sy += y;
+                    sxx += x * x;
+                    syy += y * y;
+                    sxy += x * y;
+                }
+                let nn = spl as f64;
+                let den = ((sxx - sx * sx / nn) * (syy - sy * sy / nn)).sqrt();
+                if den > 0.0 {
+                    corr_sum += (sxy - sx * sy / nn) / den;
+                    corr_n += 1;
+                }
+            }
+            // One receiver: bypass the combiner, whose waits run on host time.
+            let done = p.push_combined_line(&line).frames_completed;
+            let done_env = pe.push_combined_line(&env).frames_completed;
+            if done.len() != done_env.len() {
+                return Err("the envelope pipeline fell out of step with the picture's".into());
+            }
+            for (f, fe) in done.iter().zip(&done_env) {
+                if !on_frame(f, fe)? {
+                    break 'read;
+                }
+            }
+        }
+        if mag.len() > 2 * KEEP {
+            let cut = mag.len() - KEEP;
+            mag.drain(..cut);
+            vid.drain(..cut);
+            first += cut as u64;
+        }
+    }
+    let corr = if corr_n > 0 { corr_sum / corr_n as f64 } else { f64::NAN };
+    Ok((total_lines, dsp.stats(), corr, missing as f64 / wanted.max(1) as f64))
+}
+
+/// `decode --side DIR`: pictures (and masks) as `decode` writes them, plus the
+/// side data in DIR (see the file header). `out` None (`--side-only`): the
+/// side data alone, for recordings whose pictures are already decoded.
+fn decode_side(
+    rec: &Recording,
+    out: Option<&Path>,
+    frames: usize,
+    steady_osd: bool,
+    damage: Option<PathBuf>,
+    side: &Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    std::fs::create_dir_all(side).map_err(|e| e.to_string())?;
+    let mut rows = std::io::BufWriter::new(std::fs::File::create(side.join("rows.f32")).map_err(|e| e.to_string())?);
+    let mut saved = 0;
+    let mut height = 0;
+    let (lo_ire, hi_ire) = SIDE_ENV_IRE;
+    let (total_lines, stats, corr, missing) = walk_frames_side(rec, steady_osd, |f, fe| {
+        if saved >= frames {
+            return Ok(false);
+        }
+        if (fe.width, fe.height) != (f.width, f.height) {
+            return Err("envelope frame size differs from the picture's".into());
+        }
+        let name = format!("{}-frame{saved:02}.png", rec.name());
+        if let Some(out) = out {
+            let img = image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba8()).ok_or("frame size")?;
+            img.save(out.join(&name)).map_err(|e| e.to_string())?;
+            if let Some(d) = &damage {
+                let m = image::GrayImage::from_raw(f.width as u32, f.height as u32, f.damage.clone()).ok_or("damage size")?;
+                m.save(d.join(&name)).map_err(|e| e.to_string())?;
+            }
+        }
+        // Luma 0..1 is IRE / 100: back to 0..255 over the envelope's IRE span.
+        let env: Vec<u8> = fe
+            .y
+            .iter()
+            .map(|&y| ((y * 100.0 - lo_ire) / (hi_ire - lo_ire) * 255.0).round().clamp(0.0, 255.0) as u8)
+            .collect();
+        let e = image::GrayImage::from_raw(f.width as u32, f.height as u32, env).ok_or("envelope size")?;
+        e.save(side.join(&name)).map_err(|e| e.to_string())?;
+        height = f.height;
+        for q in &f.row_quality {
+            for v in [q.cn_db, q.noise_ire, q.sync_score, q.timing_err, q.clicks as f32, q.flags.0 as f32] {
+                rows.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+        saved += 1;
+        Ok(saved < frames)
+    })?;
+    rows.flush().map_err(|e| e.to_string())?;
+    let (lo_db, hi_db) = SIDE_ENV_DB;
+    let meta = format!(
+        "{{\"format\":\"openvrx-side\",\"version\":1,\"frames\":{saved},\"height\":{height},\
+         \"rows_file\":\"rows.f32\",\"rows_dtype\":\"<f4\",\"row_features\":{:?},\
+         \"flags\":{{\"FLYWHEEL\":1,\"CLIPPED\":2,\"NO_CARRIER\":4,\"GAIN_STEP\":8,\"SAMPLES_LOST\":16,\
+         \"REPAIRED\":32,\"VBI\":64,\"BURST_OK\":128,\"BLENDED\":256,\"RELOCK\":512}},\
+         \"envelope\":\"grey PNG per frame: 20*log10(|z| / mean |z| of the line), {lo_db} dB = 0 .. {hi_db} dB = 255\",\
+         \"envelope_db\":[{lo_db},{hi_db}],\"alignment_corr\":{corr:.4},\"envelope_missing\":{missing:.6}}}\n",
+        SIDE_ROWS
+    );
+    std::fs::write(side.join("side.json"), meta).map_err(|e| e.to_string())?;
+    println!("{saved} frames with side data in {}; alignment correlation {corr:.4}, envelope missing {:.4} %", side.display(), 100.0 * missing);
+    println!("{total_lines} lines from the DSP; stats: {stats:?}");
+    Ok(())
+}
+
+fn decode(
+    path: &str,
+    out: &Path,
+    frames: usize,
+    steady_osd: bool,
+    damage: Option<PathBuf>,
+    side: Option<PathBuf>,
+    side_only: bool,
+) -> Result<(), String> {
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
+    if let (Some(s), true) = (&side, side_only) {
+        return decode_side(&rec, None, frames, steady_osd, None, s);
+    }
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     if let Some(d) = &damage {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    if let Some(s) = &side {
+        return decode_side(&rec, Some(out), frames, steady_osd, damage, s);
     }
     let mut saved = 0;
     let (total_lines, stats) = walk_frames(&rec, steady_osd, openvrx_dsp::DemodKind::Polar, "raw", |f| {
