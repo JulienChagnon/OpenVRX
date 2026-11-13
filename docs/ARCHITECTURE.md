@@ -5,7 +5,6 @@ antenna -> ESP32-C5 (tuner, raw I/Q lanes + sample clock) -> FX2LP (USB 2.0) -> 
                                                                                 |
   capture (openvrx-hw) -> unpack/demod/TBC (openvrx-dsp) -> combine, colour, deinterlace,
   repair, denoise (openvrx-video) -> display (openvrx app) / record (openvrx-format)
-  offline: recordings or DVR files -> openvrx-restore ("doctor")
 ```
 
 ## Repository layout
@@ -28,13 +27,11 @@ antenna -> ESP32-C5 (tuner, raw I/Q lanes + sample clock) -> FX2LP (USB 2.0) -> 
 | `openvrx-sim` | Synthetic CVBS -> FM -> C5 channel -> noise/fading -> lanes, writes `.openvrx` with truth |
 | `openvrx-dsp` | Per-receiver DSP: unpack, DC, AFC, channel filter, FM demodulators, click repair, video filter, sync, time-base correction, quality, phase probe, pre-detection combining |
 | `openvrx-video` | Diversity combiner, field assembly, colour decode (NTSC/PAL, 1D/2D/3D comb), dropout repair, deinterlacers, temporal denoise, low-latency streaming pipeline |
-| `openvrx-restore` | Offline restoration of recordings and ordinary DVR video files: breakup detection, motion-compensated multi-frame rebuild, denoise, deflicker, bidirectional deinterlace |
 | `openvrx-hw` | FX2 discovery/upload/streaming (nusb, WinUSB), C5 serial control, phase calibration, lane self-test, gain/AFC loops, throughput bench |
 | `apps/openvrx` | Live receiver app (wgpu display, OSD, recording, controls) |
-| `apps/openvrx-cli` | Record, replay, decode to video, doctor, bench, probe, sim |
+| `apps/openvrx-cli` | Record, inspect, decode to frames, score and timeline of recordings |
 
-Dependencies point downward only: core <- format, sim, dsp, video, restore,
-hw <- apps.
+Dependencies point downward only: core <- format, sim, dsp, video, hw <- apps.
 
 ## Threads (live)
 
@@ -56,8 +53,8 @@ blocking capture.
 - The display never waits for a whole frame when a lower-latency mode is
   selected: the video pipeline updates rows as lines arrive and the display
   presents the newest rows (`present_every_lines`).
-- Live filters use past fields only. Bidirectional algorithms are offline
-  only (`openvrx-restore`, CLI decode with `--offline`).
+- Live filters use past fields only; nothing in the live path waits for a
+  later field.
 - Every stage stamps `clock::now_ns()`; the OSD shows capture-to-present
   latency.
 

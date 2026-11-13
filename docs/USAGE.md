@@ -59,9 +59,9 @@ controls there do nothing; change them on the C5 (below).
 Video presets (Tab, video): `raw` (demodulation, sync and bob only),
 `low_latency` (the default: comb filter, repair, edge-directed
 deinterlace), `balanced` (plus a light temporal denoise), `quality` (3D comb,
-motion-compensated denoise) and `learned`: the raw picture through the
-learned denoise filter on the GPU, the live version of the one `openvrx-cli
-render` uses. It reads only the current and the two previous fields, so it
+motion-compensated denoise) and `learned`: the raw picture through a
+learned denoise filter on the GPU. It reads only the current and the two
+previous fields, so it
 adds no delay; the app picks the filter that matches the steady OSD setting
 (I). Space still switches all cleanup off.
 

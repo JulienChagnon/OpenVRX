@@ -34,7 +34,6 @@ the other lane layouts and the HD3 path still need bench time.
 | `host/crates/openvrx-video` | diversity combiner, colour decoding, repair, deinterlacing, denoise |
 | `host/crates/openvrx-format` | recording format, reader, replay, rolling buffer |
 | `host/crates/openvrx-sim` | transmitter and channel simulator that writes recordings |
-| `host/crates/openvrx-restore` | offline repair of recordings and DVR files guided by damage masks |
 | `host/apps/openvrx` | the live receiver app (wgpu/egui) |
 | `host/apps/openvrx-cli` | offline tools: inspect and decode recordings |
 | `lab` | Python reference decoder and experiments |
