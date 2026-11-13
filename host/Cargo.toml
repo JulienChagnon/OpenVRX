@@ -6,7 +6,6 @@ members = [
     "crates/openvrx-sim",
     "crates/openvrx-dsp",
     "crates/openvrx-video",
-    "crates/openvrx-restore",
     "crates/openvrx-hw",
     "apps/openvrx",
     "apps/openvrx-cli",
