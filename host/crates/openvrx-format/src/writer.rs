@@ -53,9 +53,42 @@ struct RxStream {
     next_stream: u64,
     /// (stream byte where data resumed, total bytes lost before it).
     gaps: Vec<(u64, u64)>,
+    /// `written` when writeback was last started (see `start_writeback`).
+    kicked: u64,
 }
 
+/// Bytes between writeback kicks of a raw file.
+const WRITEBACK_EVERY: u64 = 8 << 20;
+
+/// Starts writeback of the file's dirty pages without waiting for it.
+/// Without this the kernel lets dirty data pile up to vm.dirty_ratio
+/// (hundreds of MB) and then blocks the writer while it flushes, which on a
+/// USB drive can outlast the stream's buffering even when the drive is far
+/// faster than the recording. Kicking every 8 MiB keeps the dirty data
+/// small, so nothing ever waits on a big flush.
+#[cfg(target_os = "linux")]
+fn start_writeback(f: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fd is open for the call; offset 0 and length 0 mean the
+    // whole file; SYNC_FILE_RANGE_WRITE only queues the writes.
+    unsafe {
+        libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_f: &File) {}
+
 impl RxStream {
+    /// Starts writeback every WRITEBACK_EVERY bytes (data still in the
+    /// BufWriter waits for the next kick).
+    fn maybe_kick(&mut self) {
+        if self.written - self.kicked >= WRITEBACK_EVERY {
+            self.kicked = self.written;
+            start_writeback(self.file.get_ref());
+        }
+    }
+
     fn lost_before(&self, stream_byte: u64) -> u64 {
         match self.gaps.partition_point(|&(s, _)| s <= stream_byte) {
             0 => 0,
@@ -168,6 +201,7 @@ impl RecordingWriter {
                 origin: None,
                 next_stream: 0,
                 gaps: Vec::new(),
+                kicked: 0,
             });
         }
         let events_path = paths.events();
@@ -220,6 +254,7 @@ impl RecordingWriter {
         let s = self.stream(rx)?;
         s.file.write_all(data).map_err(io_err(&s.path))?;
         s.written += data.len() as u64;
+        s.maybe_kick();
         if let Some(o) = s.origin {
             s.next_stream = s.next_stream.max(o) + data.len() as u64;
         }
@@ -256,6 +291,7 @@ impl RecordingWriter {
         let data = &block.data[skip as usize..];
         s.file.write_all(data).map_err(io_err(&s.path))?;
         s.written += data.len() as u64;
+        s.maybe_kick();
         s.next_stream += data.len() as u64;
         if let Some((at, lost)) = gap {
             self.log_event(&Event::new(
