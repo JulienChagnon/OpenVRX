@@ -20,6 +20,9 @@ sudo tee /etc/udev/rules.d/60-openvrx.rules >/dev/null <<'EOF'
 SUBSYSTEM=="usb", ATTR{idVendor}=="04b4", ATTR{idProduct}=="8613", MODE="0660", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="608c", MODE="0660", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0001", MODE="0660", TAG+="uaccess"
+# PM QoS for the FX2 stream: holding a 20 us request keeps idle C-states short
+# enough that the FX2's 2 KB FIFO cannot overflow while the PC idles.
+SUBSYSTEM=="misc", KERNEL=="cpu_dma_latency", TAG+="uaccess"
 EOF
 sudo udevadm control --reload-rules
 sudo udevadm trigger

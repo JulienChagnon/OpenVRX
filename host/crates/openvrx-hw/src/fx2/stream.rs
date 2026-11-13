@@ -552,6 +552,19 @@ impl<P: StreamPort> Engine<P> {
         } else {
             None
         };
+        // Keeps the CPU out of idle states that wake slower than the FX2
+        // FIFO lasts; without it the FIFO overflows at the pins
+        // while the PC idles, and those samples are lost.
+        let _dma_latency = match crate::power::DmaLatencyGuard::request(crate::power::FX2_DMA_LATENCY_US) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                log::warn!(
+                    "no PM QoS request on /dev/cpu_dma_latency ({e}): idle C-states may drop samples; \
+                     run tools/bench/setup-fedora.sh for the udev rule"
+                );
+                None
+            }
+        };
         let mut attempt: u32 = 0;
         let mut backoff = self.cfg.reconnect_min_ms;
         let mut gap_from: Option<(u64, String)> = None;

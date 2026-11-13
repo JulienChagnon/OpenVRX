@@ -189,6 +189,41 @@ impl SelectiveSuspend {
     }
 }
 
+/// Wake latency the FX2 stream asks for while it runs, in microseconds.
+/// The FX2 holds 4 x 512 bytes: 77 us at 26.7 MB/s, 51 us at 40 MB/s. Deep
+/// package C-states (intel_idle lists exit latencies of 85 to 200 us for C6
+/// to C8) can let that FIFO overflow while the PC idles.
+pub const FX2_DMA_LATENCY_US: i32 = 20;
+
+/// Linux PM QoS request on `/dev/cpu_dma_latency`: while the file stays
+/// open the kernel avoids idle states that wake slower than the request
+/// (the smallest open request wins; closing the file, also on a crash,
+/// drops it). The device is root-only by default; tools/bench/setup-fedora.sh
+/// adds a udev rule for the logged-in user. Elsewhere a no-op.
+pub struct DmaLatencyGuard {
+    #[cfg(target_os = "linux")]
+    _file: std::fs::File,
+}
+
+impl DmaLatencyGuard {
+    /// Holds a request of `us` microseconds until dropped.
+    pub fn request(us: i32) -> Result<DmaLatencyGuard> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).open("/dev/cpu_dma_latency")?;
+            // The binary form: one native-endian s32.
+            file.write_all(&us.to_ne_bytes())?;
+            Ok(DmaLatencyGuard { _file: file })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = us;
+            Ok(DmaLatencyGuard {})
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
