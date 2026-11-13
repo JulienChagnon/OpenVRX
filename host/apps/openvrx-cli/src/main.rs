@@ -780,7 +780,12 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
         gain,
         ..C5Settings::default()
     };
-    let cfg = ReceiverConfig::new(0, PortSelector::Name(String::new()), Fx2Selector::Only, settings.clone());
+    let mut cfg = ReceiverConfig::new(0, PortSelector::Name(String::new()), Fx2Selector::Only, settings.clone());
+    // This loop writes the file itself, so the block channel is the only
+    // buffer against a slow write: the default 64 blocks (78 ms at 26.7 MB/s)
+    // are shorter than the periodic flush stalls of a long recording to a USB
+    // drive. 512 blocks of 32 KB = 16 MB, about 600 ms.
+    cfg.block_capacity = 512;
     let receiver = Receiver::start_fx2_only(cfg).map_err(|e| format!("starting the FX2: {e}"))?;
 
     let mut info = ReceiverInfo::new(0, settings.sample_format());
@@ -795,11 +800,17 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     let mut bytes = 0u64;
     let mut blocks = 0u64;
+    let mut fifo_polls = 0u64;
+    // Reports from before the first block (stream start-up) say nothing about this file.
+    if let Some(s) = receiver.stream() {
+        let _ = s.events().try_iter().count();
+    }
     while bytes < want {
         match receiver.blocks().recv_timeout(Duration::from_millis(500)) {
             Ok(b) => {
                 bytes += writer.write_block(&b).map_err(|e| e.to_string())?;
                 blocks += 1;
+                fifo_polls += log_fifo_full(&receiver, &mut writer)?;
             }
             Err(_) if t0.elapsed() > Duration::from_secs(3) && bytes == 0 => {
                 return Err("no data from the FX2 in 3 s (C5 off, wrong wiring or IFCLK)".into());
@@ -811,6 +822,9 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
             break;
         }
     }
+    // The last status blocks of the run.
+    std::thread::sleep(Duration::from_millis(50));
+    fifo_polls += log_fifo_full(&receiver, &mut writer)?;
     drop(receiver);
     let path = writer.paths().sidecar();
     writer.close().map_err(|e| e.to_string())?;
@@ -820,7 +834,51 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
         bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
     );
+    if fifo_polls > 0 {
+        eprintln!(
+            "warning: FX2 FIFO full for {fifo_polls} polls (about {:.2} ms of samples lost at the pins)",
+            fifo_polls as f64 * FIFO_POLL_US / 1e3
+        );
+        if cfg!(target_os = "linux") && openvrx_hw::power::DmaLatencyGuard::request(1).is_err() {
+            eprintln!(
+                "         /dev/cpu_dma_latency is not writable, so idle C-states were allowed: \
+                 install the udev rule from tools/bench/setup-fedora.sh"
+            );
+        }
+    }
     Ok(())
+}
+
+/// One poll of the FX2's AUTOIN loop (firmware/fx2/src/hotloops.asm: 10
+/// cycles of 83.3 ns); a poll that finds the FIFO full stands for about this
+/// much of the C5's samples dropped at the pins.
+const FIFO_POLL_US: f64 = 0.833;
+
+/// Logs the FIFO-full reports the FX2 stream has queued as `fifo_full`
+/// events: a recording otherwise has no trace of samples lost at
+/// the pins, since no stream position jumps. Returns the polls logged.
+fn log_fifo_full(receiver: &Receiver, writer: &mut RecordingWriter) -> Result<u64, String> {
+    let Some(stream) = receiver.stream() else { return Ok(0) };
+    let mut polls = 0u64;
+    for ev in stream.events().try_iter() {
+        if let fx2::StreamEvent::FifoFull {
+            new_events,
+            byte,
+            host_ns,
+            ..
+        } = ev
+        {
+            let e = openvrx_format::Event::new(
+                Some(receiver.rx()),
+                host_ns,
+                Some(byte),
+                openvrx_format::EventKind::FifoFull { polls: new_events as u64 },
+            );
+            writer.log_stream_event(&e).map_err(|e| e.to_string())?;
+            polls += new_events as u64;
+        }
+    }
+    Ok(polls)
 }
 
 /// Luma planes, seconds read, lines and DSP statistics of a recording.
@@ -892,6 +950,7 @@ fn score(path: &str, args: &[String]) -> Result<(), String> {
     psnr.sort_by(|a, b| a.total_cmp(b));
     let median = psnr.get(psnr.len() / 2).copied();
     let duration = rec.duration_s();
+    let loss = data_loss(&rec);
     let fmt_opt = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.2}"));
     // Per-stage DSP cost (ns per input sample) by stage name.
     let stage_ns: Vec<String> = openvrx_dsp::STAGES
@@ -903,6 +962,7 @@ fn score(path: &str, args: &[String]) -> Result<(), String> {
         "{{\"rec\":\"{}\",\"seconds\":{duration:.2},\"lines\":{lines},\"line_rate_hz\":{:.1},\
          \"frames\":{},\"damaged\":{damaged:.4},\"lock\":\"{:?}\",\"cn_db\":{:.2},\"clip_pct\":{:.2},\
          \"power_db\":{:.2},\"psnr_median\":{},\"psnr_min\":{},\
+         \"usb_gaps\":{},\"usb_gap_ms\":{:.1},\"fifo_full_polls\":{},\"fifo_lost_ms\":{:.2},\
          \"demod\":\"{}\",\"ref_demod\":\"{}\",\"preset\":\"{preset}\",\"load\":{:.4},\"stage_ns\":{{{}}}}}",
         rec.name(),
         stats.line_rate_hz,
@@ -913,12 +973,42 @@ fn score(path: &str, args: &[String]) -> Result<(), String> {
         stats.power_db,
         fmt_opt(median),
         fmt_opt(psnr.first().copied()),
+        loss.gaps,
+        loss.gap_ms,
+        loss.fifo_polls,
+        loss.fifo_polls as f64 * FIFO_POLL_US / 1e3,
         stats.demod.name(),
         ref_demod.name(),
         stats.load,
         stage_ns.join(",")
     );
     Ok(())
+}
+
+/// Samples a recording is missing: `usb_gap` events (host drops, the file
+/// skips them) and `fifo_full` polls (dropped at the FX2 pins).
+struct DataLoss {
+    gaps: usize,
+    gap_ms: f64,
+    fifo_polls: u64,
+}
+
+fn data_loss(rec: &Recording) -> DataLoss {
+    let rate = rec.receiver(0).map(|i| i.byte_rate()).unwrap_or(0.0);
+    let mut d = DataLoss { gaps: 0, gap_ms: 0.0, fifo_polls: 0 };
+    for e in &rec.events().events {
+        match &e.kind {
+            openvrx_format::EventKind::UsbGap { lost_bytes, .. } => {
+                d.gaps += 1;
+                if rate > 0.0 {
+                    d.gap_ms += *lost_bytes as f64 / rate * 1e3;
+                }
+            }
+            openvrx_format::EventKind::FifoFull { polls } => d.fifo_polls += polls,
+            _ => {}
+        }
+    }
+    d
 }
 
 /// Health of a whole recording over time, one row per `--window` seconds
@@ -939,9 +1029,14 @@ fn timeline(path: &str, args: &[String]) -> Result<(), String> {
     let win_bytes = ((byte_rate * window) as usize).max(1);
 
     let mut gap_ms: BTreeMap<u64, f64> = BTreeMap::new();
+    // Estimated ms of samples dropped at the FX2 pins (fifo_full events).
+    let mut fifo_ms: BTreeMap<u64, f64> = BTreeMap::new();
     for e in &rec.events().events {
         if let (Some(byte), openvrx_format::EventKind::UsbGap { lost_bytes, .. }) = (e.byte, &e.kind) {
             *gap_ms.entry(byte / win_bytes as u64).or_default() += *lost_bytes as f64 / byte_rate * 1e3;
+        }
+        if let (Some(byte), openvrx_format::EventKind::FifoFull { polls }) = (e.byte, &e.kind) {
+            *fifo_ms.entry(byte / win_bytes as u64).or_default() += *polls as f64 * FIFO_POLL_US / 1e3;
         }
     }
 
@@ -958,7 +1053,7 @@ fn timeline(path: &str, args: &[String]) -> Result<(), String> {
     let mut lines: Vec<LineRecord> = Vec::new();
     let mut buf = vec![0u8; win_bytes.min(1 << 18)];
     let mut relocks_before = 0u64;
-    println!("    t_s  lock       cn_db  clip%  relocks  damaged%  frames  gap_ms");
+    println!("    t_s  lock       cn_db  clip%  relocks  damaged%  frames  gap_ms  fifo_ms");
     for w in 0u64.. {
         let (mut damaged, mut pixels, mut frames, mut left, mut eof) = (0u64, 0u64, 0u32, win_bytes, false);
         while left > 0 {
@@ -991,8 +1086,9 @@ fn timeline(path: &str, args: &[String]) -> Result<(), String> {
         let s = dsp.stats();
         let dmg = if pixels > 0 { format!("{:8.1}", 100.0 * damaged as f64 / pixels as f64) } else { "       -".into() };
         let gap = gap_ms.get(&w).map_or("      -".to_string(), |ms| format!("{ms:7.0}"));
+        let fifo = fifo_ms.get(&w).map_or("      -".to_string(), |ms| format!("{ms:7.2}"));
         println!(
-            "{:7.2}  {:<9}  {:5.1}  {:5.1}  {:7}  {dmg}  {frames:6}  {gap}",
+            "{:7.2}  {:<9}  {:5.1}  {:5.1}  {:7}  {dmg}  {frames:6}  {gap}  {fifo}",
             w as f64 * window,
             format!("{:?}", s.lock),
             s.cn_db,
