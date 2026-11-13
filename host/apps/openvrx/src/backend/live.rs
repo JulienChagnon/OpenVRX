@@ -28,7 +28,7 @@ use crate::source::{
 use openvrx_core::clock::now_ns;
 use openvrx_core::{LanePreset, LineRecord, RawBlock, RxId, VideoStandard};
 use openvrx_dsp::{RxDsp, RxDspConfig, RxEvent, RxStats};
-use openvrx_format::{ReceiverInfo, RecordingSource, RecordingWriter, Sidecar, WriterOptions};
+use openvrx_format::{Event, EventKind, ReceiverInfo, RecordingSource, RecordingWriter, Sidecar, WriterOptions};
 use openvrx_hw::c5::{find_c5_ports, C5Client, C5Event, C5Settings, ClientConfig, PortConnector, PortSelector};
 use openvrx_hw::control::{GainConfig, GainLoop, GainTable};
 use openvrx_hw::fx2::{self, list_fx2, Fx2Found, Fx2Kind, Fx2Selector, StreamStats};
@@ -214,10 +214,20 @@ enum DspCmd {
 /// Where a receiver's lines go: (view, sender, receivers of the view).
 type Routes = Mutex<Vec<(usize, crossbeam_channel::Sender<LineRecord>, Vec<RxId>)>>;
 
-/// Recorder input shared by all DSP threads.
+/// What the recorder thread writes, in arrival order.
+enum RecMsg {
+    Block(RawBlock),
+    /// FX2 FIFO full since its last status block: samples dropped at
+    /// the pins, which leave no position jump in the stream. `byte` is a
+    /// stream position.
+    FifoFull { rx: RxId, polls: u64, byte: u64, host_ns: u64 },
+}
+
+/// Recorder input shared by all DSP threads (blocks) and the backend
+/// thread (FIFO-full reports).
 #[derive(Default)]
 struct RecTap {
-    tx: Mutex<Option<SyncSender<RawBlock>>>,
+    tx: Mutex<Option<SyncSender<RecMsg>>>,
     dropped: AtomicU64,
 }
 
@@ -300,7 +310,7 @@ fn dsp_loop(mut c: DspCtx, cfg: RxDspConfig) {
         {
             let tap = c.tap.tx.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(tx) = tap.as_ref() {
-                if tx.try_send(block.clone()).is_err() {
+                if tx.try_send(RecMsg::Block(block.clone())).is_err() {
                     c.tap.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -580,25 +590,40 @@ struct LiveView {
 struct Recorder {
     thread: Option<JoinHandle<Result<Sidecar, String>>>,
     bytes: Arc<AtomicU64>,
+    /// FX2 FIFO-full polls logged.
+    fifo_polls: Arc<AtomicU64>,
     started_ns: u64,
     path: PathBuf,
 }
 
+/// One poll of the FX2's AUTOIN loop (firmware/fx2/src/hotloops.asm); a poll
+/// that finds the FIFO full stands for about this much of the samples lost.
+const FIFO_POLL_US: f64 = 0.833;
+
 fn recorder_loop(
     mut writer: RecordingWriter,
-    blocks: MpscReceiver<RawBlock>,
+    msgs: MpscReceiver<RecMsg>,
     bytes: Arc<AtomicU64>,
+    fifo_polls: Arc<AtomicU64>,
 ) -> Result<Sidecar, String> {
     let mut first_error: Option<String> = None;
-    for b in blocks.iter() {
-        match writer.write_block(&b) {
-            Ok(n) => {
+    for m in msgs.iter() {
+        let result = match m {
+            RecMsg::Block(b) => writer.write_block(&b).map(|n| {
                 bytes.fetch_add(n, Ordering::Relaxed);
+            }),
+            RecMsg::FifoFull { rx, polls, byte, host_ns } => {
+                let ev = Event::new(Some(rx), host_ns, Some(byte), EventKind::FifoFull { polls });
+                writer.log_stream_event(&ev).map(|logged| {
+                    if logged {
+                        fifo_polls.fetch_add(polls, Ordering::Relaxed);
+                    }
+                })
             }
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e.to_string());
-                }
+        };
+        if let Err(e) = result {
+            if first_error.is_none() {
+                first_error = Some(e.to_string());
             }
         }
     }
@@ -1172,11 +1197,13 @@ fn start_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
     let path = writer.paths().sidecar();
     let (tx, rx) = mpsc::sync_channel(REC_QUEUE);
     let bytes = Arc::new(AtomicU64::new(0));
+    let fifo_polls = Arc::new(AtomicU64::new(0));
     let thread = {
         let bytes = Arc::clone(&bytes);
+        let fifo_polls = Arc::clone(&fifo_polls);
         std::thread::Builder::new()
             .name("openvrx-recorder".into())
-            .spawn(move || recorder_loop(writer, rx, bytes))
+            .spawn(move || recorder_loop(writer, rx, bytes, fifo_polls))
     };
     match thread {
         Ok(t) => {
@@ -1186,6 +1213,7 @@ fn start_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
             st.recorder = Some(Recorder {
                 thread: Some(t),
                 bytes,
+                fifo_polls,
                 started_ns: now,
                 path,
             });
@@ -1207,11 +1235,18 @@ fn stop_recording(ctx: &BackendContext, st: &mut State) {
     let mb = rec.bytes.load(Ordering::Relaxed) as f64 / 1e6;
     match result {
         Some(Ok(Ok(_))) => {
-            let note = if dropped > 0 {
+            let mut note = if dropped > 0 {
                 format!(" ({dropped} blocks dropped: disk too slow)")
             } else {
                 String::new()
             };
+            let polls = rec.fifo_polls.load(Ordering::Relaxed);
+            if polls > 0 {
+                note.push_str(&format!(
+                    " (FX2 FIFO full {polls} polls: about {:.2} ms of samples lost at the pins)",
+                    polls as f64 * FIFO_POLL_US / 1e3
+                ));
+            }
             ctx.message(
                 MessageLevel::Info,
                 format!("recording saved: {} ({mb:.1} MB){note}", rec.path.display()),
@@ -1223,11 +1258,41 @@ fn stop_recording(ctx: &BackendContext, st: &mut State) {
 }
 
 /// Receiver housekeeping: C5 events, calibration on boot, gain loop.
+/// Hands the FX2's FIFO-full reports to the recorder. The stream's
+/// event queue is drained on every tick, recording or not (nothing else in
+/// the app reads it), so a new recording never gets reports from before it.
+fn forward_fifo_full(tap: &RecTap, r: &LiveRx) {
+    let Some(stream) = r.receiver.stream() else {
+        return;
+    };
+    let tx = tap.tx.lock().unwrap_or_else(|e| e.into_inner());
+    for ev in stream.events().try_iter() {
+        if let (
+            Some(tx),
+            fx2::StreamEvent::FifoFull {
+                new_events,
+                byte,
+                host_ns,
+                ..
+            },
+        ) = (tx.as_ref(), ev)
+        {
+            let _ = tx.try_send(RecMsg::FifoFull {
+                rx: r.rx,
+                polls: new_events as u64,
+                byte,
+                host_ns,
+            });
+        }
+    }
+}
+
 fn tick(ctx: &BackendContext, st: &mut State, now: u64) {
     let Some(live) = st.live.as_mut() else {
         return;
     };
     for r in &mut live.rxs {
+        forward_fifo_full(&live.tap, r);
         for ev in r.receiver.poll() {
             match ev {
                 ReceiverEvent::C5(C5Event::Disconnected { reason, .. }) => {
