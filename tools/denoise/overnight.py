@@ -8,7 +8,7 @@ the same command again (after a crash, a reboot, Ctrl+C) skips finished steps
 and the training continues from its last checkpoint. Re-executes itself under
 systemd-inhibit so Atlas does not suspend while it runs.
 
-    overnight.py --name v3 [--hours 8] [--data ~/denoise-data]
+    overnight.py --name v3 [--hours 8] [--data ~/openvrx-data/denoise-data]
                  [--width 32] [--depth 10] [--sat-weight 4] [--colour-start 0.4] [--no-mask]
                  [--cn 2,4,6,8,10,12,14,16,20] [--crops 64] [--size 96]
                  [--render REC[,REC2]] [--panels raw,model] [--compare A.pt,B.pt]
@@ -28,7 +28,7 @@ Steps (all outputs under DATA; OUT = DATA/overnight-NAME):
   eval      room5, bench-ramp, bench-grey: raw, linear, --compare models and
             the new one, to OUT/eval-*.json
   gallery   media.py: room5 before/after and the flight cuts (incl. the keep
-            cut), one panel per model, in ~/openvrx-media
+            cut), one panel per model, in ~/openvrx-data/media
   render    every --render recording, whole, to DATA/renders/NAME/*.mp4
 
 --kaggle USER: the train step runs on a Kaggle T4 instead (kaggle_train.py):
@@ -62,8 +62,8 @@ ROOMS_TRAIN = ["room0", "room1", "room2", "room3", "room4"]
 ROOMS_VAL = ["room5"]
 BENCH_TRAIN = ["bench-card", "bench-bars", "bench-check"]
 BENCH_VAL = ["bench-ramp", "bench-grey"]
-FLIGHT_CUTS = ["~/flights/keep/f1106-022948-t4/f1106-022948-t4", "~/flights/cuts/f1106-022457-t13",
-               "~/flights/cuts/f1031-214743-t36", "~/flights/cuts/f1102-235032-t14"]
+FLIGHT_CUTS = ["~/openvrx-data/flights/keep/f1106-022948-t4/f1106-022948-t4", "~/openvrx-data/flights/cuts/f1106-022457-t13",
+               "~/openvrx-data/flights/cuts/f1031-214743-t36", "~/openvrx-data/flights/cuts/f1102-235032-t14"]
 STEPS = ["simulate", "bench", "prepare", "train", "eval", "gallery", "render"]
 
 
@@ -136,7 +136,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     lst = lambda v: [x for x in v.split(",") if x]  # noqa: E731
     ap.add_argument("--name", required=True, help="model name: DATA/cnn-NAME.pt, DATA/overnight-NAME/")
-    ap.add_argument("--data", default="~/denoise-data")
+    ap.add_argument("--data", default="~/openvrx-data/denoise-data")
     ap.add_argument("--hours", type=float, default=8.0, help="training time budget (the other steps add about 1 to 2 h)")
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--depth", type=int, default=10)
@@ -152,15 +152,15 @@ def main():
     ap.add_argument("--cn", default="2,4,6,8,10,12,14,16,20", help="simulated C/N values (dB)")
     ap.add_argument("--crops", type=int, default=64, help="crops per noisy run")
     ap.add_argument("--size", type=int, default=96, help="crop size (px)")
-    ap.add_argument("--bench-runs", default="~/bench-runs/ml-ladder-164756,~/bench-runs/ml-ladder-164756-b")
-    ap.add_argument("--render", type=lst, default=["~/flights/20261107/openvrx-20261107-022457",
-                                                   "~/flights/20261107/openvrx-20261107-022948"],
+    ap.add_argument("--bench-runs", default="~/openvrx-data/bench-runs/ml-ladder-164756,~/openvrx-data/bench-runs/ml-ladder-164756-b")
+    ap.add_argument("--render", type=lst, default=["~/openvrx-data/flights/20261107/openvrx-20261107-022457",
+                                                   "~/openvrx-data/flights/20261107/openvrx-20261107-022948"],
                     help="whole recordings to render after training")
     ap.add_argument("--panels", default="raw,model", help="render panels, from raw, linear, model "
                     "(linear is slow in Python: about doubles the render time)")
     ap.add_argument("--compare", type=lst, default=None,
                     help="older models for eval and the gallery (default: DATA/cnn-v1.pt and the best cnn-v2*.pt there)")
-    ap.add_argument("--gallery", default="~/openvrx-media")
+    ap.add_argument("--gallery", default="~/openvrx-data/media")
     ap.add_argument("--steps", type=lst, default=STEPS, help="only these steps (default: all, in order)")
     ap.add_argument("--smoke", action="store_true", help="tiny version of every step, to test the pipeline")
     ap.add_argument("--extra-train", type=lst, default=[],

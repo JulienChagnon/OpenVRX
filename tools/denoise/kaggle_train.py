@@ -20,7 +20,8 @@ goes up too and the job copies it next to its output, so `-- ... --resume`
 continues a training that a job did not finish. push: TRAIN ARGS are
 train arguments of --script (denoise_cnn.py, the default, or
 enhance_cnn.py) except --out; {data} in them is replaced by
-the dataset's folder on Kaggle (for example --train {data}/train.npz). The
+the dataset's folder on Kaggle (for example --train {data}/train.npz); with
+several datasets (--dataset A/X,A/Y), {data:X} and {data:Y} name each one. The
 job stops at once if Kaggle gave it no GPU (an account without phone
 verification, or a missing --accelerator: with the Kaggle CLI 2.x,
 enable_gpu alone gives a CPU session). fetch --wait polls the status every
@@ -61,7 +62,15 @@ hits = glob.glob("/kaggle/input/**/*.npz", recursive=True)
 if not hits:
     sys.exit("no .npz under /kaggle/input: is the dataset attached?")
 data = os.path.dirname(hits[0])
-args = [x.replace("{data}", data) for x in ARGS]
+# {data} is the folder of the first .npz found (one dataset attached). With several datasets, name
+# each one: {data:SLUG} is the folder under /kaggle/input that holds that dataset's files.
+import re
+def slug_dir(m):
+    files = [f for f in glob.glob(f"/kaggle/input/**/{m.group(1)}/**/*", recursive=True) if os.path.isfile(f)]
+    if not files:
+        sys.exit(f"dataset {m.group(1)} is not attached (nothing under /kaggle/input/**/{m.group(1)})")
+    return os.path.dirname(sorted(files, key=len)[0])
+args = [re.sub(r"\{data:([^}]+)\}", slug_dir, x).replace("{data}", data) for x in ARGS]
 # A checkpoint uploaded with the crops (a job cut off at the 12 h limit, or
 # stopped) is where --resume continues from.
 import shutil
@@ -131,7 +140,7 @@ def cmd_push(a):
         open(os.path.join(d, "run.py"), "w").write(code)
         meta = {"id": a.kernel, "title": a.kernel.split("/")[1], "code_file": "run.py", "language": "python",
                 "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": False,
-                "machine_shape": a.accelerator, "dataset_sources": [a.dataset], "competition_sources": [],
+                "machine_shape": a.accelerator, "dataset_sources": a.dataset.split(","), "competition_sources": [],
                 "kernel_sources": [], "model_sources": []}
         with open(os.path.join(d, "kernel-metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -174,7 +183,8 @@ def main():
     u.add_argument("--message", help="version note when the dataset exists")
     p = sub.add_parser("push")
     p.add_argument("--kernel", required=True, help="USER/SLUG of the job")
-    p.add_argument("--dataset", required=True, help="USER/SLUG of the crops")
+    p.add_argument("--dataset", required=True,
+                   help="USER/SLUG of the crops; several with commas, then use {data:SLUG} in the train arguments")
     p.add_argument("--out", required=True, help="model file name in the job output")
     p.add_argument("--accelerator", default="NvidiaTeslaT4")
     p.add_argument("--script", default="denoise_cnn.py", choices=SCRIPTS, help="which model's train runs")
