@@ -1249,12 +1249,25 @@ impl Tbc {
         let hzpi = (self.lv.blank.x - self.lv.tip.x) / (-sync_ire);
         let q_b = (self.cfg.level_noise_ire as f64 * hzpi).powi(2);
         let neff = |n: usize| (n as f64 * self.hz_lpf_frac).max(1.0);
-        let (bw0, bw1) = match kind0 {
+        // Equalising pulses only occur in vertical blanking. Near threshold the width test calls a
+        // share of the horizontal pulses on picture lines "Eq", and the Eq blanking window (most of
+        // the half line) then measures the picture, with a long window's small variance: those
+        // readings would pull the blanking level toward the picture. On a picture line blanking is
+        // measured on the back porch, as for the horizontal pulse it is (make_line runs only once the
+        // field is known).
+        let kind_lv = {
+            let parity = if frame_line <= par.lines_per_field[0] { FieldParity::First } else { FieldParity::Second };
+            let fl = (frame_line - par.field_first_frame_line(parity)) as usize;
+            let first = par.first_active_field_line(parity);
+            let picture = fl >= first && fl < first + par.active_lines_per_field as usize;
+            if kind0 == PulseKind::Eq && picture { PulseKind::H } else { kind0 }
+        };
+        let (bw0, bw1) = match kind_lv {
             PulseKind::Eq => (self.us(par.eq_pulse_us + 0.6), self.us(0.5 * 1e6 / par.line_hz - 1.6)),
             _ => self.blank_window(par),
         };
         let mut noise_meas = Vec::new();
-        if matches!(kind0, PulseKind::H | PulseKind::Eq) {
+        if matches!(kind_lv, PulseKind::H | PulseKind::Eq) {
             if let Some((m, var, n)) = self.mean_range(t0 + bw0, t0 + bw1) {
                 let r = (self.lv.noise.powi(2)).max(var) / neff(n);
                 let gate = 0.15 * (self.lv.blank.x - self.lv.tip.x);
@@ -1263,6 +1276,8 @@ impl Tbc {
                 }
             }
         }
+        // The tip keeps the pulse's own class: a pulse that looked like Eq on a picture line was likely
+        // cut short or hit by a click at its tip, so its tip reading would pull the depth in.
         if matches!(kind0, PulseKind::H | PulseKind::Broad) {
             let w = if kind0 == PulseKind::H { par.hsync_us } else { par.broad_pulse_us };
             if let Some((m, var, n)) = self.mean_range(t0 + self.us(0.2 * w), t0 + self.us(0.8 * w)) {
