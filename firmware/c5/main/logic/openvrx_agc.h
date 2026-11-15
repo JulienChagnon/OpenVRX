@@ -36,9 +36,14 @@ extern "C" {
 #define OPENVRX_AGC_OVERLOAD_SHARE 0.25f
 // Gain is only raised while fewer component samples than this clip.
 #define OPENVRX_AGC_RAISE_MAX_CLIP 0.05f
-// Assumed dB per gain index until per-board tables are measured.
-#define OPENVRX_AGC_DB_PER_INDEX 0.5f
-// Largest index change per update (2 dB per 100 ms = 20 dB/s).
+// dB per gain index, measured on the bench board: receiver noise against
+// gain in the top RF stage (from index OPENVRX_AGC_TOP_STAGE_START up) and
+// the loop holding a stepped signal below it. One board so far, not a
+// per-board table yet.
+#define OPENVRX_AGC_TOP_STAGE_START 54u
+#define OPENVRX_AGC_DB_PER_INDEX_TOP 0.93f
+#define OPENVRX_AGC_DB_PER_INDEX_LOW 1.1f
+// Largest index change per update (about 4 dB per 100 ms).
 #define OPENVRX_AGC_MAX_STEP 4
 
 // Fast attack (C5-4). Flight fades swing 20 to 30 dB within a fraction of
@@ -47,9 +52,8 @@ extern "C" {
 // Every OPENVRX_AGC_FAST_MS a short batch of pad reads checks clipping;
 // at OPENVRX_AGC_ATTACK_CLIP or more the gain drops OPENVRX_AGC_ATTACK_STEP
 // indexes, again after OPENVRX_AGC_ATTACK_GAP_MS while it still clips. The
-// dB per index is not known (C5-3: one bench case moved 28 dB in 5
-// indexes), so the attack is closed-loop: it measures after every step
-// instead of computing one. Raising stays with the 100 ms loop, held off
+// dB per index is measured on one board only, so the attack is closed-loop:
+// it measures after every step instead of computing one. Raising stays with the 100 ms loop, held off
 // for OPENVRX_AGC_RAISE_HOLD_MS after an attack so it does not pump back
 // into the clipping. C5VRX found the picture follows how often the gain
 // is written (about 7 ms of picture per write), so attacks are few and

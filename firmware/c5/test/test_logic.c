@@ -629,7 +629,8 @@ static void test_agc(void)
     // On target (4.4 steps), inside the deadband, small errors: hold or one step.
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 4.4f) == 50);
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 5.0f) == 50);
-    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 3.4f) == 54);
+    CHECK(openvrx_agc_next(50, 0, 77, 4, 0.01f, 3.4f) == 52);   // -2.2 dB at 1.1 dB per index
+    CHECK(openvrx_agc_next(60, 0, 77, 4, 0.01f, 3.4f) == 62);   // top stage, 0.93 dB per index
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.0f, 3.9f) == 50);
     // Weak but clipping (interference spikes): never raised.
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.10f, 2.0f) == 50);
@@ -1068,7 +1069,7 @@ static void test_agc_fades(void)
     CHECK(openvrx_agc_slow(&c, 0x00000010u, 50, 0, 83, 4, 0.0f, 1.0f) == 50);
 
     // Simulated fade recovery: settle weak (-20 dB), then +25 dB at once.
-    static const float dpi[2] = {0.5f, 2.0f};   // dB per index: the assumption, and much steeper
+    static const float dpi[2] = {0.93f, 2.0f};   // dB per index: the measured top stage, and much steeper
     for (unsigned k = 0; k < 2; ++k) {
         fade_result_t r_old = {.gain = 60}, r_new = {.gain = 60};
         dc_plant_t p;
@@ -1081,7 +1082,7 @@ static void test_agc_fades(void)
         if (getenv("AGC_TRACE"))
             printf("settle -20 dB, %.1f dB/index: gain old %u new %u, writes old %u new %u, attacks %u\n",
                    (double)dpi[k], r_old.gain, r_new.gain, r_old.writes, r_new.writes, c.attacks);
-        // Steady weak signal. With the assumed 0.5 dB per index the attack
+        // Steady weak signal. At the measured dB per index the attack
         // never fires. At 2 dB per index the old loop hunts (4 indexes = 8 dB
         // steps against a 1.5 dB deadband: 40 writes in 4 s); the new one
         // overshoots once, the attack catches it and the raise hold-off ends
@@ -1104,7 +1105,7 @@ static void test_agc_fades(void)
         CHECK(r_old.clear_ms < 0 || r_old.clear_ms >= 4 * r_new.clear_ms);
         // Clipped time over the second, including any later overshoot of
         // the 100 ms loop's raises when the dB per index is steeper than
-        // assumed (C5-3; each overshoot costs the 10 ms confirmation plus
+        // measured (C5-3; each overshoot costs the 10 ms confirmation plus
         // the attack): at most a third of the old loop's.
         CHECK(new_ms * 3 <= old_ms);
         CHECK(r_new.writes <= 15);
@@ -1125,11 +1126,11 @@ static void test_agc_fades(void)
         plant_init(&p, OPENVRX_PRESET_4X4TOP);
         uint32_t t = 0;
         openvrx_agc_ctl_init(&c);
-        fade_run(&p, &c, &r, &t, 3000, -20.0f, 0.5f, true);   // settle without bursts
+        fade_run(&p, &c, &r, &t, 3000, -20.0f, 0.93f, true);   // settle without bursts
         const unsigned settled = c.attacks;
         s_burst_rate = 0.02f;
         r.writes = 0;
-        fade_run(&p, &c, &r, &t, 5000, -20.0f, 0.5f, true);
+        fade_run(&p, &c, &r, &t, 5000, -20.0f, 0.93f, true);
         if (getenv("AGC_TRACE"))
             printf("bursts on a weak signal: attacks %u, writes %u in 5 s, gain %u\n", c.attacks - settled, r.writes,
                    r.gain);
@@ -1137,7 +1138,7 @@ static void test_agc_fades(void)
         // Fade recovery still works with the bursts on.
         fade_result_t f = r;
         f.clip_ticks = 0;
-        fade_run(&p, &c, &f, &t, 1000, 5.0f, 0.5f, true);
+        fade_run(&p, &c, &f, &t, 1000, 5.0f, 0.93f, true);
         CHECK(f.clear_ms >= 0 && f.clear_ms <= 80);
         s_burst_rate = 0.0f;
     }

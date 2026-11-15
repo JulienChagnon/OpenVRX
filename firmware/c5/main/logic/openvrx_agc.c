@@ -100,7 +100,11 @@ unsigned openvrx_agc_next(unsigned gain, unsigned gain_min, unsigned gain_max, u
     if (clip_share >= OPENVRX_AGC_OVERLOAD_SHARE && err_db < 6.0f) err_db = 6.0f;
     if (fabsf(err_db) < OPENVRX_AGC_DEADBAND_DB) return gain;
     if (err_db < 0.0f && clip_share >= OPENVRX_AGC_RAISE_MAX_CLIP) return gain;
-    int step = (int)lroundf(err_db / OPENVRX_AGC_DB_PER_INDEX);
+    // Slope at the current index: a step that crosses into the other stage
+    // is off by the slope difference only, and the next update corrects it.
+    const float db_per_index =
+        gain >= OPENVRX_AGC_TOP_STAGE_START ? OPENVRX_AGC_DB_PER_INDEX_TOP : OPENVRX_AGC_DB_PER_INDEX_LOW;
+    int step = (int)lroundf(err_db / db_per_index);
     if (step > OPENVRX_AGC_MAX_STEP) step = OPENVRX_AGC_MAX_STEP;
     if (step < -OPENVRX_AGC_MAX_STEP) step = -OPENVRX_AGC_MAX_STEP;
     int next = (int)gain - step;   // too loud: lower index
