@@ -136,15 +136,18 @@ is a small Arduino sketch for any ESP32 that presses them:
 3. One click of + adds 0.25 dB. The seven LEDs show the value in binary,
    weights 0.25, 0.5, 1, 2, 4, 8, 16 dB (add the lit ones): 1 click =
    0.25, 2 = 0.5, 3 = 0.75 (0.5 + 0.25), 4 = 1 dB, 127 clicks = 31.75 dB.
-   A 2 dB sweep step is 8 clicks, about a second at the default timing.
+   A 2 dB sweep step is 8 clicks, about 2.4 s at the default timing (150 ms
+   press, 150 ms gap; once, 60 ms presses were all missed and the sweep
+   stayed at 0 dB while the count went up).
    `bench.py --att-step` defaults to 0.25. If + and - together selects a
    coarser step on your unit, a coarser step means fewer clicks; set it on
    the attenuator and pass the same value to `--att-step`.
 4. Flash with the Arduino IDE or `arduino-cli` (board "ESP32 Dev Module").
 5. Serial 115200: `step 0.25` (dB per click, the default), `at 0`
    (the value the LEDs show now, no presses), `set 12`, `get`,
-   `press + 4`, `timing 60 80` (press and gap in ms; raise them if presses
-   get missed).
+   `press + 4`, `timing 150 150` (press and gap in ms, the default; the
+   ESP32 cannot see a missed press, so check the LEDs after the first step
+   of a sweep).
 
 With only the + relay the ESP32 can go up, never down: `set` to a lower
 value answers `ERR set down`. `bench.py --att esp32:PORT` notices this by

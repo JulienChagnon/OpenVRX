@@ -12,12 +12,16 @@ Nothing is changed and nothing is reset: the C5 is opened with DTR/RTS low
 it when opened).
 
     lab_check.py [--c5 /dev/ttyACM0] [--esp32 socket://openvrx-bench.local:2323]
-                 [--monitor HDMI-A-2] [--json OUT.json]
+                 [--monitor MACROSILICON] [--json OUT.json]
+
+The ESP32 URL falls back to its last known address and then to the ARP neighbours that answer its
+console (esp32_net.py) when mDNS does not resolve; the converter is found by its description.
 
 Exit status 1 when a warning is printed. Needs pyserial.
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -25,6 +29,9 @@ import sys
 import time
 
 import serial
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python3 -I drops the script dir
+from esp32_net import resolve as resolve_esp32  # noqa: E402  (mDNS fallback: cache, then ARP neighbours)
 
 
 def lsusb():
@@ -97,21 +104,24 @@ def esp32(url, cmds):
         s.close()
 
 
-def monitor(name):
+def monitor(want):
+    """(output name, mode) of the converter's output, matched by name or by a substring of its
+    description (the port name changes between boots: HDMI-A-2 until 2026-11-11, then HDMI-A-1)."""
     if not shutil.which("hyprctl"):
         return None
     p = subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, text=True)
     for m in json.loads(p.stdout or "[]"):
-        if m["name"] == name:
-            return f"{m['width']}x{m['height']}@{m['refreshRate']:.3f}"
-    return "not connected"
+        if m["name"] == want or want.lower() in m.get("description", "").lower():
+            return m["name"], f"{m['width']}x{m['height']}@{m['refreshRate']:.3f}"
+    return want, "not connected"
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--c5", default="/dev/ttyACM0")
     ap.add_argument("--esp32", default="socket://openvrx-bench.local:2323")
-    ap.add_argument("--monitor", default="HDMI-A-2", help="video output feeding the CVBS converter")
+    ap.add_argument("--monitor", default="MACROSILICON",
+                    help="video output feeding the CVBS converter: output name or part of its description")
     ap.add_argument("--json", help="also write everything to this file")
     a = ap.parse_args()
     report, warn = {}, []
@@ -139,7 +149,8 @@ def main():
         print("C5: not reachable:", e)
 
     try:
-        r = esp32(a.esp32, ["get", "vget", "vtx"])
+        a.esp32 = resolve_esp32(a.esp32)
+        r = esp32(a.esp32, ["get", "vget", "vtx", "timing"])
         report["esp32"] = r
         for k, v in r.items():
             print(f"ESP32 {k}: {v}")
@@ -154,17 +165,24 @@ def main():
             warn.append("attenuator position unknown: confirm 0 dB on the LEDs, then 'at 0'")
         if "video=on" in r.get("vget", ""):
             warn.append("ESP32 video output is ON: make sure it is not wired to the VTX pad while the converter feeds it")
+        pm = re.search(r"press_ms=(\d+)", r.get("timing", ""))
+        if pm and int(pm.group(1)) < 150:
+            warn.append(f"attenuator presses are {pm.group(1)} ms: the AW8637 once missed every 60 ms press "
+                        "(sweep stuck at 0 dB); 'timing 150 150' or flash the current att_ctl")
     except Exception as e:
         report["esp32"] = {"error": str(e)}
         warn.append(f"ESP32 not reachable at {a.esp32}: {e}")
         print("ESP32: not reachable:", e)
 
-    mon = monitor(a.monitor)
-    if mon is not None:
-        report["monitor"] = {a.monitor: mon}
-        print(f"Video output {a.monitor}: {mon}")
-        if mon not in ("not connected",) and not mon.startswith("720x480@59.94"):
-            warn.append(f"{a.monitor} is {mon}, not 720x480@59.94 (NTSC loops expect that)")
+    found = monitor(a.monitor)
+    if found is not None:
+        name, mon = found
+        report["monitor"] = {name: mon}
+        print(f"Video output {name}: {mon}")
+        if mon == "not connected":
+            warn.append(f"converter output ({a.monitor}) not found: check its power and HDMI cable")
+        elif not mon.startswith("720x480@59.94"):
+            warn.append(f"{name} is {mon}, not 720x480@59.94 (NTSC loops expect that)")
 
     report["warnings"] = warn
     if a.json:
