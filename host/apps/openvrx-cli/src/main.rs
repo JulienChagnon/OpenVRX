@@ -12,9 +12,8 @@
 //!                                             with host times from the byte position; saves displayed
 //!                                             fields (FRAMES 0: none) and prints lost lines once a second
 //!                                             and the combiner/assembler/repair counters (DSP-5)
-//! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G] [--fifo-512]
-//!                                             FX2-only capture, no window (bench scripts); EP2 runs
-//!                                             4 x 1024 bytes, --fifo-512 for the old 4 x 512
+//! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G]
+//!                                             FX2-only capture, no window (bench scripts)
 //! openvrx-cli score   REC [--ref REC] [--frames N] [--skip K] [--demod polar|lut|ls|pll|ekf]
 //!                     [--preset raw|low_latency|balanced|quality] [--ref-demod D]
 //!                                             one JSON line: lock, C/N, clipping, frames, PSNR vs ref,
@@ -416,8 +415,6 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     // are shorter than the periodic flush stalls of a long recording to a USB
     // drive. 512 blocks of 32 KB = 16 MB, about 600 ms.
     cfg.block_capacity = 512;
-    // EP2 as 4 x 1024 unless `--fifo-512` asks for the old 4 x 512.
-    cfg.stream.fifo_1k = !args.iter().any(|a| a == "--fifo-512");
     let receiver = Receiver::start_fx2_only(cfg).map_err(|e| format!("starting the FX2: {e}"))?;
 
     let mut info = ReceiverInfo::new(0, settings.sample_format());
@@ -457,11 +454,6 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     // The last status blocks of the run.
     std::thread::sleep(Duration::from_millis(50));
     fifo_polls += log_fifo_full(&receiver, &mut writer)?;
-    // What the firmware actually ran (older images ignore FIFO_1K).
-    let fifo_1k_ran = receiver
-        .stream()
-        .and_then(|s| s.stats().last_status)
-        .map(|st| st.flags.fifo_1k());
     drop(receiver);
     let path = writer.paths().sidecar();
     writer.close().map_err(|e| e.to_string())?;
@@ -471,14 +463,6 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
         bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
     );
-    match fifo_1k_ran {
-        Some(true) => println!("FX2 EP2 FIFO 4 x 1024 bytes"),
-        Some(false) => println!("FX2 EP2 FIFO 4 x 512 bytes"),
-        None => println!("FX2 EP2 FIFO size unknown (no status block)"),
-    }
-    if fifo_1k_ran == Some(false) && !args.iter().any(|a| a == "--fifo-512") {
-        eprintln!("warning: asked for 4 x 1024 but the FX2 ran 4 x 512 (firmware before 0.1.1 still in RAM: replug it)");
-    }
     if fifo_polls > 0 {
         eprintln!(
             "warning: FX2 FIFO full for {fifo_polls} polls (about {:.2} ms of samples lost at the pins)",

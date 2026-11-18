@@ -67,15 +67,6 @@ pub struct StreamConfig {
     pub mmcss: bool,
     /// Emit a `Transfer` timing event every N completions (0 = never).
     pub transfer_event_every: u32,
-    /// Ask for EP2 as 4 x 1024 bytes (`StartFlags::FIFO_1K`): twice the
-    /// FIFO that bridges a host stall. The firmware applies it to full
-    /// streams at high speed only.
-    #[serde(default = "default_fifo_1k")]
-    pub fifo_1k: bool,
-}
-
-fn default_fifo_1k() -> bool {
-    true
 }
 
 impl Default for StreamConfig {
@@ -92,7 +83,6 @@ impl Default for StreamConfig {
             reconnect_max_ms: 2000,
             mmcss: true,
             transfer_event_every: 64,
-            fifo_1k: default_fifo_1k(),
         }
     }
 }
@@ -115,12 +105,9 @@ impl StreamConfig {
         Ok(())
     }
 
-    /// Flags actually sent with `START` (adds `WATCH` when watch_n > 1 and
-    /// `FIFO_1K` when `fifo_1k`).
+    /// Flags actually sent with `START` (adds `WATCH` when watch_n > 1).
     pub fn start_flags(&self) -> StartFlags {
-        self.flags
-            .with(StartFlags::WATCH, self.watch_n > 1)
-            .with(StartFlags::FIFO_1K, self.fifo_1k)
+        self.flags.with(StartFlags::WATCH, self.watch_n > 1)
     }
 }
 
@@ -1219,9 +1206,6 @@ mod tests {
         assert!(StreamConfig { watch_n: 0, ..cfg() }.validate().is_err());
         let w = StreamConfig { watch_n: 8, ..cfg() };
         assert!(w.start_flags().contains(StartFlags::WATCH));
-        assert!(cfg().start_flags().contains(StartFlags::FIFO_1K));
-        let small = StreamConfig { fifo_1k: false, ..cfg() };
-        assert!(!small.start_flags().contains(StartFlags::FIFO_1K));
     }
 
     #[test]

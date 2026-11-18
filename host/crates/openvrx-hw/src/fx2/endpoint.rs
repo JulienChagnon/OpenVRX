@@ -218,13 +218,6 @@ pub mod sim {
                     if d.watch_n > 1 {
                         f |= StatusFlags::WATCH;
                     }
-                    // As stream.c: 1024-byte buffers only for a full AUTOIN stream.
-                    if d.flags.contains(StartFlags::FIFO_1K)
-                        && d.watch_n == 1
-                        && !d.flags.contains(StartFlags::TEST_PATTERN)
-                    {
-                        f |= StatusFlags::FIFO_1K;
-                    }
                     d.status.flags = StatusFlags(f);
                     d.next_due = None;
                 }
@@ -244,14 +237,6 @@ pub mod sim {
                         d.status.flags.0 |= StatusFlags::WATCH;
                     } else {
                         d.status.flags.0 &= !StatusFlags::WATCH;
-                    }
-                    let big = d.flags.contains(StartFlags::FIFO_1K)
-                        && d.watch_n == 1
-                        && !d.flags.contains(StartFlags::TEST_PATTERN);
-                    if big {
-                        d.status.flags.0 |= StatusFlags::FIFO_1K;
-                    } else {
-                        d.status.flags.0 &= !StatusFlags::FIFO_1K;
                     }
                 }
                 req::LED | req::EEPROM_WRITE => {}
