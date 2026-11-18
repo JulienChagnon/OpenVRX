@@ -263,9 +263,9 @@ mod tests {
         f.adapt(20.0);
         assert_eq!(f.cutoff_hz(), 8.0e6);
         f.adapt(0.0);
-        assert_eq!(f.cutoff_hz(), 4.5e6);
+        assert_eq!(f.cutoff_hz(), 2.0e6);
         f.adapt(6.0);
-        assert!((f.cutoff_hz() - 6.25e6).abs() < 1.0);
+        assert!((f.cutoff_hz() - 5.0e6).abs() < 1.0);
         assert_eq!(f.delay(), d);
         // At 13.33 MS/s the 8 MHz cutoff is above Nyquist but adaptation
         // keeps it active.

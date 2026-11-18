@@ -208,6 +208,44 @@ struct Mid {
     steps: Vec<u64>,
     clicks: Vec<u64>,
     host_ns: u64,
+    /// Smoothed C/N (dB) when the block was demodulated (C/N-dependent video low-pass).
+    cn_db: f32,
+}
+
+/// C/N-dependent video low-pass: same tap count at every cutoff, designs cached.
+struct LpfAdapt {
+    n: usize,
+    beta: f64,
+    fs: f64,
+    full: f64,
+    min: f64,
+    lo: f32,
+    hi: f32,
+    cur: f64,
+    designs: Vec<(u64, Vec<f32>)>,
+}
+
+impl LpfAdapt {
+    /// New taps when the cutoff for `cn_db` moved by a quantisation step.
+    fn update(&mut self, cn_db: f32) -> Option<Vec<f32>> {
+        if !cn_db.is_finite() {
+            return None;
+        }
+        let t = ((cn_db - self.lo) / (self.hi - self.lo).max(0.1)).clamp(0.0, 1.0) as f64;
+        let q = 0.25e6;
+        let target = ((self.min + t * (self.full - self.min)) / q).round() * q;
+        if (target - self.cur).abs() < 0.5 * q {
+            return None;
+        }
+        self.cur = target;
+        let key = target.to_bits();
+        if let Some(d) = self.designs.iter().find(|d| d.0 == key) {
+            return Some(d.1.clone());
+        }
+        let h = design_lowpass(self.n, target / self.fs, self.beta);
+        self.designs.push((key, h.clone()));
+        Some(h)
+    }
 }
 
 impl Mid {
@@ -240,6 +278,7 @@ struct Back {
     fs: f64,
     deemph: Option<Biquad>,
     lpf: SymFir,
+    lpf_adapt: Option<LpfAdapt>,
     tbc: Tbc,
     env_delay: Delay<f32>,
     clip_delay: Delay<u8>,
@@ -289,6 +328,11 @@ impl Back {
         if let Some(bq) = &mut self.deemph {
             for v in mid.hz.iter_mut() {
                 *v = bq.run(*v as f64) as f32;
+            }
+        }
+        if let Some(a) = &mut self.lpf_adapt {
+            if let Some(h) = a.update(mid.cn_db) {
+                self.lpf.set_taps(h);
             }
         }
         self.video.resize(n, 0.0);
@@ -539,13 +583,28 @@ impl RxDsp {
         );
         let tracking = matches!(cfg.demod, DemodKind::Pll | DemodKind::Ekf);
         let clicks = ClickRepair::new(&cfg.clicks, tracking);
+        let mut lpf_adapt = None;
         let lpf = if cfg.video_lpf.enabled {
             // Downsampling onto the grid needs the cutoff below the grid
             // Nyquist; the narrower of the configured and safe cutoff wins.
             let grid_nyq = 0.5 * 910.0 * openvrx_core::standard::NTSC.line_hz;
             let cutoff = (cfg.video_lpf.cutoff_hz as f64).min(0.9 * grid_nyq).min(0.49 * fs);
             let n = kaiser_len(cfg.video_lpf.atten_db as f64, cfg.video_lpf.transition_hz as f64 / fs, cfg.video_lpf.max_taps);
-            SymFir::new(design_lowpass(n, cutoff / fs, kaiser_beta(cfg.video_lpf.atten_db as f64)))
+            let beta = kaiser_beta(cfg.video_lpf.atten_db as f64);
+            if cfg.video_lpf.min_cutoff_hz > 0.0 {
+                lpf_adapt = Some(LpfAdapt {
+                    n,
+                    beta,
+                    fs,
+                    full: cutoff,
+                    min: (cfg.video_lpf.min_cutoff_hz as f64).min(cutoff),
+                    lo: cfg.video_lpf.cn_lo_db,
+                    hi: cfg.video_lpf.cn_hi_db,
+                    cur: cutoff,
+                    designs: Vec::new(),
+                });
+            }
+            SymFir::new(design_lowpass(n, cutoff / fs, beta))
         } else {
             SymFir::identity()
         };
@@ -569,6 +628,7 @@ impl RxDsp {
             fs,
             deemph,
             lpf,
+            lpf_adapt,
             tbc,
             env_delay: Delay::new(0, 0.0),
             clip_delay: Delay::new(0, 0),
@@ -987,6 +1047,7 @@ impl RxDsp {
         mid.total = self.total_delay();
         mid.seg_start = self.seg_start;
         mid.host_ns = host_ns;
+        mid.cn_db = self.cn_smooth_db;
         self.in_index += n as u64;
         self.proc_samples += n as u64;
         self.stage_samples += n as u64;

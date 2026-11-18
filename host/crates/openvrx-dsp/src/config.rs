@@ -155,7 +155,7 @@ impl Default for ChannelFilterConfig {
             transition_hz: 2.0e6,
             atten_db: 40.0,
             adaptive: true,
-            min_cutoff_hz: 4.5e6,
+            min_cutoff_hz: 2.0e6,
             cn_lo_db: 2.0,
             cn_hi_db: 10.0,
             max_taps: 63,
@@ -282,16 +282,28 @@ pub struct VideoLpfConfig {
     pub transition_hz: f32,
     pub atten_db: f32,
     pub max_taps: usize,
+    /// C/N-dependent cutoff: at or above `cn_hi_db` the cutoff is `cutoff_hz`, at or below
+    /// `cn_lo_db` it is `min_cutoff_hz`, linear in between (quantised to 0.25 MHz, same tap count, so
+    /// the video delay does not move). 0 keeps the cutoff fixed.
+    pub min_cutoff_hz: f32,
+    pub cn_lo_db: f32,
+    pub cn_hi_db: f32,
 }
 
 impl Default for VideoLpfConfig {
     fn default() -> Self {
+        // A narrower cutoff trades picture detail for less noise, so the ramp only narrows as C/N
+        // drops. The C/N points depend on the lane layout and the C5's analog filter, since the C/N
+        // reading moves with them.
         VideoLpfConfig {
             enabled: true,
             cutoff_hz: 5.0e6,
             transition_hz: 1.3e6,
             atten_db: 50.0,
             max_taps: 127,
+            min_cutoff_hz: 2.0e6,
+            cn_lo_db: 5.0,
+            cn_hi_db: 12.0,
         }
     }
 }
