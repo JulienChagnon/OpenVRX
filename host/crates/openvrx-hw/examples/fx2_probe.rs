@@ -2,11 +2,14 @@
 //! Lists FX2 boards and C5 radio heads, uploads the OpenVRX firmware to any
 //! blank FX2, then runs a 5 second throughput test on every OpenVRX FX2.
 //!
-//! Usage: `cargo run -p openvrx-hw --example fx2_probe [-- path/to/openvrx-fx2.ihx] [--pattern]`
+//! Usage: `cargo run -p openvrx-hw --example fx2_probe [-- path/to/openvrx-fx2.ihx] [--pattern] [--reload]`
+//! (`--reload`: also load the image into boards already running OpenVRX firmware, no replug. A CPU
+//! reset does not reset the USB and endpoint hardware: after a test that broke the link, power-cycle.)
 
 use openvrx_hw::c5::find_c5_ports;
 use openvrx_hw::fx2::{
-    self, firmware, list_fx2, run_bench, BenchConfig, BenchMode, Fx2Kind, Fx2Selector, NusbPort, StreamPort,
+    self, firmware, list_fx2, run_bench, BenchConfig, BenchMode, Fx2Kind, Fx2Requests, Fx2Selector, NusbPort,
+    StreamPort,
 };
 use openvrx_hw::power::{SelectiveSuspend, TimerResolution};
 use std::path::PathBuf;
@@ -54,6 +57,24 @@ fn main() {
         println!("FX2: {}", d.describe());
         if let Some(h) = d.driver_hint() {
             println!("     {h}");
+        }
+    }
+
+    // `--reload`: load the image into boards that already run OpenVRX
+    // firmware. The FX2 core answers the 0xA0 RAM load itself (also after
+    // ReNumeration), so this swaps images without a replug.
+    if args.iter().any(|a| a == "--reload") {
+        match firmware::resolve(fw_path.as_deref()) {
+            Ok(img) => {
+                for d in devices.iter().filter(|d| d.kind == Fx2Kind::Openvrx) {
+                    match d.open().and_then(|dev| dev.upload_firmware(&img)) {
+                        Ok(()) => println!("reloaded {} bytes into {}", img.len(), d.describe()),
+                        Err(e) => println!("reload of {} failed: {e}", d.describe()),
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            Err(e) => println!("cannot reload: {e}"),
         }
     }
 

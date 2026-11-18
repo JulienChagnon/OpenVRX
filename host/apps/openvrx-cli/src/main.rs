@@ -12,8 +12,11 @@
 //!                                             with host times from the byte position; saves displayed
 //!                                             fields (FRAMES 0: none) and prints lost lines once a second
 //!                                             and the combiner/assembler/repair counters (DSP-5)
-//! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G]
-//!                                             FX2-only capture, no window (bench scripts)
+//! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G] [--json PATH]
+//!                                             FX2-only capture, no window (bench scripts). OUT_BASE
+//!                                             `-` drains: streams and counts, writes nothing. Prints
+//!                                             the byte rate against nominal, FIFO-full polls, host
+//!                                             drops and transfer errors; --json PATH writes them too
 //! openvrx-cli score   REC [--ref REC] [--frames N] [--skip K] [--demod polar|lut|ls|pll|ekf]
 //!                     [--preset raw|low_latency|balanced|quality] [--ref-demod D]
 //!                                             one JSON line: lock, C/N, clipping, frames, PSNR vs ref,
@@ -423,13 +426,23 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     info.board = settings.board.name().to_string();
     info.start_host_ns = openvrx_core::clock::now_ns();
     let sidecar = Sidecar::new(RecordingSource::Hardware, vec![info]);
-    let mut writer = RecordingWriter::create(base, sidecar, WriterOptions::default()).map_err(|e| e.to_string())?;
+    // `-` as OUT_BASE: a drain. The same capture path, but the blocks are
+    // only counted, so losses come from USB and the FX2 FIFO, never the disk.
+    let drain = base == "-";
+    let mut writer = if drain {
+        None
+    } else {
+        Some(RecordingWriter::create(base, sidecar, WriterOptions::default()).map_err(|e| e.to_string())?)
+    };
     let want = (seconds * settings.sample_format().sample_rate_hz()) as u64
         * settings.sample_format().lanes.word_bytes as u64;
     let t0 = Instant::now();
     let mut bytes = 0u64;
     let mut blocks = 0u64;
     let mut fifo_polls = 0u64;
+    // Byte rate from the first block to the last: (time, bytes) at the first block.
+    let mut first: Option<(Instant, u64)> = None;
+    let mut last_at = t0;
     // Reports from before the first block (stream start-up) say nothing about this file.
     if let Some(s) = receiver.stream() {
         let _ = s.events().try_iter().count();
@@ -437,9 +450,14 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     while bytes < want {
         match receiver.blocks().recv_timeout(Duration::from_millis(500)) {
             Ok(b) => {
-                bytes += writer.write_block(&b).map_err(|e| e.to_string())?;
+                bytes += match writer.as_mut() {
+                    Some(w) => w.write_block(&b).map_err(|e| e.to_string())?,
+                    None => b.data.len() as u64,
+                };
                 blocks += 1;
-                fifo_polls += log_fifo_full(&receiver, &mut writer)?;
+                last_at = Instant::now();
+                first.get_or_insert((last_at, bytes));
+                fifo_polls += log_fifo_full(&receiver, writer.as_mut())?;
             }
             Err(_) if t0.elapsed() > Duration::from_secs(3) && bytes == 0 => {
                 return Err("no data from the FX2 in 3 s (C5 off, wrong wiring or IFCLK)".into());
@@ -453,16 +471,66 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     }
     // The last status blocks of the run.
     std::thread::sleep(Duration::from_millis(50));
-    fifo_polls += log_fifo_full(&receiver, &mut writer)?;
+    fifo_polls += log_fifo_full(&receiver, writer.as_mut())?;
+    let stats = receiver.stream().map(|s| s.stats());
     drop(receiver);
-    let path = writer.paths().sidecar();
-    writer.close().map_err(|e| e.to_string())?;
+    let wall = t0.elapsed().as_secs_f64();
+    let target = if drain {
+        "drain (nothing written)".to_string()
+    } else {
+        let w = writer.take().expect("writer when not draining");
+        let path = w.paths().sidecar();
+        w.close().map_err(|e| e.to_string())?;
+        path.display().to_string()
+    };
     println!(
-        "recorded {} ({:.1} MB in {blocks} blocks, {:.1} s wall)",
-        path.display(),
-        bytes as f64 / 1e6,
-        t0.elapsed().as_secs_f64()
+        "recorded {target} ({:.1} MB in {blocks} blocks, {wall:.1} s wall)",
+        bytes as f64 / 1e6
     );
+    // Measured against the nominal rate. The C5 crystal alone moves this by
+    // about +-150 ppm, so only shortfalls well above 0.02 % mean lost data.
+    let nominal = settings.sample_format().byte_rate();
+    let measured = match first {
+        Some((t1, b1)) if last_at > t1 => Some((bytes - b1) as f64 / (last_at - t1).as_secs_f64()),
+        _ => None,
+    };
+    let short_pct = measured.map(|m| (1.0 - m / nominal) * 100.0);
+    let s = stats.unwrap_or_default();
+    println!(
+        "stream: {} MB/s (nominal {:.3}, short {}), fifo_full {fifo_polls} polls ({:.2} ms), \
+         host drops {} blocks, transfer errors {}, restarts {}",
+        measured.map_or("?".into(), |m| format!("{:.3}", m / 1e6)),
+        nominal / 1e6,
+        short_pct.map_or("?".into(), |p| format!("{p:.3} %")),
+        fifo_polls as f64 * FIFO_POLL_US / 1e3,
+        s.dropped_blocks,
+        s.transfer_errors,
+        s.restarts
+    );
+    if let Some(json) = opt(args, "--json") {
+        let summary = serde_json::json!({
+            "out": if drain { serde_json::Value::Null } else { target.clone().into() },
+            "drain": drain,
+            "lanes": lanes.to_string(),
+            "clk": divider,
+            "seconds": seconds,
+            "bytes": bytes,
+            "blocks": blocks,
+            "wall_s": wall,
+            "nominal_bps": nominal,
+            "measured_bps": measured,
+            "short_pct": short_pct,
+            "fifo_full_polls": fifo_polls,
+            "fifo_lost_ms": fifo_polls as f64 * FIFO_POLL_US / 1e3,
+            "host_dropped_blocks": s.dropped_blocks,
+            "host_dropped_bytes": s.dropped_bytes,
+            "transfer_errors": s.transfer_errors,
+            "stalls": s.stalls,
+            "restarts": s.restarts,
+            "disconnects": s.disconnects,
+        });
+        std::fs::write(json, format!("{summary}\n")).map_err(|e| format!("{json}: {e}"))?;
+    }
     if fifo_polls > 0 {
         eprintln!(
             "warning: FX2 FIFO full for {fifo_polls} polls (about {:.2} ms of samples lost at the pins)",
@@ -485,8 +553,9 @@ const FIFO_POLL_US: f64 = 0.833;
 
 /// Logs the FIFO-full reports the FX2 stream has queued as `fifo_full`
 /// events: a recording otherwise has no trace of samples lost at
-/// the pins, since no stream position jumps. Returns the polls logged.
-fn log_fifo_full(receiver: &Receiver, writer: &mut RecordingWriter) -> Result<u64, String> {
+/// the pins, since no stream position jumps. Returns the polls seen (also
+/// counted with no writer, for a drain).
+fn log_fifo_full(receiver: &Receiver, mut writer: Option<&mut RecordingWriter>) -> Result<u64, String> {
     let Some(stream) = receiver.stream() else { return Ok(0) };
     let mut polls = 0u64;
     for ev in stream.events().try_iter() {
@@ -497,13 +566,15 @@ fn log_fifo_full(receiver: &Receiver, writer: &mut RecordingWriter) -> Result<u6
             ..
         } = ev
         {
-            let e = openvrx_format::Event::new(
-                Some(receiver.rx()),
-                host_ns,
-                Some(byte),
-                openvrx_format::EventKind::FifoFull { polls: new_events as u64 },
-            );
-            writer.log_stream_event(&e).map_err(|e| e.to_string())?;
+            if let Some(w) = writer.as_deref_mut() {
+                let e = openvrx_format::Event::new(
+                    Some(receiver.rx()),
+                    host_ns,
+                    Some(byte),
+                    openvrx_format::EventKind::FifoFull { polls: new_events as u64 },
+                );
+                w.log_stream_event(&e).map_err(|e| e.to_string())?;
+            }
             polls += new_events as u64;
         }
     }
