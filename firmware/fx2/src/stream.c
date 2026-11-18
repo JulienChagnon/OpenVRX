@@ -50,12 +50,37 @@ static __xdata uint16_t status_seq;
 static __bit    ifclk_active;
 static __bit    opt_slwr_hi;
 static __bit    opt_pattern_fast;
+static __bit    cfg_fifo_1k_req;  // START asked for 1024-byte buffers (used again by live watch switches)
 
 #define IFCONFIG_IDLE (_IFCLKSRC | _3048MHZ)          // internal 48 MHz, ports
 #define IFCFG_SLAVE   (_IFCFG1 | _IFCFG0)
 
+// EP2CFG: VALID | DIR (IN) | TYPE bulk, BUF1:0 = 00 (quad), SIZE (bit 3)
+// 0 = 512, 1 = 1024. With EP4, EP6 and EP8 invalid, 4 x 1024 is the
+// configuration that gives EP2 the whole 4 KB of endpoint RAM (the
+// single-endpoint group of the TRM endpoint configuration figure).
+#define EP2CFG_512    0xE0
+#define EP2CFG_1K     0xE8
+
 bool usb_high_speed(void) {
   return (USBCS & _HSM) != 0;
+}
+
+// EP2 buffer size and AUTOIN commit length, with the host NAKed. The
+// caller resets the EP2 FIFO next (fifo_reset_ep2), which also clears
+// whatever the old layout held.
+//
+// 1024-byte buffers are used only for AUTOIN at high speed: AUTOINLEN is
+// the buffer size, the endpoint descriptor keeps wMaxPacketSize 512, and the
+// SIE sends each committed buffer as two 512-byte bulk packets. Watch mode
+// and the test pattern count and commit 512-byte packets (hotloops.asm,
+// pattern_loop), so they always run on 512-byte buffers.
+static void ep2_buffers(bool big, uint16_t autoinlen) __reentrant {
+  FIFORESET = _NAKALL;                          SYNCDELAY;
+  EP2FIFOCFG = cfg_wordwide;                    SYNCDELAY;   // AUTOIN off first (TRM 9.3.13)
+  EP2CFG = big ? EP2CFG_1K : EP2CFG_512;        SYNCDELAY;
+  EP2AUTOINLENH = (uint8_t)(autoinlen >> 8);    SYNCDELAY;
+  EP2AUTOINLENL = (uint8_t)autoinlen;           SYNCDELAY;
 }
 
 // NAKALL, manual mode, reset EP2, `fifocfg`, release NAKALL.
@@ -78,7 +103,7 @@ void stream_init(void) {
 
   EP1OUTCFG = 0;                 SYNCDELAY;   // not used
   EP1INCFG = _VALID | 0x30;      SYNCDELAY;   // interrupt IN
-  EP2CFG = 0xE0;                 SYNCDELAY;   // valid, IN, bulk, 512, quad
+  EP2CFG = EP2CFG_512;           SYNCDELAY;   // valid, IN, bulk, 512, quad
   EP4CFG = 0;                    SYNCDELAY;   // EP4 memory belongs to EP2 (quad)
   EP6CFG = 0;                    SYNCDELAY;
   EP8CFG = 0;                    SYNCDELAY;
@@ -109,6 +134,8 @@ void stream_stop(void) {
   cfg_flags = 0;
   IFCONFIG = IFCONFIG_IDLE;      SYNCDELAY;
   cfg_wordwide = 0;
+  cfg_fifo_1k_req = 0;
+  ep2_buffers(false, usb_high_speed() ? 512 : 64);
   fifo_reset_ep2(0);
 }
 
@@ -118,6 +145,7 @@ bool stream_start(uint16_t flags, uint16_t ratio) __reentrant {
   bool pattern = (flags & START_TEST_PATTERN) != 0;
   bool internal = pattern || (flags & START_INTERNAL_CLK) != 0;
   bool watch = !pattern && (flags & START_WATCH) && ratio > 1;
+  bool big;
   uint8_t ifc;
   uint8_t fifocfg;
 
@@ -131,14 +159,14 @@ bool stream_start(uint16_t flags, uint16_t ratio) __reentrant {
     ifc |= _IFCLKPOL;
   cfg_wordwide = (flags & START_WIDTH16) ? _WORDWIDE : 0;
   fifocfg = cfg_wordwide | ((watch || pattern) ? 0 : _AUTOIN);
+  cfg_fifo_1k_req = hs && !pattern && (flags & START_FIFO_1K) != 0;
+  big = cfg_fifo_1k_req && !watch;
 
   // Phase A: internal 48 MHz, pins disconnected, NAK the host.
-  FIFORESET = _NAKALL;                          SYNCDELAY;
+  ep2_buffers(big, big ? 1024 : pkt);
   FIFOPINPOLAR = opt_slwr_hi ? _SLWR : 0;       SYNCDELAY;
   EP2FIFOCFG = cfg_wordwide;                    SYNCDELAY;
   FIFORESET = _NAKALL | 2;                      SYNCDELAY;
-  EP2AUTOINLENH = (uint8_t)(pkt >> 8);          SYNCDELAY;
-  EP2AUTOINLENL = (uint8_t)pkt;                 SYNCDELAY;
   EP2FIFOCFG = fifocfg;                         SYNCDELAY;
 
   // Phase B: final clock source and polarity, still in ports mode.
@@ -169,6 +197,8 @@ bool stream_start(uint16_t flags, uint16_t ratio) __reentrant {
     cfg_flags |= STF_WATCH;
   if(pattern)
     cfg_flags |= STF_TEST_PATTERN;
+  if(big)
+    cfg_flags |= STF_FIFO_1K;
 
   // Phase D: connect the pins (the test pattern stays in ports mode: the CPU
   // is the only source of EP2 data).
@@ -183,6 +213,7 @@ bool stream_start(uint16_t flags, uint16_t ratio) __reentrant {
 
 void stream_set_watch(uint16_t ratio) __reentrant {
   bool watch = ratio > 1;
+  bool big;
 
   if(mode != MODE_AUTO && mode != MODE_WATCH) {
     // Not streaming from the pins: remembered only for the status block.
@@ -191,16 +222,23 @@ void stream_set_watch(uint16_t ratio) __reentrant {
   }
 
   // Live switch between AUTOIN and manual commit. Disconnect the pins while
-  // the FIFO is reset so that no partial packet is left behind.
+  // the FIFO is reset so that no partial packet is left behind. Watch mode
+  // needs 512-byte buffers; a full stream gets back the size START chose.
   IFCONFIG = cfg_ifconfig;                      SYNCDELAY;
   watch_reload = ratio - 1;
   watch_left = 0;
+  big = cfg_fifo_1k_req && !watch;
+  ep2_buffers(big, big ? 1024 : (usb_high_speed() ? 512 : 64));
   fifo_reset_ep2(cfg_wordwide | (watch ? 0 : _AUTOIN));
   watch_n = watch ? ratio : 0;
   if(watch)
     cfg_flags |= STF_WATCH;
   else
     cfg_flags &= ~STF_WATCH;
+  if(big)
+    cfg_flags |= STF_FIFO_1K;
+  else
+    cfg_flags &= ~STF_FIFO_1K;
   mode = watch ? MODE_WATCH : MODE_AUTO;
   IFCONFIG = cfg_ifconfig | IFCFG_SLAVE;        SYNCDELAY;
 }

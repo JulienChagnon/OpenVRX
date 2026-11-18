@@ -177,6 +177,12 @@ All on the device recipient. `bmRequestType` `0x40` (OUT) or `0xC0` (IN).
 - bit 5 `TEST_PATTERN`: with bit 2: firmware fills packets with a 16-bit
   counter instead of port data (end-to-end loss check at full USB rate,
   slower than the slave FIFO; reports its own rate).
+- bit 6 `FIFO_1K` (firmware 0.1.1): EP2 as 4 x 1024-byte buffers (the whole
+  4 KB of endpoint RAM, AUTOINLEN 1024) instead of 4 x 512. Applies only to a
+  full AUTOIN stream at high speed; watch mode and the test pattern keep
+  512-byte buffers, also when `SET_WATCH` switches a running stream. The
+  endpoint descriptor stays at wMaxPacketSize 512: each 1024-byte buffer goes
+  out as two 512-byte bulk packets. Older firmware ignores the bit.
 
 ### Status block (32 bytes, little endian)
 
@@ -184,7 +190,7 @@ All on the device recipient. `bmRequestType` `0x40` (OUT) or `0xC0` (IN).
 |---|---|---|
 | 0 | u32 | magic `"PCVS"` |
 | 4 | u8 | proto version (1) |
-| 5 | u8 | flags: bit0 running, bit1 width16, bit2 ifclk_inv, bit3 internal_clk, bit4 watch, bit5 ifclk_active, bit6 test_pattern |
+| 5 | u8 | flags: bit0 running, bit1 width16, bit2 ifclk_inv, bit3 internal_clk, bit4 watch, bit5 ifclk_active, bit6 test_pattern, bit7 fifo_1k (EP2 runs 4 x 1024) |
 | 6 | u16 | watch_n |
 | 8 | u32 | packets committed (counted in watch mode and test-pattern mode; 0 in AUTOIN mode) |
 | 12 | u32 | packets skipped (watch mode) |

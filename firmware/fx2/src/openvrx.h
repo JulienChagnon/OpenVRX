@@ -15,7 +15,7 @@
 
 #define FW_MAJOR        0
 #define FW_MINOR        1
-#define FW_PATCH        0
+#define FW_PATCH        1
 #define PROTO_VERSION   1
 
 #define USB_VID         0x1209
@@ -50,6 +50,7 @@
 #define START_INTERNAL_48   0x08
 #define START_WATCH         0x10
 #define START_TEST_PATTERN  0x20
+#define START_FIFO_1K       0x40  // AUTOIN at high speed: EP2 as 4 x 1024 (whole 4 KB) instead of 4 x 512
 
 // Status block flags (byte 5)
 #define STF_RUNNING         0x01
@@ -59,6 +60,7 @@
 #define STF_WATCH           0x10
 #define STF_IFCLK_ACTIVE    0x20
 #define STF_TEST_PATTERN    0x40
+#define STF_FIFO_1K         0x80  // EP2 runs with 1024-byte buffers (START_FIFO_1K honoured)
 
 // SET_OPTION keys (wValue = key, wIndex = value)
 #define OPT_WATCH_DETECT    0x01  // 0 = FIFO byte count minus committed packets, 1 = byte count only

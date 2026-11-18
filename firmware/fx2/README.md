@@ -4,8 +4,9 @@
 
 Streaming firmware for the CY7C68013A (EZ-USB FX2LP) boards that carry the
 ESP32-C5 I/Q lanes to the PC. The slave FIFO latches the lanes on the C5's
-sample clock (external IFCLK) and the chip sends them on EP2 (bulk IN, 512
-bytes, quad buffered, AUTOIN). EP1 IN carries a 32-byte status block every
+sample clock (external IFCLK) and the chip sends them on EP2 (bulk IN, 512-byte
+packets, AUTOIN; the FIFO is 4 x 1024 bytes when the host asks for it with the
+`FIFO_1K` start flag, else 4 x 512). EP1 IN carries a 32-byte status block every
 8 ms. The protocol is in `docs/PROTOCOL.md`, section 2.
 
 Built with SDCC and a pinned copy of libfx2 (0BSD, `third_party/libfx2/`,

@@ -190,7 +190,8 @@ impl SelectiveSuspend {
 }
 
 /// Wake latency the FX2 stream asks for while it runs, in microseconds.
-/// The FX2 holds 4 x 512 bytes: 77 us at 26.7 MB/s, 51 us at 40 MB/s. Deep
+/// The FX2 holds 4 x 512 bytes: 77 us at 26.7 MB/s, 51 us at 40 MB/s
+/// (4 x 1024 with `StartFlags::FIFO_1K`: 154 and 102 us). Deep
 /// package C-states (intel_idle lists exit latencies of 85 to 200 us for C6
 /// to C8) can let that FIFO overflow while the PC idles.
 pub const FX2_DMA_LATENCY_US: i32 = 20;

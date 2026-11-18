@@ -63,6 +63,11 @@ impl StartFlags {
     pub const WATCH: StartFlags = StartFlags(1 << 4);
     /// With `INTERNAL_CLK`: firmware-generated 16-bit counter.
     pub const TEST_PATTERN: StartFlags = StartFlags(1 << 5);
+    /// Full AUTOIN stream at high speed: EP2 as 4 x 1024 bytes (the whole
+    /// 4 KB of endpoint RAM) instead of 4 x 512. Ignored by firmware before
+    /// 0.1.1 and in watch or test-pattern mode; `StatusFlags::fifo_1k` says
+    /// whether it is in effect.
+    pub const FIFO_1K: StartFlags = StartFlags(1 << 6);
 
     pub const fn empty() -> StartFlags {
         StartFlags(0)
@@ -169,6 +174,7 @@ impl StatusFlags {
     pub const WATCH: u8 = 1 << 4;
     pub const IFCLK_ACTIVE: u8 = 1 << 5;
     pub const TEST_PATTERN: u8 = 1 << 6;
+    pub const FIFO_1K: u8 = 1 << 7;
 
     #[inline]
     fn bit(self, b: u8) -> bool {
@@ -194,6 +200,10 @@ impl StatusFlags {
     }
     pub fn test_pattern(self) -> bool {
         self.bit(Self::TEST_PATTERN)
+    }
+    /// EP2 runs with 1024-byte buffers (4 KB of FIFO).
+    pub fn fifo_1k(self) -> bool {
+        self.bit(Self::FIFO_1K)
     }
 }
 
