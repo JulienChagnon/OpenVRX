@@ -637,9 +637,17 @@ static void test_agc(void)
     // Limits.
     CHECK(openvrx_agc_next(1, 0, 77, 4, 1.0f, 7.0f) == 0);
     CHECK(openvrx_agc_next(76, 0, 77, 4, 0.0f, 0.5f) == 77);
-    // 7x7: full scale 64 steps, target about 35.
-    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 35.0f) == 50);
-    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 8.0f) == 54);
+    // Target by bits: 0.55 of full scale for 4 bits, lower with more bits (room for fade-ups).
+    CHECK(fabsf(openvrx_agc_target_share(4) - 0.55f) < 1e-6f);
+    CHECK(openvrx_agc_target_share(5) < openvrx_agc_target_share(4));
+    CHECK(openvrx_agc_target_share(6) < openvrx_agc_target_share(5));
+    CHECK(openvrx_agc_target_share(7) < openvrx_agc_target_share(6));
+    CHECK(openvrx_agc_target_share(8) == openvrx_agc_target_share(7));
+    // 7x7: full scale 64 steps, target 0.20 x 64 = 12.8 steps.
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 12.8f) == 50);            // on target: hold
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 35.0f) == 50 - OPENVRX_AGC_MAX_STEP);   // the old 4-bit-like level is now +8.7 dB: lower
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 8.0f) == 54);             // -4.1 dB at 1.1 dB per index: raise 4
+    CHECK(openvrx_agc_next(50, 0, 77, 7, 0.0f, 11.0f) == 50);            // -1.3 dB: inside the deadband
 
     // Command.
     char line[32] = "agc off";

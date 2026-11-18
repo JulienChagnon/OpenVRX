@@ -26,9 +26,19 @@ extern "C" {
 // Loop period and pad reads per update.
 #define OPENVRX_AGC_PERIOD_MS 100u
 #define OPENVRX_AGC_READS 4096u
-// Target RMS per component as a share of full scale (2^(bits-1) steps):
-// 0.55 puts the FM envelope just under the clip level (4x4top: 4.4 steps).
-#define OPENVRX_AGC_TARGET_SHARE 0.55f
+// Target RMS per component as a share of full scale (2^(bits-1) steps), by bits per component
+// (openvrx_agc_target_share). With 4 bits, 0.55 puts the FM envelope just under the clip level
+// (4x4top: 4.4 steps): the picture loses fast on both sides of it, so the target sits at the top.
+// More bits make the low side cheap (each bit is 6 dB more range below the clip), so the target
+// moves down to keep room for fade-ups: 7 and 8 bits at 0.20 (about 9 dB under the 4-bit target,
+// 12.8 steps of 64 for 7x7), 5 and 6 bits in between.
+#define OPENVRX_AGC_TARGET_SHARE_4 0.55f
+#define OPENVRX_AGC_TARGET_SHARE_5 0.40f
+#define OPENVRX_AGC_TARGET_SHARE_6 0.28f
+#define OPENVRX_AGC_TARGET_SHARE_7 0.20f
+
+// Target share of full scale for a layout with `bits` per component (see above).
+float openvrx_agc_target_share(unsigned bits);
 // No change while the level is within this many dB of the target.
 #define OPENVRX_AGC_DEADBAND_DB 1.5f
 // Clipped share of component samples that counts as overload whatever the

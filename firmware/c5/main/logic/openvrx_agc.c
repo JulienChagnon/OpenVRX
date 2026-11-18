@@ -91,11 +91,19 @@ float openvrx_agc_rms_steps(const openvrx_agc_acc_t *a)
     return a->values ? sqrtf((float)a->sumsq4 / (4.0f * (float)a->values)) : 0.0f;
 }
 
+float openvrx_agc_target_share(unsigned bits)
+{
+    if (bits <= 4) return OPENVRX_AGC_TARGET_SHARE_4;
+    if (bits == 5) return OPENVRX_AGC_TARGET_SHARE_5;
+    if (bits == 6) return OPENVRX_AGC_TARGET_SHARE_6;
+    return OPENVRX_AGC_TARGET_SHARE_7;   // 7 and 8
+}
+
 unsigned openvrx_agc_next(unsigned gain, unsigned gain_min, unsigned gain_max, unsigned bits, float clip_share,
                           float rms_steps)
 {
     if (bits < 2 || gain_min > gain_max) return gain;
-    const float target = OPENVRX_AGC_TARGET_SHARE * (float)(1u << (bits - 1));
+    const float target = openvrx_agc_target_share(bits) * (float)(1u << (bits - 1));
     float err_db = 20.0f * log10f(fmaxf(rms_steps, 0.05f) / target);
     if (clip_share >= OPENVRX_AGC_OVERLOAD_SHARE && err_db < 6.0f) err_db = 6.0f;
     if (fabsf(err_db) < OPENVRX_AGC_DEADBAND_DB) return gain;
