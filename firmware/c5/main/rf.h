@@ -75,6 +75,40 @@ typedef struct {
 } rf_dc_info_t;
 void rf_dc_info(rf_dc_info_t *out);
 
+// Timing of the last rf_tune (C5-22): the vendor part (channel setup or
+// offset helper) and the whole call with the restore; whether it was a
+// full channel setup and whether the restore wrote the gain force again.
+typedef struct {
+    uint32_t vendor_us, total_us;
+    bool setup, reforced;
+} rf_tune_time_t;
+rf_tune_time_t rf_last_tune(void);
+
+// One-shot 10-bit I/Q capture (C5-20, words decoded by logic/openvrx_iq.h).
+// The dump engine that streams the lanes is stopped, writes n words into
+// SRAM on a software trigger, and streams again: the lanes pause for
+// meta->us. ESP_OK when the engine reported done and wrote exactly the n
+// words; ESP_ERR_TIMEOUT without done; ESP_ERR_INVALID_RESPONSE when words
+// are missing or it wrote past them; ESP_ERR_INVALID_STATE when the radio or
+// the stream is down. words gets the n words in every case.
+typedef struct {
+    uint32_t us;        // from stopping the stream to restarting it
+    uint32_t ptr;       // the engine's pointer after the capture (DUMP_PTR_MODE bits 15:0)
+    unsigned written;   // of the n words
+    bool done;          // the engine's done bit came within the timeout
+    bool guard_ok;      // the word after the n was left alone
+} rf_iq_meta_t;
+esp_err_t rf_iq_capture(uint32_t *words, unsigned n, rf_iq_meta_t *meta);
+// rf_iq_capture with the whole 64 KB capture RAM filled and scanned after:
+// where the engine wrote (bench check of the capture layout).
+typedef struct {
+    rf_iq_meta_t meta;
+    unsigned changed;   // words of the 16384 that changed
+    int first, last;    // first and last changed index, -1 when none
+    unsigned gain_forced;
+} rf_iq_probe_t;
+esp_err_t rf_iq_probe(uint32_t *words, unsigned n, rf_iq_probe_t *p);
+
 // Checks the receive lock (modem streaming, MAC TX queues off, forced gain,
 // 11p state, DC hold) and restores it when something drifted. Emits EVT phy lines.
 void rf_watchdog_poll(void);

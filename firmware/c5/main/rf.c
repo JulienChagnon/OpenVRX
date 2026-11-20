@@ -19,13 +19,19 @@
 #include <string.h>
 #include "arc_gain.h"
 #include "console.h"
+#include "esp_attr.h"
+#include "esp_cpu.h"
 #include "esp_event.h"
+#include "esp_rom_sys.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "heap_memory_layout.h"
 #include "openvrx_cmd.h"
 #include "openvrx_dc.h"
+#include "openvrx_iq.h"
 #include "phy.h"
 #include "soc/lp_aon_reg.h"
 #include "soc/soc.h"
@@ -50,6 +56,35 @@
 #define TX_START_SELECT 0x00060000u
 #define SELECTOR_MASK 0x01fe0000u
 #define HP_SRAM_USAGE 0x60095004u
+// One-shot capture into SRAM (rf_iq_capture, C5-20). HP_SRAM_USAGE is
+// HP_SYSTEM_SRAM_USAGE_CONF (soc/hp_system_reg.h): bits 11:8 hand SRAM to
+// the MAC dump, bit 16 adds 64 KB to its addresses. The vendor adctrig
+// (librftest.a) captures with bits 11:8 = 2 and bit 16 set: the dump owns
+// the bank from 0x40820000 and writes from 0x40830000 (the buffer its
+// print_dump_data and loop_dump_test read). While it owns the bank nothing
+// else may use it, DMA included (the sample clock's PARLIO buffer is heap),
+// so the whole bank is kept out of the heap.
+#define SRAM_USAGE_FIELD 0x00000f00u
+#define SRAM_USAGE_DUMP 0x00000200u
+#define SRAM_MAC_DUMP_ALLOC 0x00010000u
+#define IQ_BANK_LO 0x40820000u
+#define IQ_BANK_HI 0x40840000u
+#define IQ_RAM 0x40830000u
+#define IQ_RAM_WORDS 16384u
+SOC_RESERVE_MEMORY_REGION(IQ_BANK_LO, IQ_BANK_HI, openvrx_iq_bank);
+// DUMP_CTRL bits of a capture as adctrig sets them: count (16:0), done (18,
+// read), software trigger pulse (19); 20 and 21 cleared; dump-first (17)
+// off. DUMP_PTR_MODE bits 20:17 select the trigger: 15 is adctrig's
+// software trigger (its mode 0). Never the TX selectors or adctrig's
+// trigger cases 1 and 2: those transmit.
+#define CTRL_TRIGGER 0x00080000u
+#define CTRL_DONE 0x00040000u
+#define CTRL_COUNT 0x0001ffffu
+#define CTRL_CAPTURE_CLEAR 0x00300000u
+#define TRIG_SELECT_MASK 0x001e0000u
+#define TRIG_SELECT_SOFTWARE 0x001e0000u
+#define DUMP_POINTER 0x0000ffffu
+#define IQ_TIMEOUT_US 200u
 // Forced RX gain as the vendor PHY holds it: bit 23 force, bits 31:24 index
 // (C5VRX phy.c pbus_workmode_keep_gain and pin_bank1 read it this way).
 #define GAIN_FORCE_REG 0x600A702Cu
@@ -73,6 +108,7 @@ static uint16_t s_setup_mhz;
 static arc_gain_table_t s_table;
 static rf_phy_state_t s_state = RF_PHY_DOWN;
 static bool s_gain_check;   // GAIN_FORCE_REG matched our model after the first restore
+static rf_tune_time_t s_tune_time;   // the last rf_tune (C5-22)
 
 // DC hold (rf_dc_*). All under phy_begin().
 static openvrx_dc_rows_t s_dc_rows;
@@ -195,7 +231,16 @@ static void dc_new_setup(void)
 // state, analog filter, digital filter, DC hold. Caller holds phy_begin().
 // Returns true when everything read back as requested (a failed DC hold is
 // reported on its own, rf_dc_info).
-static bool restore_lock(void)
+//
+// The gain is forced again only after a channel setup (`setup`), or when
+// the force no longer reads back as set (C5-22): re-writing a force that
+// still holds disturbs the receiver (another C5 receiver measured 12 to
+// 25 dB spikes after hops and a steady carrier 3 to 6 dB low; writing only
+// on a change took its level sd from 2.2 to 0.1 dB). Without a working
+// readback (s_gain_check false) it is always written.
+static bool s_reforced;   // the last restore wrote the gain force
+
+static bool restore_lock(bool setup)
 {
     bool ok = true;
     dc_release();   // the restore must run in work mode (vendor rows replayed)
@@ -204,7 +249,8 @@ static bool restore_lock(void)
     phy_disable_agc();
     phy_rfagc_disable();
     phy_wifi_fbw_sel(s_cfg.bw20 ? 0u : 1u);
-    phy_force_rx_gain(true, s_cfg.gain);
+    s_reforced = setup || !s_gain_check || !gain_forced_as_set();
+    if (s_reforced) phy_force_rx_gain(true, s_cfg.gain);
     if (!phy_pinned()) return ok;
     const esp_err_t p11 = s_cfg.p11 ? phy_11p_apply_on() : phy_11p_apply_off();
     if (p11 != ESP_OK) {
@@ -274,9 +320,14 @@ static esp_err_t retune(void)
 {
     dc_release();   // before the setup: in debug mode the vendor rows would not replay
     dc_new_setup();
+    const int64_t t0 = esp_timer_get_time();
     esp_err_t err = channel_setup(s_cfg.mhz);
     if (err == ESP_OK && s_cfg.off_khz) phy_chip_set_chan_offset(s_cfg.off_khz);
-    const bool ok = restore_lock();
+    s_tune_time.vendor_us = (uint32_t)(esp_timer_get_time() - t0);
+    const bool ok = restore_lock(true);
+    s_tune_time.total_us = (uint32_t)(esp_timer_get_time() - t0);
+    s_tune_time.setup = true;
+    s_tune_time.reforced = s_reforced;
     if (err == ESP_OK) capture_table();   // a setup may regenerate the vendor gain table
     set_state_after_restore(ok && err == ESP_OK);
     return err != ESP_OK ? err : ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
@@ -340,10 +391,15 @@ esp_err_t rf_tune(uint16_t mhz, int off_khz)
         // Offset only (as C5VRX's AFC): the vendor helper re-enables BB AGC,
         // so the full receive state is restored after it.
         s_cfg.off_khz = (int16_t)off_khz;
+        const int64_t t0 = esp_timer_get_time();
         dc_release();
         dc_new_setup();
         phy_chip_set_chan_offset(off_khz);
-        const bool ok = restore_lock();
+        s_tune_time.vendor_us = (uint32_t)(esp_timer_get_time() - t0);
+        const bool ok = restore_lock(false);
+        s_tune_time.total_us = (uint32_t)(esp_timer_get_time() - t0);
+        s_tune_time.setup = false;
+        s_tune_time.reforced = s_reforced;
         set_state_after_restore(ok);
         err = ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
     } else {
@@ -400,7 +456,7 @@ esp_err_t rf_set_filter(int code, int skirt)
     phy_begin();
     s_cfg.filter_code = (int8_t)code;
     s_cfg.skirt = (uint8_t)skirt;
-    const bool ok = restore_lock();
+    const bool ok = restore_lock(false);
     set_state_after_restore(ok);
     const bool applied = phy_filter_code() == code && phy_filter_skirt() == skirt;
     if (!applied) {
@@ -489,6 +545,7 @@ void rf_dc_info(rf_dc_info_t *out)
 }
 
 rf_config_t rf_config(void) { return s_cfg; }
+rf_tune_time_t rf_last_tune(void) { return s_tune_time; }
 rf_phy_state_t rf_phy_state(void) { return s_state; }
 
 const char *rf_phy_state_name(rf_phy_state_t s)
@@ -531,11 +588,119 @@ void rf_watchdog_poll(void)
             why = "dco";
     }
     if (why) {
-        const bool ok = restore_lock();
+        const bool ok = restore_lock(false);
         s_state = ok ? RF_PHY_RESTORED : RF_PHY_ERROR;
         console_evt("phy state=%s cause=%s", rf_phy_state_name(s_state), why);
     }
     phy_end();
+}
+
+// ---------------------------------------------------------------------
+// One-shot 10-bit I/Q capture (C5-20)
+// ---------------------------------------------------------------------
+
+static portMUX_TYPE s_iq_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// The register part of a capture, from IRAM with interrupts off: while the
+// dump engine owns the bank no code may touch it, and the lanes (fed by the
+// same engine) pause from the first write to the last. Stops the stream,
+// sets up the vendor's software-triggered capture of n words, pulses the
+// trigger, waits for done (or the timeout), and restarts the stream from
+// the exact register values it found, the way enable_continuous_modem
+// starts it (enable last).
+static IRAM_ATTR bool iq_capture_regs(unsigned n, uint32_t timeout_cycles, uint32_t *cycles, uint32_t *ptr)
+{
+    const uint32_t ctrl = REG32(DUMP_CTRL), mode = REG32(DUMP_PTR_MODE), sram = REG32(HP_SRAM_USAGE);
+    const uint32_t cap = (ctrl & ~(CTRL_ENABLE | CTRL_DUMP_FIRST | CTRL_TRIGGER | CTRL_DONE | CTRL_CAPTURE_CLEAR |
+                                   CTRL_COUNT)) | (n & CTRL_COUNT);
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+    REG32(DUMP_CTRL) = ctrl & ~CTRL_ENABLE;
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    REG32(DUMP_PTR_MODE) = (mode & ~TRIG_SELECT_MASK) | TRIG_SELECT_SOFTWARE;
+    REG32(HP_SRAM_USAGE) = (sram & ~SRAM_USAGE_FIELD) | SRAM_USAGE_DUMP | SRAM_MAC_DUMP_ALLOC;
+    REG32(DUMP_CTRL) = cap;
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    REG32(DUMP_CTRL) = cap | CTRL_ENABLE;
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    REG32(DUMP_CTRL) = cap | CTRL_ENABLE | CTRL_TRIGGER;
+    REG32(DUMP_CTRL) = cap | CTRL_ENABLE;
+    bool done;
+    while (!(done = (REG32(DUMP_CTRL) & CTRL_DONE) != 0) && esp_cpu_get_cycle_count() - t0 < timeout_cycles) {
+    }
+    *ptr = REG32(DUMP_PTR_MODE) & DUMP_POINTER;
+    REG32(DUMP_CTRL) = cap;
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    REG32(HP_SRAM_USAGE) = sram;
+    REG32(DUMP_PTR_MODE) = mode;
+    REG32(DUMP_CTRL) = ctrl & ~(CTRL_ENABLE | CTRL_TRIGGER | CTRL_DONE);
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    REG32(DUMP_CTRL) = (ctrl & ~(CTRL_TRIGGER | CTRL_DONE)) | CTRL_ENABLE;
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+    *cycles = esp_cpu_get_cycle_count() - t0;
+    return done;
+}
+
+// Fills words [lo, hi) of the capture RAM with their fill pattern (the CPU owns the bank here).
+static void iq_fill(unsigned lo, unsigned hi)
+{
+    volatile uint32_t *const ram = (volatile uint32_t *)(uintptr_t)IQ_RAM;
+    for (unsigned k = lo; k < hi; ++k) ram[k] = openvrx_iq_sentinel(k);
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+}
+
+// Caller holds phy_begin(). n words plus one guard word are filled; with
+// `whole`, the full 16384 (for rf_iq_probe: where did the words land).
+static esp_err_t iq_capture_locked(unsigned n, bool whole, rf_iq_meta_t *m)
+{
+    memset(m, 0, sizeof(*m));
+    if (!s_started || s_state == RF_PHY_ERROR || s_state == RF_PHY_DOWN) return ESP_ERR_INVALID_STATE;
+    if (!(REG32(DUMP_CTRL) & CTRL_ENABLE)) return ESP_ERR_INVALID_STATE;   // the watchdog restores the stream first
+    iq_fill(0, whole ? IQ_RAM_WORDS : n + 1u);
+    const uint32_t timeout = IQ_TIMEOUT_US * esp_rom_get_cpu_ticks_per_us();
+    uint32_t cycles, ptr;
+    portENTER_CRITICAL(&s_iq_mux);
+    const bool done = iq_capture_regs(n, timeout, &cycles, &ptr);
+    portEXIT_CRITICAL(&s_iq_mux);
+    m->us = cycles / esp_rom_get_cpu_ticks_per_us();
+    m->ptr = ptr;
+    m->done = done;
+    volatile const uint32_t *const ram = (volatile const uint32_t *)(uintptr_t)IQ_RAM;
+    for (unsigned k = 0; k < n; ++k) m->written += ram[k] != openvrx_iq_sentinel(k);
+    m->guard_ok = ram[n] == openvrx_iq_sentinel(n);
+    if (!done) return ESP_ERR_TIMEOUT;
+    return m->written == n && m->guard_ok ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t rf_iq_capture(uint32_t *words, unsigned n, rf_iq_meta_t *meta)
+{
+    if (n == 0 || n > OPENVRX_IQ_MAX) return ESP_ERR_INVALID_ARG;
+    phy_begin();
+    const esp_err_t err = iq_capture_locked(n, false, meta);
+    volatile const uint32_t *const ram = (volatile const uint32_t *)(uintptr_t)IQ_RAM;
+    for (unsigned k = 0; k < n; ++k) words[k] = ram[k];
+    phy_end();
+    return err;
+}
+
+esp_err_t rf_iq_probe(uint32_t *words, unsigned n, rf_iq_probe_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    if (n == 0 || n > OPENVRX_IQ_MAX) return ESP_ERR_INVALID_ARG;
+    phy_begin();
+    const esp_err_t err = iq_capture_locked(n, true, &p->meta);
+    volatile const uint32_t *const ram = (volatile const uint32_t *)(uintptr_t)IQ_RAM;
+    p->first = -1;
+    p->last = -1;
+    for (unsigned k = 0; k < IQ_RAM_WORDS; ++k) {
+        if (ram[k] == openvrx_iq_sentinel(k)) continue;
+        ++p->changed;
+        if (p->first < 0) p->first = (int)k;
+        p->last = (int)k;
+    }
+    for (unsigned k = 0; k < n; ++k) words[k] = ram[k];
+    p->gain_forced = s_cfg.gain;
+    phy_end();
+    return err;
 }
 
 // Resets do not reach the modem domain; the forced clocks and the running

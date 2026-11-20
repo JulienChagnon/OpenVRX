@@ -23,9 +23,10 @@
 extern "C" {
 #endif
 
-// Loop period and pad reads per update.
+// Loop period. Each update pools the short batches of the period before it
+// (openvrx_agc_window_t below), OPENVRX_AGC_READS pad reads in all.
 #define OPENVRX_AGC_PERIOD_MS 100u
-#define OPENVRX_AGC_READS 4096u
+#define OPENVRX_AGC_READS (OPENVRX_AGC_WINDOW * OPENVRX_AGC_FAST_READS)
 // Target RMS per component as a share of full scale (2^(bits-1) steps), by bits per component
 // (openvrx_agc_target_share). With 4 bits, 0.55 puts the FM envelope just under the clip level
 // (4x4top: 4.4 steps): the picture loses fast on both sides of it, so the target sits at the top.
@@ -154,6 +155,11 @@ typedef struct {
     uint64_t sumsq4;   // sum of (2 v + 1)^2: four times the half-step centred square
     int32_t sum2[2];   // per axis (0 = I, 1 = Q): sum of 2 v + 1, twice the half-step centred value
     uint32_t neg[2];   // per axis: values with the sign bit set
+    // v is in units of 2^-frac steps: 0 for pad reads (v is the lane code),
+    // 10 - bits for 10-bit captures (v is the ADC value, openvrx_iq.h). The
+    // readers below return steps either way.
+    uint8_t frac;
+    uint32_t rails;    // values at an ADC rail (10-bit captures only)
 } openvrx_agc_acc_t;
 
 void openvrx_agc_acc_reset(openvrx_agc_acc_t *a);
@@ -172,6 +178,47 @@ float openvrx_agc_mean_steps(const openvrx_agc_acc_t *a, unsigned axis);
 // Share of one axis' values below zero (sign bit set). The sign bit is the
 // ADC's own: on a top-bit layout it follows the true DC at any level.
 float openvrx_agc_neg_share(const openvrx_agc_acc_t *a, unsigned axis);
+
+// Batch window (C5-21). The 100 ms update once read its pads in one burst of
+// a few hundred microseconds, so a 5 GHz Wi-Fi packet overlapping it set the
+// whole measurement: the clipped share, the RMS and the DC servo's means
+// (board 2026-11-04: bursts read 2-6 % of such a burst, over the 5 % that
+// blocks raises). Now every OPENVRX_AGC_FAST_MS batch goes into a window and
+// the update pools the batches of its period, so the reads are spread over
+// the 100 ms and a burst can be left out. A batch stands out when its clipped
+// share is OPENVRX_AGC_BURST_CLIP_RISE over the window's median batch, or its
+// mean square OPENVRX_AGC_BURST_POWER times the median's. Batches that stand
+// out are a burst when they come in a run of at most OPENVRX_AGC_BURST_RUN
+// (a packet lasts at most a few ms; a fade-up or a carrier arriving lasts
+// longer) and when bursts are under half the window (most batches standing
+// out is the carrier itself). A run that ends at the newest batch counts too:
+// if it was a carrier arriving, the next update sees it.
+#define OPENVRX_AGC_WINDOW (OPENVRX_AGC_PERIOD_MS / OPENVRX_AGC_FAST_MS)   // 20 batches
+// Fewest batches behind an update; fewer (just after a gain change) waits.
+#define OPENVRX_AGC_WINDOW_MIN 4u
+#define OPENVRX_AGC_BURST_CLIP_RISE 0.40f
+#define OPENVRX_AGC_BURST_POWER 4.0f
+#define OPENVRX_AGC_BURST_RUN 2u
+
+typedef struct {
+    openvrx_agc_acc_t batch[OPENVRX_AGC_WINDOW];   // ring, oldest at (head - n) mod WINDOW
+    unsigned n;                                    // batches held
+    unsigned head;                                 // next slot written
+    unsigned gain;                                 // gain index and DC epoch of the held batches
+    uint32_t epoch;
+    uint8_t frac;                                  // their units (openvrx_agc_acc_t.frac)
+} openvrx_agc_window_t;
+
+void openvrx_agc_window_reset(openvrx_agc_window_t *w);
+// Adds a batch read at (gain, epoch). A batch at another gain or epoch than
+// the held ones starts the window over, so two analog states never mix; so
+// does a batch in other units (pad reads after captures or back). Past
+// OPENVRX_AGC_WINDOW batches the oldest is dropped.
+void openvrx_agc_window_push(openvrx_agc_window_t *w, const openvrx_agc_acc_t *batch, unsigned gain,
+                             uint32_t epoch);
+// The held batches summed into *out, bursts left out (see above). Returns
+// the number of batches left out.
+unsigned openvrx_agc_window_pool(const openvrx_agc_window_t *w, openvrx_agc_acc_t *out);
 
 // Next gain index from the measured level, within [gain_min, gain_max].
 unsigned openvrx_agc_next(unsigned gain, unsigned gain_min, unsigned gain_max, unsigned bits, float clip_share,

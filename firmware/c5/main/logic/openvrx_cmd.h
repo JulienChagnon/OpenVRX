@@ -56,6 +56,7 @@ typedef enum {
     OPENVRX_CMD_PING,
     OPENVRX_CMD_AGC,
     OPENVRX_CMD_DC,
+    OPENVRX_CMD_IQ,
     OPENVRX_CMD_COUNT,
 } openvrx_cmd_kind_t;
 
@@ -76,6 +77,16 @@ typedef enum {
 } openvrx_selftest_mode_t;
 
 typedef enum {
+    OPENVRX_IQ_OFF = 0,
+    OPENVRX_IQ_ON,       // gain loop and DC servo on 10-bit captures
+    OPENVRX_IQ_STRICT,   // on, and captures whose gain field differs are dropped
+    OPENVRX_IQ_PROBE,    // one capture, reported in detail
+} openvrx_iq_action_t;
+
+#define OPENVRX_IQ_PROBE_MAX 1024u
+#define OPENVRX_IQ_PROBE_DEFAULT 256u
+
+typedef enum {
     OPENVRX_CLK_DIV = 0,
     OPENVRX_CLK_ON,
     OPENVRX_CLK_OFF,
@@ -93,6 +104,7 @@ typedef struct {
         bool p11_on;
         bool agc_on;
         bool dc_on;
+        struct { openvrx_iq_action_t action; unsigned n; } iq;
         struct { int code; int skirt; } filter;   // code OPENVRX_FILTER_CAL = calibrated
         unsigned bw_mhz;
         struct { unsigned lanes; int clk; } drive; // clk -1 = unchanged

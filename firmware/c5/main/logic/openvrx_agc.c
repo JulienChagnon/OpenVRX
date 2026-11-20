@@ -60,10 +60,13 @@ void openvrx_agc_acc_add(openvrx_agc_acc_t *a, const openvrx_agc_plan_t *plan, u
     a->values += 2;
 }
 
+// Steps per unit of the acc's values (1 for pad reads).
+static float unit_steps(const openvrx_agc_acc_t *a) { return 1.0f / (float)(1u << a->frac); }
+
 float openvrx_agc_mean_steps(const openvrx_agc_acc_t *a, unsigned axis)
 {
     const uint32_t per_axis = a->values / 2u;
-    return axis < 2u && per_axis ? (float)a->sum2[axis] / (2.0f * (float)per_axis) : 0.0f;
+    return axis < 2u && per_axis ? (float)a->sum2[axis] / (2.0f * (float)per_axis) * unit_steps(a) : 0.0f;
 }
 
 float openvrx_agc_neg_share(const openvrx_agc_acc_t *a, unsigned axis)
@@ -77,7 +80,8 @@ float openvrx_agc_rms_ac_steps(const openvrx_agc_acc_t *a)
     if (!a->values) return 0.0f;
     // Mean square over both axes minus the mean of the two squared means.
     const float mi = openvrx_agc_mean_steps(a, 0), mq = openvrx_agc_mean_steps(a, 1);
-    const float ms = (float)a->sumsq4 / (4.0f * (float)a->values) - 0.5f * (mi * mi + mq * mq);
+    const float u = unit_steps(a);
+    const float ms = (float)a->sumsq4 / (4.0f * (float)a->values) * u * u - 0.5f * (mi * mi + mq * mq);
     return ms > 0.0f ? sqrtf(ms) : 0.0f;
 }
 
@@ -88,7 +92,7 @@ float openvrx_agc_clip_share(const openvrx_agc_acc_t *a)
 
 float openvrx_agc_rms_steps(const openvrx_agc_acc_t *a)
 {
-    return a->values ? sqrtf((float)a->sumsq4 / (4.0f * (float)a->values)) : 0.0f;
+    return a->values ? sqrtf((float)a->sumsq4 / (4.0f * (float)a->values)) * unit_steps(a) : 0.0f;
 }
 
 float openvrx_agc_target_share(unsigned bits)
@@ -169,4 +173,78 @@ unsigned openvrx_agc_slow(const openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned 
     if (next > gain && c->attacked && ms_since(now_ms, c->last_attack_ms) < (int32_t)OPENVRX_AGC_RAISE_HOLD_MS)
         return gain;
     return next;
+}
+
+void openvrx_agc_window_reset(openvrx_agc_window_t *w) { memset(w, 0, sizeof(*w)); }
+
+void openvrx_agc_window_push(openvrx_agc_window_t *w, const openvrx_agc_acc_t *batch, unsigned gain,
+                             uint32_t epoch)
+{
+    if (w->n && (gain != w->gain || epoch != w->epoch || batch->frac != w->frac)) openvrx_agc_window_reset(w);
+    w->gain = gain;
+    w->epoch = epoch;
+    w->frac = batch->frac;
+    w->batch[w->head] = *batch;
+    w->head = (w->head + 1u) % OPENVRX_AGC_WINDOW;
+    if (w->n < OPENVRX_AGC_WINDOW) ++w->n;
+}
+
+// Middle value of x[0..n) (the mean of the two middle ones for even n); sorts a copy.
+static float median(const float *x, unsigned n)
+{
+    float s[OPENVRX_AGC_WINDOW];
+    for (unsigned k = 0; k < n; ++k) {
+        unsigned j = k;
+        for (; j > 0 && s[j - 1] > x[k]; --j) s[j] = s[j - 1];
+        s[j] = x[k];
+    }
+    return 0.5f * (s[(n - 1u) / 2u] + s[n / 2u]);
+}
+
+unsigned openvrx_agc_window_pool(const openvrx_agc_window_t *w, openvrx_agc_acc_t *out)
+{
+    openvrx_agc_acc_reset(out);
+    const unsigned n = w->n;
+    if (!n) return 0;
+    // Batches in time order, oldest first, with their clipped share and mean square.
+    const openvrx_agc_acc_t *b[OPENVRX_AGC_WINDOW];
+    float clip[OPENVRX_AGC_WINDOW], ms[OPENVRX_AGC_WINDOW];
+    for (unsigned k = 0; k < n; ++k) {
+        b[k] = &w->batch[(w->head + OPENVRX_AGC_WINDOW - n + k) % OPENVRX_AGC_WINDOW];
+        clip[k] = openvrx_agc_clip_share(b[k]);
+        ms[k] = b[k]->values ? (float)b[k]->sumsq4 / (4.0f * (float)b[k]->values) : 0.0f;
+    }
+    const float clip_med = median(clip, n), ms_med = median(ms, n);
+    bool out_k[OPENVRX_AGC_WINDOW];
+    for (unsigned k = 0; k < n; ++k)
+        out_k[k] = clip[k] >= clip_med + OPENVRX_AGC_BURST_CLIP_RISE || ms[k] >= OPENVRX_AGC_BURST_POWER * ms_med;
+    // Runs of standing-out batches: only short ones are bursts.
+    bool burst[OPENVRX_AGC_WINDOW];
+    unsigned bursts = 0;
+    for (unsigned k = 0; k < n;) {
+        if (!out_k[k]) {
+            burst[k++] = false;
+            continue;
+        }
+        unsigned end = k;
+        while (end < n && out_k[end]) ++end;
+        const unsigned run = end - k;
+        const bool short_run = run <= OPENVRX_AGC_BURST_RUN;
+        for (; k < end; ++k) burst[k] = short_run;
+        if (short_run) bursts += run;
+    }
+    if (2u * bursts >= n) bursts = 0;   // most of the window: the carrier itself (or nothing to tell apart)
+    out->frac = w->frac;
+    for (unsigned k = 0; k < n; ++k) {
+        if (bursts && burst[k]) continue;
+        out->values += b[k]->values;
+        out->clips += b[k]->clips;
+        out->rails += b[k]->rails;
+        out->sumsq4 += b[k]->sumsq4;
+        for (unsigned a = 0; a < 2; ++a) {
+            out->sum2[a] += b[k]->sum2[a];
+            out->neg[a] += b[k]->neg[a];
+        }
+    }
+    return bursts;
 }

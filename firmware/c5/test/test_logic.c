@@ -13,6 +13,7 @@
 #include "arc_gain.h"
 #include "openvrx_agc.h"
 #include "openvrx_dc.h"
+#include "openvrx_iq.h"
 #include "openvrx_boards.h"
 #include "openvrx_cmd.h"
 #include "openvrx_lanes.h"
@@ -743,15 +744,45 @@ static float plant_dc(const dc_plant_t *p, const int trim[2], unsigned a)
     return p->dc0[a] + p->slope[a] * (float)trim[a] + p->cross * p->slope[a] * (float)trim[1 - a];
 }
 
+// Interference packets in time (C5-21): packets of s_pkt_us microseconds start at random (Poisson,
+// s_pkt_hz a second); a pad read inside one sees a carrier that rails both axes. s_clock_us is the
+// time of a measurement's first read; reads follow PAD_READ_US apart (a 4096-read burst took a few
+// hundred microseconds on the board, where bursts filled 2-6 % of one).
+#define PAD_READ_US 0.06
+static double s_pkt_hz, s_pkt_us, s_clock_us;
+static double s_pkt_next_us = -1.0, s_pkt_end_us;   // next packet start (-1: not drawn), end of the last
+
+static double pkt_gap_us(void) { return -log(1.0 - (double)frand()) * 1e6 / s_pkt_hz; }
+
+static void pkt_start(double hz, double us)
+{
+    s_pkt_hz = hz;
+    s_pkt_us = us;
+    s_pkt_end_us = 0.0;
+    s_pkt_next_us = hz > 0.0 ? s_clock_us + pkt_gap_us() : -1.0;
+}
+
+// True when a packet covers time t_us (times only move forward).
+static bool pkt_at(double t_us)
+{
+    if (s_pkt_next_us < 0.0) return false;
+    while (s_pkt_next_us <= t_us) {
+        s_pkt_end_us = s_pkt_next_us + s_pkt_us;
+        s_pkt_next_us += pkt_gap_us();
+    }
+    return t_us < s_pkt_end_us;
+}
+
 static void plant_measure_n(const dc_plant_t *p, const int trim[2], openvrx_agc_acc_t *acc, unsigned reads)
 {
     openvrx_agc_acc_reset(acc);
     const int shift = 10 - (int)p->bits;
     for (unsigned k = 0; k < reads; ++k) {
         const float ph = 6.2831853f * frand();
+        const float carrier = pkt_at(s_clock_us + PAD_READ_US * (double)k) ? 3000.0f : p->carrier;
         int v[2];
         for (unsigned a = 0; a < 2; ++a) {
-            const float x = plant_dc(p, trim, a) + p->noise * gauss() + p->carrier * (a ? sinf(ph) : cosf(ph));
+            const float x = plant_dc(p, trim, a) + p->noise * gauss() + carrier * (a ? sinf(ph) : cosf(ph));
             int code = (int)floorf(x);
             code = code < -512 ? -512 : code > 511 ? 511 : code;
             v[a] = code >> shift;   // arithmetic: floor
@@ -1034,14 +1065,23 @@ typedef struct {
     unsigned costly_ticks; // 5 ms ticks at or above the attack threshold (both axes start to clip together)
     unsigned under_ticks;  // 5 ms ticks more than 3 dB under the gain target (under-range)
     int clear_ms;          // ms from the run's start to the first tick under the attack threshold (-1: none yet)
+    unsigned drops;        // 100 ms updates that lowered the gain
+    unsigned min_gain;     // lowest gain in the run
+    unsigned bursts;       // batches the window left out
+    openvrx_agc_window_t win;   // LOOP_ATTACK: batches since the last 100 ms update
+    uint32_t next_full;         // LOOP_ATTACK: earliest time of the next 100 ms update
 } fade_result_t;
 
 // Share of 5 ms ticks whose batch an interference burst saturates.
 static float s_burst_rate;
 
 // Which loop fade_run drives: the 100 ms loop alone, with the first fast attack
-// (10 % clipped, always 6 indexes), or with today's attack.
-typedef enum { LOOP_SLOW, LOOP_ATTACK_V1, LOOP_ATTACK } loop_t;
+// (10 % clipped, always 6 indexes), today's attack with the 100 ms update on
+// one burst of reads at its tick (the firmware before C5-21), or today's loop
+// (the update pools the window of 5 ms batches).
+typedef enum { LOOP_SLOW, LOOP_ATTACK_V1, LOOP_ATTACK_BURST, LOOP_ATTACK } loop_t;
+// Reads of the 100 ms update's single burst before C5-21.
+#define BURST_READS 4096u
 
 // The fast attack as first built, kept as the reference the current one is compared with.
 static unsigned agc_fast_v1(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, float clip_share)
@@ -1067,21 +1107,43 @@ static void fade_run(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, uint
     const uint32_t start = *t;
     const float under = 4.4f * powf(10.0f, -3.0f / 20.0f);   // 4-bit target RMS, -3 dB
     r->clear_ms = -1;
+    if (!r->min_gain || r->gain < r->min_gain) r->min_gain = r->gain;
     for (uint32_t end = *t + ms; *t < end; *t += OPENVRX_AGC_FAST_MS) {
+        s_clock_us += 1000.0 * OPENVRX_AGC_FAST_MS;
         fade_plant(p, sig_db, r->gain, db_per_index);
         if (s_burst_rate > 0.0f && frand() < s_burst_rate) p->carrier = 3000.0f;   // a packet, rails both axes
         openvrx_agc_acc_t acc;
         unsigned next = r->gain;
-        if (*t % OPENVRX_AGC_PERIOD_MS == 0) {
-            plant_measure_n(p, trim0, &acc, OPENVRX_AGC_READS);
+        bool slow = false;
+        if (loop == LOOP_ATTACK) {
+            // As agc.c: every batch into the window, the attack on the batch, the 100 ms update on
+            // the pooled window once it holds enough batches.
+            plant_measure_n(p, trim0, &acc, OPENVRX_AGC_FAST_READS);
+            openvrx_agc_window_push(&r->win, &acc, r->gain, 0);
+            next = openvrx_agc_fast(c, *t, r->gain, 0, 4, openvrx_agc_clip_share(&acc));
+            if (next == r->gain && (int32_t)(*t - r->next_full) >= 0 && r->win.n >= OPENVRX_AGC_WINDOW_MIN) {
+                r->next_full = *t + OPENVRX_AGC_PERIOD_MS;
+                openvrx_agc_acc_t pool;
+                r->bursts += openvrx_agc_window_pool(&r->win, &pool);
+                openvrx_agc_window_reset(&r->win);
+                next = openvrx_agc_slow(c, *t, r->gain, 0, 83, 4, openvrx_agc_clip_share(&pool),
+                                        openvrx_agc_rms_ac_steps(&pool));
+                slow = true;
+            }
+        } else if (*t % OPENVRX_AGC_PERIOD_MS == 0) {
+            plant_measure_n(p, trim0, &acc, BURST_READS);
             const float clip = openvrx_agc_clip_share(&acc), rms = openvrx_agc_rms_ac_steps(&acc);
             next = loop != LOOP_SLOW ? openvrx_agc_slow(c, *t, r->gain, 0, 83, 4, clip, rms)
                                      : openvrx_agc_next(r->gain, 0, 83, 4, clip, rms);
+            slow = true;
         } else {
             plant_measure_n(p, trim0, &acc, OPENVRX_AGC_FAST_READS);
-            if (loop == LOOP_ATTACK) next = openvrx_agc_fast(c, *t, r->gain, 0, 4, openvrx_agc_clip_share(&acc));
+            if (loop == LOOP_ATTACK_BURST)
+                next = openvrx_agc_fast(c, *t, r->gain, 0, 4, openvrx_agc_clip_share(&acc));
             if (loop == LOOP_ATTACK_V1) next = agc_fast_v1(c, *t, r->gain, openvrx_agc_clip_share(&acc));
         }
+        if (slow && next < r->gain) ++r->drops;
+        if (next < r->min_gain) r->min_gain = next;
         if (openvrx_agc_clip_share(&acc) >= 0.05f) ++r->clip_ticks;
         if (openvrx_agc_rms_ac_steps(&acc) < under) ++r->under_ticks;
         if (openvrx_agc_clip_share(&acc) >= OPENVRX_AGC_ATTACK_CLIP) ++r->costly_ticks;
@@ -1270,6 +1332,307 @@ static void test_agc_fades(void)
     }
 }
 
+// ---------------------------------------------------------------- agc window (C5-21)
+
+// One 5 ms batch of the plant with this carrier (ADC units).
+static void window_batch(dc_plant_t *p, float carrier, openvrx_agc_acc_t *b)
+{
+    static const int trim0[2] = {0, 0};
+    p->carrier = carrier;
+    plant_measure_n(p, trim0, b, OPENVRX_AGC_FAST_READS);
+}
+
+// A window of OPENVRX_AGC_WINDOW batches: `carrier`, except those flagged in `mask` (bit k = batch k,
+// oldest first), which carry `other`. Returns the batches left out; *pool gets the pool.
+static unsigned window_case(dc_plant_t *p, float carrier, float other, uint32_t mask, openvrx_agc_acc_t *pool)
+{
+    openvrx_agc_window_t w;
+    openvrx_agc_window_reset(&w);
+    for (unsigned k = 0; k < OPENVRX_AGC_WINDOW; ++k) {
+        openvrx_agc_acc_t b;
+        window_batch(p, (mask >> k) & 1u ? other : carrier, &b);
+        openvrx_agc_window_push(&w, &b, 70, 1);
+    }
+    return openvrx_agc_window_pool(&w, pool);
+}
+
+// Settles a weak carrier from gain 60; returns the ms until the gain first reaches `want` (-1: never).
+static int window_settle(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, loop_t loop, unsigned want,
+                         uint32_t ms)
+{
+    uint32_t t = 0;
+    for (; t < ms; t += OPENVRX_AGC_PERIOD_MS) {
+        uint32_t t1 = t;
+        fade_run(p, c, r, &t1, OPENVRX_AGC_PERIOD_MS, -20.0f, 0.93f, loop);
+        if (r->gain >= want) return (int)(t + OPENVRX_AGC_PERIOD_MS);
+    }
+    return -1;
+}
+
+static void test_agc_window(void)
+{
+    dc_plant_t p;
+    plant_init(&p, OPENVRX_PRESET_4X4TOP);
+    p.noise = 6.0f;
+    // A weak carrier (1.6 steps on 4x4top, where the clip code is 7), a packet that rails both axes.
+    const float weak = 100.0f, rail = 3000.0f;
+    openvrx_agc_acc_t clean, pool;
+    CHECK(window_case(&p, weak, weak, 0, &clean) == 0);
+    CHECK(clean.values == 2u * OPENVRX_AGC_WINDOW * OPENVRX_AGC_FAST_READS);
+    CHECK(openvrx_agc_clip_share(&clean) < 0.001f);
+    const float rms_clean = openvrx_agc_rms_ac_steps(&clean);
+
+    // One packet: left out, the pool reads as the clean window. Without the rule the pool would
+    // read 5 % clipped (over the 5 % that blocks raises) and the RMS 4 dB high.
+    CHECK(window_case(&p, weak, rail, 1u << 7, &pool) == 1);
+    CHECK(pool.values == clean.values - 2u * OPENVRX_AGC_FAST_READS);
+    CHECK(openvrx_agc_clip_share(&pool) < 0.001f);
+    CHECK(fabsf(openvrx_agc_rms_ac_steps(&pool) / rms_clean - 1.0f) < 0.03f);
+    CHECK(fabsf(openvrx_agc_mean_steps(&pool, 0) - openvrx_agc_mean_steps(&clean, 0)) < 0.1f);
+    // Two in a row are still a packet; three in a row are not (5 ms apart: longer than a packet).
+    CHECK(window_case(&p, weak, rail, 3u << 7, &pool) == 2);
+    CHECK(window_case(&p, weak, rail, 7u << 7, &pool) == 0);
+    CHECK(openvrx_agc_clip_share(&pool) > 0.1f);
+    // At the newest end too (if it was a carrier arriving, the next update sees it).
+    CHECK(window_case(&p, weak, rail, 1u << 19, &pool) == 1);
+    CHECK(window_case(&p, weak, rail, 3u << 18, &pool) == 2);
+    // Many packets: 9 in 20 batches left out; 10 is half the window, which could be the carrier.
+    CHECK(window_case(&p, weak, rail, 0x2aaaau, &pool) == 9);
+    CHECK(window_case(&p, weak, rail, 0xaaaaau, &pool) == 0);
+    // A packet that does not rail but carries 16 times the power: left out on power.
+    CHECK(window_case(&p, weak, 4.0f * weak, 1u << 4, &pool) == 1);
+    // A carrier that steps up 10 dB for the last 6 batches is no packet.
+    CHECK(window_case(&p, weak, 3.16f * weak, 0x3fu << 14, &pool) == 0);
+    // A carrier clipping about 35 % of the time everywhere: nothing stands out.
+    CHECK(window_case(&p, 525.0f, 525.0f, 0, &pool) == 0);
+    CHECK(openvrx_agc_clip_share(&pool) > 0.25f && openvrx_agc_clip_share(&pool) < 0.45f);
+    // A packet on top of that carrier stands out on its clipping (the power is capped near full scale).
+    CHECK(window_case(&p, 525.0f, rail, 1u << 9, &pool) == 1);
+    CHECK(openvrx_agc_clip_share(&pool) < 0.45f);
+
+    // Window mechanics: a batch at another gain or epoch starts over; past the window the oldest go.
+    {
+        openvrx_agc_window_t w;
+        openvrx_agc_acc_t b;
+        openvrx_agc_window_reset(&w);
+        CHECK(openvrx_agc_window_pool(&w, &pool) == 0 && pool.values == 0);
+        window_batch(&p, weak, &b);
+        for (unsigned k = 0; k < 5; ++k) openvrx_agc_window_push(&w, &b, 60, 1);
+        CHECK(w.n == 5);
+        openvrx_agc_window_push(&w, &b, 61, 1);
+        CHECK(w.n == 1);
+        openvrx_agc_window_push(&w, &b, 61, 2);
+        CHECK(w.n == 1 && w.gain == 61 && w.epoch == 2);
+        openvrx_agc_acc_t r;
+        window_batch(&p, rail, &r);
+        openvrx_agc_window_reset(&w);
+        for (unsigned k = 0; k < 5; ++k) openvrx_agc_window_push(&w, &r, 60, 1);
+        for (unsigned k = 0; k < OPENVRX_AGC_WINDOW; ++k) openvrx_agc_window_push(&w, &b, 60, 1);
+        CHECK(w.n == OPENVRX_AGC_WINDOW);
+        CHECK(openvrx_agc_window_pool(&w, &pool) == 0 && openvrx_agc_clip_share(&pool) < 0.001f);
+    }
+
+    // Closed loop on a weak carrier (-20 dB: the gain settles about 21 indexes up), with packets in
+    // time. Short packets as the board saw them (2-6 % of a 4096-read burst: about 5 to 15 us) and
+    // Wi-Fi data frames (300 us: one covers a whole burst of the old update, which then reads as
+    // +27 dB of overload and drops 4 indexes).
+    static const struct {
+        double hz, us;
+    } pk[3] = {{0.0, 0.0}, {300.0, 15.0}, {200.0, 300.0}};
+    unsigned target;
+    {
+        // The packet-free settled gain, both loops alike.
+        fade_result_t r_old = {.gain = 60}, r_new = {.gain = 60};
+        openvrx_agc_ctl_t c_old, c_new;
+        openvrx_agc_ctl_init(&c_old);
+        openvrx_agc_ctl_init(&c_new);
+        plant_init(&p, OPENVRX_PRESET_4X4TOP);
+        (void)window_settle(&p, &c_old, &r_old, LOOP_ATTACK_BURST, 200, 3000);
+        (void)window_settle(&p, &c_new, &r_new, LOOP_ATTACK, 200, 3000);
+        target = r_new.gain;
+        CHECK(target >= 78 && target <= 83);
+        CHECK(r_old.gain + 1 >= target && r_old.gain <= target + 1);
+    }
+    for (unsigned k = 0; k < 3; ++k) {
+        fade_result_t r_old = {.gain = 60}, r_new = {.gain = 60};
+        openvrx_agc_ctl_t c_old, c_new;
+        openvrx_agc_ctl_init(&c_old);
+        openvrx_agc_ctl_init(&c_new);
+        plant_init(&p, OPENVRX_PRESET_4X4TOP);
+        pkt_start(pk[k].hz, pk[k].us);
+        // Settle within 3 s, then 10 s steady.
+        const int set_old = window_settle(&p, &c_old, &r_old, LOOP_ATTACK_BURST, target - 1, 3000);
+        const int set_new = window_settle(&p, &c_new, &r_new, LOOP_ATTACK, target - 1, 3000);
+        r_old.drops = r_new.drops = r_old.writes = r_new.writes = 0;
+        r_old.min_gain = r_old.gain;
+        r_new.min_gain = r_new.gain;
+        uint32_t t_old = 3000, t_new = 3000;
+        const unsigned bursts0 = r_new.bursts, atk_old = c_old.attacks, atk_new = c_new.attacks;
+        fade_run(&p, &c_old, &r_old, &t_old, 10000, -20.0f, 0.93f, LOOP_ATTACK_BURST);
+        fade_run(&p, &c_new, &r_new, &t_new, 10000, -20.0f, 0.93f, LOOP_ATTACK);
+        if (getenv("AGC_TRACE"))
+            printf("weak carrier, packets %.0f/s of %.0f us: settled gain %u; to %u: old %d new %d ms; in 10 s: 100 ms "
+                   "drops old %u new %u, attacks old %u new %u, writes old %u new %u, lowest gain old %u new %u, "
+                   "gain old %u new %u, bursts left out %u\n",
+                   pk[k].hz, pk[k].us, target, target - 1, set_old, set_new, r_old.drops, r_new.drops,
+                   c_old.attacks - atk_old, c_new.attacks - atk_new, r_old.writes, r_new.writes, r_old.min_gain,
+                   r_new.min_gain, r_old.gain, r_new.gain, r_new.bursts - bursts0);
+        // Today's loop reaches the gain as fast with packets as without, and its 100 ms update never
+        // lowers it for a packet. (The fast attack still fires when three batches in a row meet a
+        // packet: about once in 20 s at 6 % airtime, alike in both loops; not part of this change.)
+        CHECK(set_new >= 0 && set_new <= 1500);
+        CHECK(r_new.drops == 0);
+        if (c_new.attacks == atk_new) CHECK(r_new.min_gain + 1 >= target);   // no attack: never under the target
+        if (k == 2) {
+            // Long packets dragged the old update down every second or two (about 10 in 10 s).
+            CHECK(r_old.drops >= 2);
+            CHECK(r_new.bursts - bursts0 >= 40);
+        }
+    }
+    pkt_start(0.0, 0.0);
+}
+
+// ---------------------------------------------------------------- 10-bit captures (C5-20)
+
+static uint32_t iq_word(int i, int q, unsigned gain)
+{
+    return ((uint32_t)(i & 0x3ff) << 10) | (uint32_t)(q & 0x3ff) | ((gain & OPENVRX_IQ_GAIN_MASK) << OPENVRX_IQ_GAIN_SHIFT);
+}
+
+static uint32_t s_iq_rng = 12345u;
+static float iq_gauss(void)
+{
+    // Box-Muller on a 32-bit LCG: repeatable, good enough for statistics checks.
+    s_iq_rng = s_iq_rng * 1664525u + 1013904223u;
+    const float u1 = ((float)(s_iq_rng >> 8) + 1.0f) / 16777217.0f;
+    s_iq_rng = s_iq_rng * 1664525u + 1013904223u;
+    const float u2 = (float)(s_iq_rng >> 8) / 16777216.0f;
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+}
+
+static int iq_clamp(float v)
+{
+    const long r = lroundf(v);
+    return r > 511 ? 511 : r < -512 ? -512 : (int)r;
+}
+
+static void test_iq(void)
+{
+    // Decode: Q in bits 0..9, I in 10..19, gain in 20..26.
+    const openvrx_iq_sample_t s = openvrx_iq_decode(iq_word(-5, 300, 83));
+    CHECK(s.i == -5 && s.q == 300 && s.gain == 83);
+    const openvrx_iq_sample_t r = openvrx_iq_decode(iq_word(511, -512, 0));
+    CHECK(r.i == 511 && r.q == -512 && r.gain == 0);
+
+    // Fill pattern: never a sample word (bit 31), and written words counted.
+    uint32_t w[OPENVRX_IQ_MAX];
+    for (unsigned k = 0; k < 64; ++k) {
+        w[k] = openvrx_iq_sentinel(k);
+        CHECK(w[k] >> 31);
+        CHECK(k == 0 || w[k] != w[k - 1]);
+    }
+    CHECK(openvrx_iq_written(w, 64) == 0);
+    w[0] = iq_word(0, 0, 0);
+    w[17] = iq_word(3, 4, 5);
+    w[63] = iq_word(-1, -1, 9);
+    CHECK(openvrx_iq_written(w, 64) == 3);
+
+    // A noisy carrier-free capture at 4x4top: the clipped share is the lanes' exactly, mean and RMS close to
+    // the generated ones.
+    const unsigned n = 256;
+    const float sigma = 150.0f, dc_i = 40.0f;
+    unsigned lane_clips = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        const int i = iq_clamp(dc_i + sigma * iq_gauss()), q = iq_clamp(sigma * iq_gauss());
+        w[k] = iq_word(i, q, 70);
+        const int ci = i >= 0 ? i / 64 : -((-i - 1) / 64) - 1, cq = q >= 0 ? q / 64 : -((-q - 1) / 64) - 1;
+        lane_clips += (ci == 7 || ci == -8) + (cq == 7 || cq == -8);
+    }
+    openvrx_agc_acc_t a;
+    openvrx_agc_acc_reset(&a);
+    openvrx_iq_check_t chk;
+    CHECK(openvrx_iq_add(&a, w, n, 4, 70, true, &chk));
+    CHECK(a.frac == 6 && a.values == 2 * n && chk.samples == n && chk.gain_bad == 0);
+    CHECK(a.clips == lane_clips);
+    CHECK(fabsf(openvrx_agc_rms_ac_steps(&a) - sigma / 64.0f) < 0.15f * sigma / 64.0f);
+    CHECK(fabsf(openvrx_agc_mean_steps(&a, 0) - dc_i / 64.0f) < 0.25f);
+    CHECK(fabsf(openvrx_agc_mean_steps(&a, 1)) < 0.25f);
+
+    // C5-8: a cloud well inside one lane step. The pads read 0.5 step whatever the level; the capture reads it.
+    const float tiny = 10.0f;   // 0.16 step at 4 bits
+    for (unsigned k = 0; k < n; ++k) w[k] = iq_word(iq_clamp(tiny * iq_gauss()), iq_clamp(tiny * iq_gauss()), 70);
+    openvrx_agc_acc_reset(&a);
+    CHECK(openvrx_iq_add(&a, w, n, 4, 70, true, &chk));
+    CHECK(fabsf(openvrx_agc_rms_ac_steps(&a) - tiny / 64.0f) < 0.2f * tiny / 64.0f);
+    CHECK(openvrx_agc_rms_ac_steps(&a) < 0.25f);
+    CHECK(a.clips == 0 && a.rails == 0);
+    // The same cloud through the pads (lane codes only) cannot go under half a step.
+    openvrx_agc_acc_t pads;
+    openvrx_agc_acc_reset(&pads);
+    for (unsigned k = 0; k < n; ++k) {
+        const openvrx_iq_sample_t t = openvrx_iq_decode(w[k]);
+        const int ci = t.i >= 0 ? t.i / 64 : -((-t.i - 1) / 64) - 1, cq = t.q >= 0 ? t.q / 64 : -((-t.q - 1) / 64) - 1;
+        pads.sumsq4 += (uint64_t)((2 * ci + 1) * (2 * ci + 1) + (2 * cq + 1) * (2 * cq + 1));
+        pads.values += 2;
+    }
+    CHECK(openvrx_agc_rms_steps(&pads) >= 0.5f);
+
+    // Rails counted at 10 bits, apart from the lanes' clipping.
+    for (unsigned k = 0; k < n; ++k) w[k] = iq_word(k % 2 ? 511 : -512, 0, 70);
+    openvrx_agc_acc_reset(&a);
+    CHECK(openvrx_iq_add(&a, w, n, 7, 70, true, &chk));
+    CHECK(a.rails == n && chk.rails == n && a.clips == n && a.frac == 3);
+
+    // Rejections leave the acc alone: a stopped engine (one word repeated), a gain field off the index in force
+    // (strict only), units that do not match.
+    for (unsigned k = 0; k < n; ++k) w[k] = iq_word(12, -7, 70);
+    openvrx_agc_acc_reset(&a);
+    CHECK(!openvrx_iq_add(&a, w, n, 4, 70, true, &chk));
+    CHECK(a.values == 0 && chk.repeats == n - 1);
+    for (unsigned k = 0; k < n; ++k) w[k] = iq_word((int)k - 128, 0, k < 10 ? 71 : 70);
+    CHECK(!openvrx_iq_add(&a, w, n, 4, 70, true, &chk));
+    CHECK(a.values == 0 && chk.gain_bad == 10);
+    CHECK(openvrx_iq_add(&a, w, n, 4, 70, false, &chk));
+    CHECK(a.values == 2 * n && chk.gain_bad == 10);
+    CHECK(!openvrx_iq_add(&a, w, n, 5, 70, false, &chk));   // the acc holds 4-bit units
+    CHECK(a.values == 2 * n);
+    CHECK(!openvrx_iq_add(&a, w, 0, 4, 70, false, &chk));
+    CHECK(!openvrx_iq_add(&a, w, n, 1, 70, false, &chk));
+
+    // Window: a batch in other units starts it over; the pool keeps the units and the rails.
+    openvrx_agc_window_t win;
+    openvrx_agc_window_reset(&win);
+    openvrx_agc_acc_t lane_batch;
+    openvrx_agc_acc_reset(&lane_batch);
+    lane_batch.values = 2;
+    lane_batch.sumsq4 = 2;
+    openvrx_agc_window_push(&win, &lane_batch, 70, 1);
+    openvrx_agc_window_push(&win, &lane_batch, 70, 1);
+    CHECK(win.n == 2 && win.frac == 0);
+    openvrx_agc_window_push(&win, &a, 70, 1);
+    CHECK(win.n == 1 && win.frac == 6);
+    openvrx_agc_window_push(&win, &a, 70, 1);
+    openvrx_agc_acc_t pooled;
+    openvrx_agc_window_pool(&win, &pooled);
+    CHECK(pooled.frac == 6 && pooled.values == 2 * a.values && pooled.rails == 2 * a.rails);
+    CHECK(fabsf(openvrx_agc_rms_steps(&pooled) - openvrx_agc_rms_steps(&a)) < 1e-4f);
+
+    // Console: iq on | off | strict | probe [n].
+    openvrx_cmd_t cmd;
+    openvrx_err_t err;
+    CHECK(parse("iq on", &cmd, &err) && cmd.kind == OPENVRX_CMD_IQ && cmd.a.iq.action == OPENVRX_IQ_ON);
+    CHECK(parse("iq off", &cmd, &err) && cmd.a.iq.action == OPENVRX_IQ_OFF);
+    CHECK(parse("iq strict", &cmd, &err) && cmd.a.iq.action == OPENVRX_IQ_STRICT);
+    CHECK(parse("iq probe", &cmd, &err) && cmd.a.iq.action == OPENVRX_IQ_PROBE && cmd.a.iq.n == 256);
+    CHECK(parse("iq probe 64", &cmd, &err) && cmd.a.iq.n == 64);
+    CHECK(!parse("iq probe 0", &cmd, &err) && err.code == OPENVRX_ERR_RANGE);
+    CHECK(!parse("iq probe 2000", &cmd, &err) && err.code == OPENVRX_ERR_RANGE);
+    CHECK(!parse("iq maybe", &cmd, &err) && err.code == OPENVRX_ERR_SYNTAX);
+    CHECK(!parse("iq on 3", &cmd, &err) && err.code == OPENVRX_ERR_SYNTAX);
+    CHECK(!parse("iq", &cmd, &err));
+    CHECK_STR(openvrx_cmd_word(OPENVRX_CMD_IQ), "iq");
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--tables") == 0) {
@@ -1285,6 +1648,8 @@ int main(int argc, char **argv)
     test_agc();
     test_dc();
     test_agc_fades();
+    test_agc_window();
+    test_iq();
     printf("%u checks, %u failures\n", s_checks, s_failures);
     return s_failures ? 1 : 0;
 }

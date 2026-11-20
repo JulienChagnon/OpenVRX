@@ -4,6 +4,7 @@
 // console_reply().
 #include "radiohead.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,7 +20,9 @@
 #include "freertos/task.h"
 #include "lanes_hw.h"
 #include "openvrx_boards.h"
+#include "openvrx_agc.h"
 #include "openvrx_cmd.h"
+#include "openvrx_iq.h"
 #include "openvrx_sclk_logic.h"
 #include "rf.h"
 #include "sclk.h"
@@ -208,9 +211,17 @@ static void cmd_status(void)
         snprintf(dc + len, sizeof(dc) - (size_t)len, " dco=%d/%d trim=%d/%d", d.code[0], d.code[1], d.trim[0], d.trim[1]);
     else
         snprintf(dc + len, sizeof(dc) - (size_t)len, " dco=%s trim=-", d.failed ? "error" : "-");
-    reply("OK status mhz=%u off_khz=%d gain=%u agc=%d %s atk=%u dc=%d %s clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
+    agc_iq_stats_t iq;
+    agc_iq_stats(&iq);
+    char iqs[96];
+    if (iq.on)
+        snprintf(iqs, sizeof(iqs), "iq=%s iq_ok=%lu iq_fail=%lu iq_us=%u rails=%u.%u", iq.strict ? "strict" : "1",
+                 (unsigned long)iq.ok, (unsigned long)iq.fail, iq.us, iq.rail_permille / 10, iq.rail_permille % 10);
+    else
+        snprintf(iqs, sizeof(iqs), "iq=0");
+    reply("OK status mhz=%u off_khz=%d gain=%u agc=%d %s atk=%u bursts=%u %s dc=%d %s clk=%lu clk_on=%d lanes=%s p11=%d filter=%s skirt=%u bw=%u "
           "selftest=%s up_ms=%llu slips=%lu phy=%s board=%s hz=%lu boot=%s",
-          c.mhz, c.off_khz, c.gain, agc_enabled() ? 1 : 0, level, agc_attacks(), c.dc ? 1 : 0, dc, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
+          c.mhz, c.off_khz, c.gain, agc_enabled() ? 1 : 0, level, agc_attacks(), agc_bursts(), iqs, c.dc ? 1 : 0, dc, (unsigned long)sclk_div(), sclk_on() ? 1 : 0, openvrx_preset_name(current_preset()),
           c.p11 ? 1 : 0, filter_text(c.filter_code, fbuf, sizeof(fbuf)), c.skirt, c.bw20 ? 20u : 40u,
           lanes_hw_selftest_name(st), (unsigned long long)(esp_timer_get_time() / 1000), (unsigned long)sclk_slips(),
           rf_phy_state_name(rf_phy_state()), openvrx_board_name(s_board), (unsigned long)openvrx_clock_hz(sclk_div()),
@@ -279,7 +290,9 @@ static void cmd_tune(int mhz, int off_khz)
         return;
     }
     const rf_config_t c = rf_config();
-    reply("OK tune mhz=%u off_khz=%d", c.mhz, c.off_khz);
+    const rf_tune_time_t t = rf_last_tune();
+    reply("OK tune mhz=%u off_khz=%d us=%lu vendor_us=%lu path=%s reforce=%d", c.mhz, c.off_khz,
+          (unsigned long)t.total_us, (unsigned long)t.vendor_us, t.setup ? "setup" : "offset", t.reforced ? 1 : 0);
 }
 
 static void cmd_gain(unsigned gain)
@@ -439,6 +452,61 @@ static void cmd_dc(bool on)
     else reply("OK dc on=%d held=0", on ? 1 : 0);
 }
 
+// C5-20. `iq probe [n]`: one capture with the whole capture RAM checked,
+// the words as EVT iqw lines (32 per line, hex), then one OK line with the
+// capture's facts and the heap (the capture bank is kept out of it).
+static uint32_t s_probe_words[OPENVRX_IQ_PROBE_MAX];
+
+static void cmd_iq_probe(unsigned n)
+{
+    rf_iq_probe_t p;
+    const esp_err_t err = rf_iq_probe(s_probe_words, n, &p);
+    if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_ARG) {
+        reply_esp_err(OPENVRX_CMD_IQ, err);
+        return;
+    }
+    for (unsigned k = 0; k < n; k += 32u) {
+        char line[OPENVRX_LINE_MAX * 3];
+        int len = snprintf(line, sizeof(line), "iqw k=%u", k);
+        for (unsigned j = k; j < n && j < k + 32u && len > 0 && (size_t)len < sizeof(line); ++j)
+            len += snprintf(line + len, sizeof(line) - (size_t)len, " %08lx", (unsigned long)s_probe_words[j]);
+        console_evt("%s", line);
+    }
+    // Statistics at 10 bits (one step = one ADC unit), gain field counted.
+    openvrx_agc_acc_t acc;
+    openvrx_agc_acc_reset(&acc);
+    openvrx_iq_check_t chk;
+    const bool usable = openvrx_iq_add(&acc, s_probe_words, n, 10u, (int)p.gain_forced, false, &chk);
+    int imin = 511, imax = -512, qmin = 511, qmax = -512;
+    for (unsigned k = 0; k < n; ++k) {
+        const openvrx_iq_sample_t s = openvrx_iq_decode(s_probe_words[k]);
+        if (s.i < imin) imin = s.i;
+        if (s.i > imax) imax = s.i;
+        if (s.q < qmin) qmin = s.q;
+        if (s.q > qmax) qmax = s.q;
+    }
+    const openvrx_iq_sample_t s0 = openvrx_iq_decode(s_probe_words[0]);
+    reply("OK iq probe n=%u err=%s us=%lu done=%d written=%u guard=%d ptr=%lu changed=%u first=%d last=%d "
+          "usable=%d gain=%u field0=%u gain_bad=%u rails=%u repeats=%u high=%u i_mean=%d q_mean=%d rms_ac=%d "
+          "i=%d..%d q=%d..%d heap=%lu heap_min=%lu",
+          n, esp_err_to_name(err), (unsigned long)p.meta.us, p.meta.done ? 1 : 0, p.meta.written,
+          p.meta.guard_ok ? 1 : 0, (unsigned long)p.meta.ptr, p.changed, p.first, p.last, usable ? 1 : 0,
+          p.gain_forced, s0.gain, chk.gain_bad, chk.rails, chk.repeats, chk.high_bits,
+          (int)lroundf(openvrx_agc_mean_steps(&acc, 0)), (int)lroundf(openvrx_agc_mean_steps(&acc, 1)),
+          (int)lroundf(openvrx_agc_rms_ac_steps(&acc)), imin, imax, qmin, qmax,
+          (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+}
+
+static void cmd_iq(openvrx_iq_action_t action, unsigned n)
+{
+    if (action == OPENVRX_IQ_PROBE) {
+        cmd_iq_probe(n);
+        return;
+    }
+    agc_set_iq(action != OPENVRX_IQ_OFF, action == OPENVRX_IQ_STRICT);
+    reply("OK iq on=%d strict=%d", action != OPENVRX_IQ_OFF ? 1 : 0, action == OPENVRX_IQ_STRICT ? 1 : 0);
+}
+
 static void cmd_save(void)
 {
     const rf_config_t c = rf_config();
@@ -508,6 +576,7 @@ void radiohead_command(char *line)
         reply("OK agc on=%d", cmd.a.agc_on ? 1 : 0);
         break;
     case OPENVRX_CMD_DC: cmd_dc(cmd.a.dc_on); break;
+    case OPENVRX_CMD_IQ: cmd_iq(cmd.a.iq.action, cmd.a.iq.n); break;
     default: reply_err(cmd.kind, OPENVRX_ERR_SYNTAX, "unknown command"); break;
     }
 }

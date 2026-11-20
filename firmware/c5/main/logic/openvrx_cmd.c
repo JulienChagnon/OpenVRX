@@ -27,6 +27,7 @@ static const char *const s_words[OPENVRX_CMD_COUNT] = {
     [OPENVRX_CMD_PING] = "ping",
     [OPENVRX_CMD_AGC] = "agc",
     [OPENVRX_CMD_DC] = "dc",
+    [OPENVRX_CMD_IQ] = "iq",
 };
 
 const char *openvrx_cmd_word(openvrx_cmd_kind_t kind)
@@ -207,6 +208,29 @@ bool openvrx_cmd_parse(char *line, openvrx_cmd_t *cmd, openvrx_err_t *err, const
     case OPENVRX_CMD_DC:
         if (!args(n, 1, 1, err)) return false;
         if (!parse_on_off(tok[1], &cmd->a.dc_on)) return fail(err, OPENVRX_ERR_SYNTAX, "expected on or off");
+        return true;
+    case OPENVRX_CMD_IQ:
+        if (!args(n, 1, 2, err)) return false;
+        cmd->a.iq.n = OPENVRX_IQ_PROBE_DEFAULT;
+        if (strcmp(tok[1], "probe") == 0) {
+            cmd->a.iq.action = OPENVRX_IQ_PROBE;
+            if (n == 3) {
+                if (!openvrx_parse_int(tok[2], -100000, 100000, &v)) return fail(err, OPENVRX_ERR_SYNTAX, "bad count");
+                if (v < 1 || v > (long)OPENVRX_IQ_PROBE_MAX) return fail(err, OPENVRX_ERR_RANGE, "count out of 1..1024");
+                cmd->a.iq.n = (unsigned)v;
+            }
+            return true;
+        }
+        if (n != 2) return fail(err, OPENVRX_ERR_SYNTAX, "too many arguments");
+        if (strcmp(tok[1], "strict") == 0) {
+            cmd->a.iq.action = OPENVRX_IQ_STRICT;
+            return true;
+        }
+        {
+            bool on;
+            if (!parse_on_off(tok[1], &on)) return fail(err, OPENVRX_ERR_SYNTAX, "expected on, off, strict or probe");
+            cmd->a.iq.action = on ? OPENVRX_IQ_ON : OPENVRX_IQ_OFF;
+        }
         return true;
     case OPENVRX_CMD_FILTER:
         if (!args(n, 1, 2, err)) return false;
