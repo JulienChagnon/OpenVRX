@@ -26,6 +26,7 @@ typedef enum {
     OPENVRX_BOARD_XIAO = 0,
     OPENVRX_BOARD_ZERO,
     OPENVRX_BOARD_CUSTOM,
+    OPENVRX_BOARD_XIAO7X7,   // after CUSTOM so saved settings keep their board index
     OPENVRX_BOARD_COUNT,
 } openvrx_board_id_t;
 
@@ -56,7 +57,7 @@ typedef enum {
     OPENVRX_ROUTE_BAD_MAP = -3,     // the board map is invalid
 } openvrx_route_result_t;
 
-// Built-in maps (XIAO, C5-Zero). OPENVRX_BOARD_CUSTOM returns NULL here; the
+// Built-in maps (XIAO, C5-Zero, XIAO 7x7 beside the FX2 mini board). OPENVRX_BOARD_CUSTOM returns NULL here; the
 // firmware supplies the custom map from Kconfig.
 const openvrx_board_map_t *openvrx_board_builtin(openvrx_board_id_t id);
 const char *openvrx_board_name(openvrx_board_id_t id);

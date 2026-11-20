@@ -187,6 +187,32 @@ static void test_boards(void)
     // GPIO11 (499 ohm on the Zero) carries only the I bit 2 lane.
     CHECK(z->w16[8] == 11);
 
+    // XIAO beside the FX2 mini board: the same 15 pins as the XIAO map, 16-bit presets only.
+    const openvrx_board_map_t *x7 = openvrx_board_builtin(OPENVRX_BOARD_XIAO7X7);
+    CHECK(x7 && openvrx_board_validate(x7, why, sizeof(why)));
+    CHECK(openvrx_board_pin_count(x7) == 15 && openvrx_board_gpio_mask(x7) == xm);
+    CHECK(((1u << x7->clk) & strap) == 0 && x7->clk == 24);
+    for (unsigned k = 0; k < OPENVRX_PRESET_COUNT; ++k) {
+        const openvrx_preset_t p = (openvrx_preset_t)k;
+        CHECK(openvrx_board_fits(x7, p) ==
+              (p == OPENVRX_PRESET_7X7 || p == OPENVRX_PRESET_6X6 || p == OPENVRX_PRESET_5X5));
+    }
+    CHECK(openvrx_board_default_preset(x7) == OPENVRX_PRESET_7X7);
+    CHECK(openvrx_route(x7, OPENVRX_PRESET_4X4TOP, &r, &missing) == OPENVRX_ROUTE_NO_FIT);
+    CHECK(openvrx_route(x7, OPENVRX_PRESET_7X7, &r, NULL) == OPENVRX_ROUTE_OK);
+    CHECK(r.n == 14 && (r.used_mask | (1u << r.clk)) == xm && r.idle_mask == 0 && r.spare_mask == 0);
+    // HARDWARE.md table: Q3 D6 (GPIO11), Q9 D9 (GPIO9), I3 MTCK (GPIO4), I9 D1 (GPIO0).
+    CHECK(r.lane[0].word_bit == 1 && r.lane[0].comp == 'Q' && r.lane[0].adc_bit == 3 && r.gpio[0] == 11);
+    CHECK(r.lane[6].word_bit == 7 && r.lane[6].adc_bit == 9 && r.gpio[6] == 9);
+    CHECK(r.lane[7].word_bit == 9 && r.lane[7].comp == 'I' && r.lane[7].adc_bit == 3 && r.gpio[7] == 4);
+    CHECK(r.lane[13].word_bit == 15 && r.lane[13].adc_bit == 9 && r.gpio[13] == 0);
+    // 5x5 on this wiring: bits 4 and 3 (D4, D6, MTMS, MTCK) driven low.
+    CHECK(openvrx_route(x7, OPENVRX_PRESET_5X5, &r, NULL) == OPENVRX_ROUTE_OK);
+    CHECK(r.idle_mask == ((1u << 11) | (1u << 23) | (1u << 4) | (1u << 2)));
+    openvrx_board_id_t id7;
+    CHECK(openvrx_board_parse("xiao7x7", &id7) && id7 == OPENVRX_BOARD_XIAO7X7);
+    CHECK_STR(openvrx_board_name(OPENVRX_BOARD_XIAO7X7), "xiao7x7");
+
     // NONE route: nothing used, every lane pin spare.
     CHECK(openvrx_route(z, OPENVRX_PRESET_NONE, &r, NULL) == OPENVRX_ROUTE_OK);
     CHECK(r.n == 0 && r.spare_mask == (zm & ~(1u << z->clk)));

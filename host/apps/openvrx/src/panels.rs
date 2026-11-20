@@ -119,7 +119,7 @@ fn receivers(ui: &mut Ui, app: &mut OpenvrxApp) {
             });
             ui.horizontal(|ui| {
                 ui.label("Board");
-                combo(ui, &format!("board{k}"), &mut r.board, &[BoardKind::Xiao, BoardKind::Zero, BoardKind::Custom], |b| {
+                combo(ui, &format!("board{k}"), &mut r.board, &[BoardKind::Xiao, BoardKind::Xiao7x7, BoardKind::Zero, BoardKind::Custom], |b| {
                     b.name().to_string()
                 });
                 ui.label("Lanes");

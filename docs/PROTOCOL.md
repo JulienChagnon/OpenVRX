@@ -35,7 +35,7 @@ The C5 stores nothing in flash unless `save` is sent.
 |---|---|---|
 | `ver` | `OK ver fw=0.1.0 proto=1 board=xiao idf=v6.0.2 chip=esp32c5 rev=1` | |
 | `status` | `OK status mhz=5732 off_khz=0 gain=64 agc=1 clip=0.4 rms=4.31 atk=0 dc=1 i_dc=3 q_dc=-5 dco=241/250 trim=-18/-14 clk=18 clk_on=1 lanes=7x7 p11=1 filter=cal selftest=off up_ms=12345 slips=2 phy=ok` | `clip` (% of I/Q values at full scale) and `rms` (per component, in steps of the lowest carried bit) are the last gain-loop measurement, `-` when the layout cannot be measured. While the DC is held, `rms` is taken around the mean (the offset is not signal); otherwise it includes it. `atk`: fast-attack gain drops since boot. `i_dc`/`q_dc`: the measured I and Q mean in ADC units (full scale 512, the unit of the PC's `decode` stats). `dco`: the held DC DAC pair (`-` not held, `error` when a hold did not read back), `trim`: its distance from the vendor code of the gain row. |
-| `board <xiao\|zero\|custom>` | `OK board name=xiao pins=15` | Selects the pin map (see HARDWARE.md). Re-routes lanes. |
+| `board <xiao\|zero\|custom\|xiao7x7>` | `OK board name=xiao pins=15` | Selects the pin map (see HARDWARE.md). Re-routes lanes. `xiao7x7`: the XIAO beside the FX2 mini board, 16-bit presets only. |
 | `pins` | `OK pins clk=G10 q=G1,G0,... i=G23,...` | Pin map for the current board and lanes, MSB first. |
 | `lanes <preset>` | `OK lanes preset=7x7 data_pins=14` | Presets as `openvrx_core::LanePreset` names: `8x8 7x7 6x6 5x5 4x4top 4x4fine 4x4ultra angle8`. `ERR range` if the board lacks pins. |
 | `tune <MHz> [offset_khz]` | `OK tune mhz=5732 off_khz=0` | Raw MHz, any value the PHY accepts (5645..5945 typical). |

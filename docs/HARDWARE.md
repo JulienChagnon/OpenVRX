@@ -112,6 +112,97 @@ are then unconnected and the firmware's low drive on them is harmless.
 The XIAO needs its back pads for 6x6 and 7x7: use headers or wire the pads
 before soldering the board down.
 
+### XIAO 7x7 beside the FX2 mini board (default 7x7 pinout)
+
+The default 7x7 wiring. It routes each FX2 pin from the nearest C5 pin, so
+the wires are short and mostly straight; the C5 firmware moves the lanes to
+match (the host side is unchanged: the FX2 word is the same as in the table
+above). The 4x4 bench wiring (8-bit table below) stays as it is.
+
+Layout: the XIAO sits between the FX2 board's two 2x10 headers. Its D0..D6
+column lines up with rows 1..7 of the FX2 left header, and its VBUS, GND,
+3V3, D10..D7 column with rows 1..7 of the FX2 right header. Rows count from
+the top (the XIAO's USB end); L and R are the two columns of each header.
+
+FX2 headers as wired:
+
+| Row | Left header L | Left header R | Right header L | Right header R |
+|---|---|---|---|---|
+| 1 | PD5 | PD6 | PD4 | PD3 |
+| 2 | PD7 | GND | PD2 | PD1 |
+| 3 | CLK | GND | PD0 | PA7 |
+| 4 | RDY1 | RDY0 | PA6 | PA5 |
+| 5 | GND | VCC | PA4 | PA3 |
+| 6 | GND | IFCLK | PA2 | PA1 |
+| 7 | SCL | SDA | PA0 | CTL2 |
+| 8 | PB0 | PB1 | CTL1 | CTL0 |
+| 9 | PB2 | PB3 | PB7 | PB6 |
+| 10 | GND | VCC | PB5 | PB4 |
+
+FX2 left header and the XIAO D0 column:
+
+| C5 pin (GPIO) | FX2 pin (row, column) | Signal |
+|---|---|---|
+| D0 (GPIO1) | PD5 (1 L) | I7 |
+| D1 (GPIO0) | PD7 (2 L) | I9 |
+| D2 (GPIO25) | PD6 (1 R) | I8 |
+| D3 (GPIO7) | PB3 (9 R) | Q5 |
+| D4 (GPIO23) | PB2 (9 L) | Q4 |
+| D5 (GPIO24) | IFCLK (6 R) | sample clock: keep it straight and short, its return is the GND at 6 L |
+| D6 (GPIO11) | PB1 (8 R) | Q3 |
+
+FX2 right header and the XIAO VBUS column and back pads:
+
+| C5 pin (GPIO) | FX2 pin (row, column) | Signal |
+|---|---|---|
+| MTDO pad (GPIO5) | PD3 (1 R) | I5 |
+| MTDI pad (GPIO3) | PD4 (1 L) | I6 |
+| MTCK pad (GPIO4) | PD1 (2 R) | I3 |
+| MTMS pad (GPIO2) | PD2 (2 L) | I4 |
+| D10 (GPIO10) | PB6 (9 R) | Q8 |
+| D9 (GPIO9) | PB7 (9 L) | Q9 |
+| D8 (GPIO8) | PB4 (10 R) | Q6 |
+| D7 (GPIO12) | PB5 (10 L) | Q7 |
+
+Control ties (blue mini board: RDY0 and RDY1 are tied by the header label,
+which is swapped against the chip signal, see the board note above):
+
+| FX2 pin | Where (header, row, column) | Tie to | Nearest pin (header, row, column) |
+|---|---|---|---|
+| Header label RDY0 (chip SLWR) | left 4 R | GND | left 3 R, right beside it |
+| Header label RDY1 (chip SLRD) | left 4 L | FX2 VCC | left 5 R, diagonal |
+| PB0 (spare lane) | left 8 L | GND | left 10 L |
+| PD0 (spare lane) | right 3 L | GND | XIAO GND pin (lines up with right row 2) |
+| PA5 (FIFOADR1) | right 4 R | GND | XIAO GND pin, or chain from PD0 |
+| PA4 (FIFOADR0) | right 5 L | GND | XIAO GND pin, or chain from PA5 |
+| PA6 (PKTEND) | right 4 L | FX2 VCC | left 5 R (across the board), or left 10 R |
+| PA2 (SLOE) | right 6 L | FX2 VCC | chain from PA6 |
+| PA7 (SLCS#) | right 3 R | leave open | - |
+
+All GND pins are one net (FX2 GND, XIAO GND and the shared ground), so a
+GND tie can go to any of them; the last column only names the closest one.
+The right header has no GND or VCC pin: its GND ties can share one wire
+from the XIAO GND, and its VCC ties one wire from the FX2 VCC. Never take a
+VCC tie from the XIAO 3V3.
+
+Power and ground:
+
+- GND: two wires from the XIAO GND to the FX2 GND, one of them to left 6 L
+  beside IFCLK (the clock's return).
+- XIAO 3V3: not connected. It is the output of the XIAO's own regulator;
+  tied to the FX2 VCC, two regulators would drive one rail. The 3.3 V ties
+  above go to the FX2 VCC.
+- XIAO VBUS and BAT: not connected. The XIAO runs from its own USB cable.
+- PB0 and PD0 are free in 7x7. They could later carry a marker from the
+  C5 to two free GPIOs (the BOOT pad, GPIO28, is unused); tied to GND they
+  read 0 as in the table above.
+
+Firmware: select this map with `board xiao7x7`, then `lanes 7x7` (6x6 and
+5x5 also fit; no 8-bit preset does, PB0 is tied to GND). `board xiao`
+keeps the tables above for the 4x4 wiring. After wiring, run `fx2_diag`
+(it must show `RDY1 / SLWR low` and `RDY0 / SLRD high`, chip signals)
+before the first stream, then `selftest walk` to check every lane.
+
 ### XIAO 8-bit wiring (4x4top, 4x4fine, 4x4ultra), front pins only
 
 D0..D4 stay on the same FX2 pins as in the 16-bit wiring; D5, D6, D7 move

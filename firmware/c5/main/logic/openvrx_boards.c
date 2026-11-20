@@ -40,13 +40,28 @@ static const openvrx_board_map_t s_zero = {
     .w8 = {28, 24, 12, 5, 4, 3, 2, 1},
 };
 
-static const char *const s_board_names[OPENVRX_BOARD_COUNT] = {"xiao", "zero", "custom"};
+// Seeed XIAO ESP32-C5 between the two 2x10 headers of the FX2 mini board
+// (HARDWARE.md, "XIAO 7x7 beside the FX2 mini board"): each FX2 pin takes
+// the nearest XIAO pin. D0..D6 face the FX2 left header (PD7..PD5, IFCLK,
+// PB3..PB1); D10..D7 and the four back pads face the right header
+// (PD4..PD1, PB7..PB4). Clock on D5 (GPIO24, not a strapping pin), beside
+// an FX2 GND. 16-bit only: PB0 and PD0 are tied to GND, no 8-bit preset fits.
+static const openvrx_board_map_t s_xiao7x7 = {
+    .name = "xiao7x7",
+    .clk = 24,
+    .w16 = {-1, 11, 23, 7, 8, 12, 10, 9,   // PB0..PB7: Q (PB0 tied to GND)
+            -1, 4, 2, 5, 3, 1, 25, 0},     // PD0..PD7: I (PD0 tied to GND)
+    .w8 = {-1, -1, -1, -1, -1, -1, -1, -1},
+};
+
+static const char *const s_board_names[OPENVRX_BOARD_COUNT] = {"xiao", "zero", "custom", "xiao7x7"};
 
 const openvrx_board_map_t *openvrx_board_builtin(openvrx_board_id_t id)
 {
     switch (id) {
     case OPENVRX_BOARD_XIAO: return &s_xiao;
     case OPENVRX_BOARD_ZERO: return &s_zero;
+    case OPENVRX_BOARD_XIAO7X7: return &s_xiao7x7;
     default: return NULL;
     }
 }

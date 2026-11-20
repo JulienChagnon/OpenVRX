@@ -298,12 +298,14 @@ pub mod sim {
                     self.mhz, self.off_khz, self.gain, self.divider, self.clk_on as u8, self.lanes,
                     self.p11 as u8, self.filter, self.selftest, self.up_ms, self.slips
                 )),
-                ("board", Some(b)) if ["xiao", "zero", "custom"].contains(&b) => {
+                ("board", Some(b)) if ["xiao", "zero", "custom", "xiao7x7"].contains(&b) => {
                     self.board = b.into();
                     Ok(format!("OK board name={b} pins={}", if b == "zero" { 17 } else { 15 }))
                 }
                 ("lanes", Some(p)) => match p.parse::<openvrx_core::LanePreset>() {
-                    Ok(pr) if self.board == "xiao" && pr.data_pins() > 14 => Err("range board has 14 data pins".to_string()),
+                    Ok(pr) if self.board.starts_with("xiao") && pr.data_pins() > 14 => {
+                        Err("range board has 14 data pins".to_string())
+                    }
                     Ok(pr) => {
                         self.lanes = p.into();
                         Ok(format!("OK lanes preset={p} data_pins={}", pr.data_pins()))

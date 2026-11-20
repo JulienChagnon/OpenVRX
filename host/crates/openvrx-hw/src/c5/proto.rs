@@ -353,6 +353,8 @@ pub enum BoardKind {
     Xiao,
     Zero,
     Custom,
+    /// XIAO beside the FX2 mini board, 16-bit presets only (HARDWARE.md).
+    Xiao7x7,
 }
 
 impl BoardKind {
@@ -361,6 +363,7 @@ impl BoardKind {
             BoardKind::Xiao => "xiao",
             BoardKind::Zero => "zero",
             BoardKind::Custom => "custom",
+            BoardKind::Xiao7x7 => "xiao7x7",
         }
     }
 }
@@ -372,7 +375,8 @@ impl FromStr for BoardKind {
             "xiao" => Ok(BoardKind::Xiao),
             "zero" => Ok(BoardKind::Zero),
             "custom" => Ok(BoardKind::Custom),
-            o => Err(HwError::Invalid(format!("unknown board `{o}` (xiao|zero|custom)"))),
+            "xiao7x7" => Ok(BoardKind::Xiao7x7),
+            o => Err(HwError::Invalid(format!("unknown board `{o}` (xiao|zero|custom|xiao7x7)"))),
         }
     }
 }
