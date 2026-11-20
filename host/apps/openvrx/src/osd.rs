@@ -232,6 +232,9 @@ pub fn paint_view(p: &Painter, rect: Rect, o: &ViewOsd<'_>) {
             Color32::LIGHT_GRAY,
         );
     }
+    if !s.filter.is_empty() {
+        line(&s.filter, Color32::LIGHT_GRAY);
+    }
     for w in &s.warnings {
         line(w, Color32::from_rgb(255, 120, 120));
     }

@@ -133,8 +133,8 @@ def command(s, line, word, timeout, tries=1):
 
 # C5 status fields kept per step (DC correction, C5-1): the C5's own view
 # of the samples before the lanes, next to the PC's score.
-C5_FIELDS = {"gain": "c5_gain", "clip": "c5_clip", "i_dc": "i_dc", "q_dc": "q_dc", "dc": "dc", "dco": "dco",
-             "trim": "dc_trim"}
+C5_FIELDS = {"gain": "c5_gain", "clip": "c5_clip", "atk": "c5_atk", "bursts": "c5_bursts", "i_dc": "i_dc",
+             "q_dc": "q_dc", "dc": "dc", "dco": "dco", "trim": "dc_trim"}
 
 
 def c5_status(s):

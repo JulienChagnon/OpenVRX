@@ -2539,6 +2539,7 @@ dependencies = [
  "log",
  "openvrx-core",
  "openvrx-dsp",
+ "openvrx-filter",
  "openvrx-format",
  "openvrx-hw",
  "openvrx-video",
@@ -2556,10 +2557,12 @@ dependencies = [
  "image",
  "openvrx-core",
  "openvrx-dsp",
+ "openvrx-filter",
  "openvrx-format",
  "openvrx-hw",
  "openvrx-video",
  "rayon",
+ "serde",
  "serde_json",
 ]
 
@@ -2584,6 +2587,21 @@ dependencies = [
  "serde_json",
  "wide",
 ]
+
+[[package]]
+name = "openvrx-filter"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "openvrx-core",
+ "openvrx-filter-abi",
+ "openvrx-video",
+ "serde_json",
+]
+
+[[package]]
+name = "openvrx-filter-abi"
+version = "0.1.0"
 
 [[package]]
 name = "openvrx-format"

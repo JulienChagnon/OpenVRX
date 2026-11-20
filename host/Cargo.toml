@@ -7,6 +7,8 @@ members = [
     "crates/openvrx-dsp",
     "crates/openvrx-video",
     "crates/openvrx-hw",
+    "crates/openvrx-filter-abi",
+    "crates/openvrx-filter",
     "apps/openvrx",
     "apps/openvrx-cli",
 ]

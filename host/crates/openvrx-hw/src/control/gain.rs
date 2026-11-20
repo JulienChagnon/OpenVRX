@@ -29,6 +29,18 @@ impl GainTable {
         }
     }
 
+    /// The bench board's measured slopes, as the C5's own gain loop uses them
+    /// (firmware/c5/main/logic/openvrx_agc.h): 1.1 dB per index below index
+    /// 54, 0.93 from there up (the top RF stage), indices 0..=83. One board
+    /// measured so far.
+    pub fn c5_measured() -> GainTable {
+        let mut db = vec![0.0f32; 84];
+        for k in 1..db.len() {
+            db[k] = db[k - 1] + if k - 1 >= 54 { 0.93 } else { 1.1 };
+        }
+        GainTable { db }
+    }
+
     pub fn max_index(&self) -> u32 {
         self.db.len().saturating_sub(1) as u32
     }
@@ -414,5 +426,14 @@ mod tests {
         assert_eq!(t.index_for_change(1, 4.5), 3);
         assert_eq!(t.index_for_change(4, -100.0), 0);
         assert!((t.db_interp(2.5) - 4.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn c5_measured_slopes() {
+        let t = GainTable::c5_measured();
+        assert_eq!(t.max_index(), 83);
+        assert!((t.db_at(54) - t.db_at(53) - 1.1).abs() < 1e-4);
+        assert!((t.db_at(55) - t.db_at(54) - 0.93).abs() < 1e-4);
+        assert!((t.db_at(83) - (54.0 * 1.1 + 29.0 * 0.93)).abs() < 1e-3);
     }
 }

@@ -22,8 +22,9 @@
 //! Other public pieces: [`probe`] (sampling-phase lottery probe),
 //! [`predetect`] (pre-detection diversity combining of complex I/Q from
 //! several receivers), [`frontend::FrontEnd`] (unpack-side corrections
-//! usable on their own), and `testsig` (synthetic signals, behind the
-//! `testsig` feature).
+//! usable on their own), [`meter`] (a short reading of one channel for a
+//! band scan), and `testsig` (synthetic signals, behind the `testsig`
+//! feature).
 
 // DSP loops index several arrays in step; explicit indices read better.
 #![allow(clippy::needless_range_loop)]
@@ -38,6 +39,7 @@ pub mod demod;
 pub mod fastmath;
 pub mod filters;
 pub mod frontend;
+pub mod meter;
 pub mod predetect;
 pub mod probe;
 pub mod spectrum;

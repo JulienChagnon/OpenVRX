@@ -9,7 +9,7 @@ use crate::osd::{fmt_bytes, fmt_cn, fmt_elapsed};
 use crate::settings::{
     AspectMode, BoardKind, DiversityMode, GainMode, OutputAspect, PresentModeSetting,
     PresentTrigger, ScalingFilter, StandardChoice, VideoPreset, ViewLayout, DEFAULT_GAIN,
-    DIVIDERS,
+    DIVIDERS, PLUGIN_DEADLINE_MS,
 };
 use egui::{CollapsingHeader, ComboBox, DragValue, Slider, Ui};
 use openvrx_core::clock::now_ns;
@@ -182,6 +182,24 @@ fn video(ui: &mut Ui, app: &mut OpenvrxApp) {
         ui.label("Diversity");
         combo(ui, "diversity", &mut v.diversity, &DiversityMode::ALL, |d| d.name().to_string());
     });
+    ui.separator();
+    ui.label("Filter plugin (preset plugin)");
+    ui.horizontal(|ui| {
+        ui.label("Library");
+        let mut s = v.plugin_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        if ui.text_edit_singleline(&mut s).changed() {
+            v.plugin_path = (!s.trim().is_empty()).then(|| s.trim().into());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Config");
+        let mut s = v.plugin_config_text();
+        if ui.text_edit_singleline(&mut s).changed() {
+            v.plugin_config = serde_json::Value::String(s);
+        }
+    });
+    ui.add(Slider::new(&mut v.plugin_deadline_ms, PLUGIN_DEADLINE_MS.0..=PLUGIN_DEADLINE_MS.1).text("deadline ms"));
+    ui.label("Library or config changes restart the plugin; the plain pipeline shows meanwhile.");
 }
 
 fn recording(ui: &mut Ui, app: &mut OpenvrxApp) {

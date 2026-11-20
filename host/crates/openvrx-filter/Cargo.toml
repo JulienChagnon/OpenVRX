@@ -1,0 +1,27 @@
+[package]
+name = "openvrx-filter"
+description = "OpenVRX video filter plugin host: loads plugin libraries, feeds them fields on one worker thread per library, deadline and timing statistics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The test plugin (src/fixture.rs) linked in, for downstream tests that
+# register it with `register_static`.
+fixture = []
+
+[dependencies]
+openvrx-core = { path = "../openvrx-core" }
+openvrx-filter-abi = { path = "../openvrx-filter-abi" }
+libloading = "0.8"
+serde_json = "1"
+
+[dev-dependencies]
+openvrx-video = { path = "../openvrx-video" }
+
+# The test plugin as a shared library, loaded by tests/plugin.rs
+# (`cargo test` builds examples first).
+[[example]]
+name = "openvrx_test_filter"
+crate-type = ["cdylib"]

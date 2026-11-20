@@ -1,0 +1,9 @@
+[package]
+name = "openvrx-filter-abi"
+description = "OpenVRX video filter plugin ABI v1: the C types a plugin library exports, as Rust types and a C header"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies: plugins build against this crate alone.
+[dependencies]

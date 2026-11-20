@@ -400,15 +400,20 @@ pub enum VideoPreset {
     /// Raw pipeline, then the learned linear filter on the GPU
     /// (`live_filter.rs`): causal, no added latency.
     Learned,
+    /// A filter plugin library (`plugin_path`, the openvrx-filter ABI) on
+    /// every field, after the pipeline its info names (default raw).
+    /// Without a working plugin the view falls back to that pipeline.
+    Plugin,
 }
 
 impl VideoPreset {
-    pub const ALL: [VideoPreset; 5] = [
+    pub const ALL: [VideoPreset; 6] = [
         VideoPreset::Raw,
         VideoPreset::LowLatency,
         VideoPreset::Balanced,
         VideoPreset::Quality,
         VideoPreset::Learned,
+        VideoPreset::Plugin,
     ];
     /// Name shown and saved.
     pub fn name(self) -> &'static str {
@@ -418,14 +423,16 @@ impl VideoPreset {
             VideoPreset::Balanced => "balanced",
             VideoPreset::Quality => "quality",
             VideoPreset::Learned => "learned",
+            VideoPreset::Plugin => "plugin",
         }
     }
 
     /// Name of the `openvrx_video::VideoConfig::preset` it runs: the
-    /// learned filter was fitted on the raw pipeline's pictures.
+    /// learned filter was fitted on the raw pipeline's pictures; a plugin
+    /// runs raw until its info names another one.
     pub fn pipeline_name(self) -> &'static str {
         match self {
-            VideoPreset::Learned => "raw",
+            VideoPreset::Learned | VideoPreset::Plugin => "raw",
             p => p.name(),
         }
     }
@@ -433,6 +440,15 @@ impl VideoPreset {
     /// The live learned filter runs on the GPU after the pipeline.
     pub fn gpu_filter(self) -> bool {
         self == VideoPreset::Learned
+    }
+
+    /// Every field goes through the filter plugin.
+    pub fn uses_plugin(self) -> bool {
+        self == VideoPreset::Plugin
+    }
+
+    pub fn next(self) -> Self {
+        cycle(&Self::ALL, self)
     }
 }
 
@@ -503,6 +519,13 @@ pub struct VideoSettings {
     /// The flight controller OSD stops jumping a row per field; the camera
     /// picture loses its half-line placement.
     pub steady_osd: bool,
+    /// Filter plugin library of the `plugin` preset (openvrx-filter ABI).
+    pub plugin_path: Option<PathBuf>,
+    /// Text passed to the plugin's `create`: a JSON string as it is, any
+    /// other JSON value (an object, usually) as its compact JSON text.
+    pub plugin_config: serde_json::Value,
+    /// How long a field waits for the plugin before it is shown plain.
+    pub plugin_deadline_ms: f32,
 }
 
 impl Default for VideoSettings {
@@ -513,11 +536,37 @@ impl Default for VideoSettings {
             diversity: DiversityMode::Blend,
             cleanup: true,
             steady_osd: true,
+            plugin_path: None,
+            plugin_config: serde_json::Value::Null,
+            plugin_deadline_ms: openvrx_filter::DEFAULT_DEADLINE_MS,
         }
     }
 }
 
+/// Bounds of `plugin_deadline_ms`: past 40 ms the video thread would hold
+/// more lines than its queue's backlog limit.
+pub const PLUGIN_DEADLINE_MS: (f32, f32) = (0.5, 40.0);
+
 impl VideoSettings {
+    /// The config text the plugin's `create` gets.
+    pub fn plugin_config_text(&self) -> String {
+        match &self.plugin_config {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => s.clone(),
+            v => v.to_string(),
+        }
+    }
+
+    /// The plugin to run: (library, config) while the `plugin` preset is in
+    /// effect and a library is set.
+    pub fn plugin(&self) -> Option<(&Path, String)> {
+        if !self.effective_preset().uses_plugin() {
+            return None;
+        }
+        let p = self.plugin_path.as_deref().filter(|p| !p.as_os_str().is_empty())?;
+        Some((p, self.plugin_config_text()))
+    }
+
     /// The preset actually running (Raw when cleanup is switched off).
     pub fn effective_preset(&self) -> VideoPreset {
         if self.cleanup {
@@ -565,8 +614,8 @@ pub enum ControlMode {
 /// Gain index the C5 starts from (and stays at in manual mode until set).
 pub const DEFAULT_GAIN: u8 = 64;
 
-/// Usable PARLIO dividers: 240 MHz / divider.
-pub const DIVIDERS: [u8; 4] = [6, 9, 12, 18];
+/// Usable PARLIO dividers: 240 MHz / divider (multiples of 3 keep the bus locked).
+pub const DIVIDERS: [u8; 5] = [6, 9, 12, 15, 18];
 
 /// Sample clock for a divider, Hz.
 pub fn divider_hz(divider: u8) -> f64 {
@@ -824,6 +873,9 @@ impl AppSettings {
         d.saturation = finite_or(d.saturation, 1.0).clamp(0.0, 3.0);
         d.ui_scale = finite_or(d.ui_scale, 1.0).clamp(0.5, 3.0);
         d.osd_refresh_hz = finite_or(d.osd_refresh_hz, 15.0).clamp(1.0, 120.0);
+        let v = &mut self.video;
+        v.plugin_deadline_ms = finite_or(v.plugin_deadline_ms, openvrx_filter::DEFAULT_DEADLINE_MS)
+            .clamp(PLUGIN_DEADLINE_MS.0, PLUGIN_DEADLINE_MS.1);
 
         if self.receivers.is_empty() {
             self.receivers = default_receivers();
@@ -1164,6 +1216,35 @@ mod tests {
             let cfg = openvrx_video::VideoConfig::preset(p.pipeline_name(), VideoStandard::Ntsc);
             assert!(cfg.is_some(), "{}", p.name());
         }
+    }
+
+    #[test]
+    fn plugin_settings() {
+        let mut v = VideoSettings::default();
+        assert!(v.plugin().is_none());
+        v.preset = VideoPreset::Plugin;
+        assert!(v.plugin().is_none(), "no library set");
+        v.plugin_path = Some(PathBuf::from("/opt/f/libf.so"));
+        assert_eq!(v.plugin(), Some((Path::new("/opt/f/libf.so"), String::new())));
+        v.plugin_config = serde_json::json!({"model_dir": "/m", "threads": 2});
+        assert_eq!(v.plugin().unwrap().1, r#"{"model_dir":"/m","threads":2}"#);
+        v.plugin_config = serde_json::Value::String("gain=0.5".into());
+        assert_eq!(v.plugin_config_text(), "gain=0.5");
+        v.cleanup = false;
+        assert!(v.plugin().is_none(), "cleanup off is raw");
+        // Saved and loaded with the rest; the deadline is clamped.
+        let mut s = AppSettings::default();
+        s.video = v;
+        s.video.cleanup = true;
+        s.video.plugin_deadline_ms = 500.0;
+        let back = AppSettings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.video.plugin_path, s.video.plugin_path);
+        assert_eq!(back.video.plugin_config, s.video.plugin_config);
+        assert_eq!(back.video.plugin_deadline_ms, PLUGIN_DEADLINE_MS.1);
+        let old = AppSettings::from_json(r#"{"video": {"preset": "plugin"}}"#).unwrap();
+        assert_eq!(old.video.plugin_deadline_ms, openvrx_filter::DEFAULT_DEADLINE_MS);
+        assert_eq!(VideoPreset::Learned.next(), VideoPreset::Plugin);
+        assert_eq!(VideoPreset::Plugin.next(), VideoPreset::Raw);
     }
 
     #[test]

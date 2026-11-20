@@ -13,6 +13,7 @@ use crate::commands::{diff, full_state, AppCommand, BackendEvent, BackendStatus,
 use crate::gpu::{Uniforms, VideoGpu};
 use crate::keys::{action_for, key_name, Action, BINDINGS};
 use crate::layout::{fit_picture, pixel_aspect, view_cells, Rect as LRect, CELL_GAP};
+use crate::menu::{Menu, MenuPick, RowState};
 use crate::osd::{fmt_latency, paint_global, paint_view, ViewOsd};
 use crate::present::{choose_present_mode, mode_name, PresentScheduler};
 use crate::settings::{
@@ -74,6 +75,8 @@ pub struct OpenvrxApp {
     messages: VecDeque<(u64, String)>,
     pub show_panels: bool,
     show_help: bool,
+    /// The Esc menu (actions with their keys, band and channel).
+    menu: Menu,
     surface_applied: Option<(wgpu::PresentMode, u32)>,
     supported_modes: Vec<wgpu::PresentMode>,
     fullscreen_applied: Option<bool>,
@@ -142,6 +145,7 @@ impl OpenvrxApp {
             messages,
             show_panels: false,
             show_help: false,
+            menu: Menu::new(),
             surface_applied: None,
             supported_modes,
             fullscreen_applied: None,
@@ -412,6 +416,18 @@ impl OpenvrxApp {
             Action::Osd => d.osd = !d.osd,
             Action::Record => self.toggle_recording(),
             Action::Cleanup => self.settings.video.cleanup = !self.settings.video.cleanup,
+            Action::Preset => {
+                let v = &mut self.settings.video;
+                v.preset = v.preset.next();
+                let text = match (v.cleanup, v.preset) {
+                    (false, p) => format!("preset {} (cleanup is off: Space)", p.name()),
+                    (true, crate::settings::VideoPreset::Plugin) if v.plugin_path.is_none() => {
+                        "preset plugin: no plugin set (video.plugin_path, or --plugin)".to_string()
+                    }
+                    (true, p) => format!("preset {}", p.name()),
+                };
+                self.note(text);
+            }
             Action::SteadyOsd => self.settings.video.steady_osd = !self.settings.video.steady_osd,
             Action::Hd3 => d.hd3_mode = !d.hd3_mode,
             Action::Layout => d.layout = d.layout.next(),
@@ -457,12 +473,75 @@ impl OpenvrxApp {
                     self.show_help = false;
                     self.show_panels = false;
                 } else {
-                    d.fullscreen = false;
-                    d.hd3_mode = false;
+                    let mhz = self.current_mhz();
+                    self.menu.toggle(mhz);
                 }
             }
             Action::Compare => self.toggle_compare(),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// Channel of the first receiver (all receivers tune together).
+    fn current_mhz(&self) -> u32 {
+        self.settings.receivers.first().map_or(0, |r| r.freq_mhz)
+    }
+
+    /// Tunes every receiver. FX2-only: the app has no C5 link, so the C5 is
+    /// tuned over its console in the background and the label follows once it
+    /// answers. With the C5 console mode the backend pushes the change itself.
+    fn tune(&mut self, mhz: u32) {
+        let fx2_only = self.settings.receivers.first().map(|r| r.control) == Some(ControlMode::Fx2Only);
+        if fx2_only {
+            self.menu.start_tune(mhz);
+        } else {
+            self.set_receivers_mhz(mhz);
+        }
+    }
+
+    fn set_receivers_mhz(&mut self, mhz: u32) {
+        for r in &mut self.settings.receivers {
+            r.freq_mhz = mhz;
+        }
+        self.note(format!("channel {}", channels::label(mhz)));
+    }
+
+    /// Draws the Esc menu and runs what was picked.
+    fn menu_ui(&mut self, ctx: &egui::Context) {
+        if let Some(r) = self.menu.poll_tune() {
+            match r {
+                Ok(mhz) => self.set_receivers_mhz(mhz),
+                Err(e) => self.note(format!("channel not changed: {e}")),
+            }
+        }
+        if !self.menu.open {
+            return;
+        }
+        let d = self.settings.display.clone();
+        let v = self.settings.video.clone();
+        let recording = self.backend_status.recording.active;
+        let state = move |a: Action| match a {
+            Action::Fullscreen => RowState::On(d.fullscreen),
+            Action::Osd => RowState::On(d.osd),
+            Action::Hd3 => RowState::On(d.hd3_mode),
+            Action::Damage => RowState::On(d.damage_overlay),
+            Action::Cleanup => RowState::On(v.cleanup),
+            Action::Preset => RowState::Value(v.preset.name().to_string()),
+            Action::SteadyOsd => RowState::On(v.steady_osd),
+            Action::Record => RowState::On(recording),
+            Action::Layout => RowState::Value(d.layout.name().to_string()),
+            Action::Aspect => RowState::Value(d.aspect.name().to_string()),
+            Action::Scaling => RowState::Value(d.scaling.name().to_string()),
+            Action::PresentMode => RowState::Value(d.present_mode.name().to_string()),
+            Action::PresentTrigger => RowState::Value(d.present_trigger.name().to_string()),
+            _ => RowState::None,
+        };
+        let mhz = self.current_mhz();
+        for pick in self.menu.show(ctx, mhz, state) {
+            match pick {
+                MenuPick::Act(a) => self.act(ctx, a),
+                MenuPick::Tune(f) => self.tune(f),
+            }
         }
     }
 
@@ -673,6 +752,7 @@ impl eframe::App for OpenvrxApp {
         if self.show_help {
             self.help_window(&ctx);
         }
+        self.menu_ui(&ctx);
         self.apply_settings(&ctx, frame);
 
         // Line-to-submit latency: the frame built here is submitted and

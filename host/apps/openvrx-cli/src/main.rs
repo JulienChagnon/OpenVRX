@@ -12,6 +12,27 @@
 //!                                             with host times from the byte position; saves displayed
 //!                                             fields (FRAMES 0: none) and prints lost lines once a second
 //!                                             and the combiner/assembler/repair counters (DSP-5)
+//! openvrx-cli decode  ... --filter-plugin LIB [--plugin-config TEXT] [--plugin-deadline-ms MS]
+//!                     [--plugin-json PATH]
+//!                                             either decode with every field through a filter plugin
+//!                                             (openvrx-filter ABI, as the app's plugin preset) before it
+//!                                             is saved; the pipeline and geometry the plugin's info names
+//!                                             replace --preset and the steady OSD choice. Prints ms per
+//!                                             field (p50/p99/max/mean) and the fields over the live
+//!                                             deadline (default 6 ms) on stderr; --plugin-json writes
+//!                                             them as JSON. --live with FRAMES 0 times the whole
+//!                                             recording without saving pictures
+//! openvrx-cli phasecal --lanes P --clk D [--c5 PORT] [--seconds S]
+//!                                             sets the C5 sample clock edge to the cleanest of its
+//!                                             three positions, measured through the FX2 (S seconds
+//!                                             per position, default 0.25); needs the C5 console
+//! openvrx-cli scan --lanes P --clk D [--c5 PORT] [--bands RABEFL] [--settle MS] [--dwell MS]
+//!                  [--json PATH] [--stay]
+//!                                             band scan on the live receiver: retunes the C5 over the
+//!                                             bands (default all six; settle 30 ms, dwell 60 ms), ranks
+//!                                             the channels by sync, C/N and level and names the video
+//!                                             transmitters; then back to the channel it was on (--stay:
+//!                                             to the best transmitter). Needs the C5 console
 //! openvrx-cli record  OUT_BASE --lanes P --clk D [--seconds S] [--mhz M] [--gain G] [--json PATH]
 //!                                             FX2-only capture, no window (bench scripts). OUT_BASE
 //!                                             `-` drains: streams and counts, writes nothing. Prints
@@ -44,34 +65,58 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod filter;
+mod scan;
+
 /// Line rate the strip is cut at (NTSC; PAL rows drift slowly sideways).
 const LINE_HZ: f64 = 15_734.264;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Commands without a recording argument.
+    let live: Option<fn(&[String]) -> Result<(), String>> = match args.first().map(String::as_str) {
+        Some("phasecal") => Some(phasecal),
+        Some("scan") => Some(scan::scan),
+        _ => None,
+    };
+    if let Some(run) = live {
+        if let Err(e) = run(&args[1..]) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let (cmd, rec) = match (args.first(), args.get(1)) {
         (Some(c), Some(r)) => (c.as_str(), r.as_str()),
         _ => {
-            eprintln!("usage: openvrx-cli inspect|decode|record|score|timeline|lines ... (see the source header)");
+            eprintln!(
+                "usage: openvrx-cli inspect|decode|record|score|timeline|lines|phasecal|scan ... (see the source header)"
+            );
             std::process::exit(2);
         }
     };
     let out = args.get(2).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("openvrx-out"));
     let result = match cmd {
         "inspect" => inspect(rec, &out),
-        "decode" if args.iter().any(|a| a == "--live") => decode_live(
-            rec,
-            &out,
-            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8),
-            opt(&args, "--preset").unwrap_or("low_latency"),
-            !args.iter().any(|a| a == "--no-steady-osd"),
-        ),
-        "decode" => decode(
-            rec,
-            &out,
-            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8),
-            args.iter().any(|a| a == "--steady-osd"),
-        ),
+        "decode" => filter::CliFilter::from_args(&args).and_then(|mut f| {
+            let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let r = if args.iter().any(|a| a == "--live") {
+                decode_live(
+                    rec,
+                    &out,
+                    frames,
+                    opt(&args, "--preset").unwrap_or("low_latency"),
+                    !args.iter().any(|a| a == "--no-steady-osd"),
+                    f.as_mut(),
+                )
+            } else {
+                decode(rec, &out, frames, args.iter().any(|a| a == "--steady-osd"), f.as_mut())
+            };
+            match &f {
+                Some(f) => r.and(f.report(&args)),
+                None => r,
+            }
+        }),
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
         "timeline" => timeline(rec, &args[2..]),
@@ -254,14 +299,30 @@ fn walk_frames(
     Ok((total_lines, dsp.stats()))
 }
 
-fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(), String> {
+/// `decode`: the raw chain's frames as PNG; with a filter plugin, its
+/// pipeline and geometry, and each frame as the plugin made it.
+fn decode(
+    path: &str,
+    out: &Path,
+    frames: usize,
+    steady_osd: bool,
+    mut filter: Option<&mut filter::CliFilter>,
+) -> Result<(), String> {
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let (preset, steady_osd) = match filter.as_deref() {
+        Some(fl) => (fl.info().pipeline.clone(), fl.info().geometry.steady(steady_osd)),
+        None => ("raw".to_string(), steady_osd),
+    };
     let mut saved = 0;
-    let (total_lines, stats) = walk_frames(&rec, steady_osd, openvrx_dsp::DemodKind::Polar, "raw", |f| {
+    let (total_lines, stats) = walk_frames(&rec, steady_osd, openvrx_dsp::DemodKind::Polar, &preset, |f| {
         if saved >= frames {
             return Ok(false);
         }
+        let f = match filter.as_deref_mut() {
+            Some(fl) => fl.apply(f, steady_osd)?,
+            None => f,
+        };
         let img = image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba8()).ok_or("frame size")?;
         let name = format!("{}-frame{saved:02}.png", rec.name());
         let path = out.join(&name);
@@ -281,8 +342,27 @@ fn decode(path: &str, out: &Path, frames: usize, steady_osd: bool) -> Result<(),
 /// recording's events name declared as the app does. A field is saved
 /// whenever the display would show a completed one (`current_frame()`
 /// after the bottom row updated). Prints the pipeline counters at the end.
-fn decode_live(path: &str, out: &Path, frames: usize, preset: &str, steady_osd: bool) -> Result<(), String> {
+/// With a filter plugin each displayed field goes through it (its pipeline
+/// and geometry replace `preset` and `steady_osd`), saved or not.
+fn decode_live(
+    path: &str,
+    out: &Path,
+    frames: usize,
+    preset: &str,
+    steady_osd: bool,
+    mut filter: Option<&mut filter::CliFilter>,
+) -> Result<(), String> {
     const BLOCK: usize = 32 * 1024;
+    let (preset, steady_osd) = match filter.as_deref() {
+        Some(fl) => {
+            if preset != fl.info().pipeline && preset != "low_latency" {
+                eprintln!("note: the plugin asks for the {} pipeline, not {preset}", fl.info().pipeline);
+            }
+            (fl.info().pipeline.clone(), fl.info().geometry.steady(steady_osd))
+        }
+        None => (preset.to_string(), steady_osd),
+    };
+    let preset = preset.as_str();
     let rec = Recording::open(path).map_err(|e| e.to_string())?;
     let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
     let cfg = RxDspConfig {
@@ -343,14 +423,19 @@ fn decode_live(path: &str, out: &Path, frames: usize, preset: &str, steady_osd: 
                     s.combiner.late_lines
                 );
             }
+            if frames > 0 && saved >= frames {
+                break 'read;
+            }
+            let f = match filter.as_deref_mut() {
+                Some(fl) => fl.apply(f, steady_osd)?,
+                None => f,
+            };
             if saved < frames {
                 let img =
                     image::RgbaImage::from_raw(f.width as u32, f.height as u32, f.to_rgba8()).ok_or("frame size")?;
                 let path = out.join(format!("{}-live{saved:04}.png", rec.name()));
                 img.save(&path).map_err(|e| e.to_string())?;
                 saved += 1;
-            } else if frames > 0 {
-                break 'read;
             }
         }
     }
@@ -398,19 +483,7 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     let mhz: u32 = opt_num(args, "--mhz", 0)?;
     let gain: u32 = opt_num(args, "--gain", 0)?;
 
-    if list_fx2().map_err(|e| e.to_string())?.iter().any(|f| f.kind == Fx2Kind::Bootloader) {
-        let fw = fx2::firmware::embedded().map_err(|e| e.to_string())?;
-        for (dev, r) in fx2::upload_all(&fw).map_err(|e| e.to_string())? {
-            r.map_err(|e| format!("FX2 firmware upload on {}: {e}", dev.describe()))?;
-        }
-        // Renumeration after the upload.
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(5)
-            && !list_fx2().map_err(|e| e.to_string())?.iter().any(|f| f.kind == Fx2Kind::Openvrx)
-        {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
+    ensure_fx2_firmware()?;
     let settings = C5Settings {
         lanes,
         divider,
@@ -556,6 +629,175 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
 /// cycles of 83.3 ns); a poll that finds the FIFO full stands for about this
 /// much of the C5's samples dropped at the pins.
 const FIFO_POLL_US: f64 = 0.833;
+
+/// Loads the embedded firmware into every FX2 still in its boot loader and
+/// waits for the renumeration. A board already running OpenVRX firmware is
+/// left alone: loading over a running image resets only its CPU, and a
+/// board in that state can stop streaming until it is power-cycled.
+fn ensure_fx2_firmware() -> Result<(), String> {
+    if !list_fx2().map_err(|e| e.to_string())?.iter().any(|f| f.kind == Fx2Kind::Bootloader) {
+        return Ok(());
+    }
+    let fw = fx2::firmware::embedded().map_err(|e| e.to_string())?;
+    for (dev, r) in fx2::upload_all(&fw).map_err(|e| e.to_string())? {
+        r.map_err(|e| format!("FX2 firmware upload on {}: {e}", dev.describe()))?;
+    }
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5)
+        && !list_fx2().map_err(|e| e.to_string())?.iter().any(|f| f.kind == Fx2Kind::Openvrx)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// Share of samples (both components) that jump away from what their
+/// neighbours predict by more than a few steps of the lowest carried bit.
+/// The captured signal is oversampled (analog filter well under half the
+/// sample rate), so a sample is close to `(4 (x[n-1] + x[n+1]) - (x[n-2] +
+/// x[n+2])) / 6`; a lane caught mid-change at the FX2 sampling edge flips
+/// its bit and leaves a jump of that bit's weight. Words are little-endian
+/// as received; NaN when the capture is too short.
+fn jump_share(bytes: &[u8], fmt: &openvrx_core::LaneFormat) -> f64 {
+    let wb = fmt.word_bytes as usize;
+    let n = bytes.len() / wb;
+    if n < 1000 {
+        return f64::NAN;
+    }
+    let mut re = Vec::with_capacity(n);
+    let mut im = Vec::with_capacity(n);
+    for c in bytes.chunks_exact(wb) {
+        let w = if wb == 1 { c[0] as u32 } else { c[0] as u32 | (c[1] as u32) << 8 };
+        let z = fmt.decode(w);
+        re.push(z.re);
+        im.push(z.im);
+    }
+    // Step of the lowest carried bit: word 0 decodes to half a step.
+    let step = 2.0 * fmt.decode(0).re.abs();
+    let half_codes = (fmt.component_full_scale() / step).max(1.0);
+    // 6 steps on 7 bits (just under the 8-step weight of the fourth bit from
+    // the top), at least 1.5 steps on fewer bits.
+    let thr = step * (0.75 * half_codes / 8.0).max(1.5);
+    let mut bad = 0usize;
+    let mut total = 0usize;
+    for x in [&re, &im] {
+        for k in 2..x.len() - 2 {
+            let pred = (4.0 * (x[k - 1] + x[k + 1]) - (x[k - 2] + x[k + 2])) / 6.0;
+            bad += ((x[k] - pred).abs() > thr) as usize;
+            total += 1;
+        }
+    }
+    bad as f64 / total as f64
+}
+
+/// Sets the C5's sample clock edge to the cleanest of its three positions
+/// against the MODEM_DIAG bus, measured through the FX2 at the working rate.
+/// One stream: measure, `slip`, measure, `slip`, measure, then slip to the
+/// best. Uses the C5 console (`--c5 PORT`, default the first Espressif port)
+/// and pushes no other settings; `--lanes`/`--clk` must match the C5.
+fn phasecal(args: &[String]) -> Result<(), String> {
+    use openvrx_hw::c5::{find_c5_ports, C5Client, ClientConfig, PortConnector};
+    let lanes: LanePreset = opt(args, "--lanes")
+        .ok_or("phasecal needs --lanes PRESET")?
+        .parse()
+        .map_err(|e| format!("{e}"))?;
+    let divider: u32 = opt_num(args, "--clk", 9)?;
+    let seconds: f64 = opt_num(args, "--seconds", 0.25)?;
+    let port = match opt(args, "--c5") {
+        Some(p) => p.to_string(),
+        None => find_c5_ports()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .map(|p| p.port_name)
+            .ok_or("no C5 on USB (phasecal needs its console)")?,
+    };
+    let c5 = C5Client::start(PortConnector::new(PortSelector::Name(port.clone())), None, ClientConfig::default())
+        .map_err(|e| e.to_string())?;
+    if !c5.wait_connected(Duration::from_secs(3)) {
+        return Err(format!("C5 on {port} does not answer"));
+    }
+    let st = c5.status().map_err(|e| format!("C5 status: {e}"))?;
+    if st.lanes != lanes.name() || st.clk != divider || !st.clk_on {
+        return Err(format!(
+            "the C5 streams {} clk {} (clock {}), not {} clk {divider}",
+            st.lanes,
+            st.clk,
+            if st.clk_on { "on" } else { "off" },
+            lanes.name()
+        ));
+    }
+
+    ensure_fx2_firmware()?;
+    let settings = C5Settings {
+        lanes,
+        divider,
+        ..C5Settings::default()
+    };
+    let fmt = settings.sample_format().lanes.clone();
+    let want = (seconds * settings.sample_format().sample_rate_hz()) as usize * fmt.word_bytes as usize;
+    let cfg = ReceiverConfig::new(0, PortSelector::Name(String::new()), Fx2Selector::Only, settings.clone());
+    let receiver = Receiver::start_fx2_only(cfg).map_err(|e| format!("starting the FX2: {e}"))?;
+
+    // Bytes after the last slip: drop what is queued, then 50 ms more (the
+    // slip itself is a ~25 us clock gap), then collect `want` bytes.
+    let capture = |receiver: &Receiver| -> Result<Vec<u8>, String> {
+        while receiver.blocks().try_recv().is_ok() {}
+        let t0 = Instant::now();
+        let mut buf = Vec::with_capacity(want);
+        while buf.len() < want {
+            match receiver.blocks().recv_timeout(Duration::from_millis(500)) {
+                Ok(b) if t0.elapsed() >= Duration::from_millis(50) => buf.extend_from_slice(&b.data),
+                Ok(_) => {}
+                Err(_) if t0.elapsed() > Duration::from_secs(3) => {
+                    return Err(if buf.is_empty() {
+                        "no data from the FX2 in 3 s (replug the FX2 if it stays so)".into()
+                    } else {
+                        "the FX2 stream stopped during the measurement".into()
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(buf)
+    };
+    let mut shares = [f64::NAN; 3];
+    let mut total = 0u32;
+    for (k, share) in shares.iter_mut().enumerate() {
+        *share = jump_share(&capture(&receiver)?, &fmt);
+        if k < 2 {
+            total = c5.slip(1).map_err(|e| format!("slip: {e}"))?;
+        }
+    }
+    drop(receiver);
+
+    // Positions relative to now (the third one): +1 slip is the first, +2 the second.
+    let best = (0..3)
+        .filter(|&k| shares[k].is_finite())
+        .min_by(|&a, &b| shares[a].total_cmp(&shares[b]))
+        .ok_or("no position could be measured")?;
+    let slips = (best as u32 + 1) % 3;
+    if slips > 0 {
+        total = c5.slip(slips).map_err(|e| format!("slip: {e}"))?;
+    }
+    let pct = |v: f64| format!("{:.2} %", 100.0 * v);
+    println!(
+        "phasecal: bit-jump share per position {} / {} / {}: chose {} (C5 slip total {total}, rel {})",
+        pct(shares[0]),
+        pct(shares[1]),
+        pct(shares[2]),
+        best + 1,
+        total % 3
+    );
+    if shares[best] > 0.02 {
+        eprintln!(
+            "warning: no clean position ({} at best). Check the clock wire and the grounds; with no \
+             signal the score is less sharp.",
+            pct(shares[best])
+        );
+    }
+    Ok(())
+}
 
 /// Logs the FIFO-full reports the FX2 stream has queued as `fifo_full`
 /// events: a recording otherwise has no trace of samples lost at
@@ -867,4 +1109,48 @@ fn timeline(path: &str, args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An oversampled FM carrier in 7x7 words, with one lane optionally
+    /// replaced by noise on a share of the samples (a lane caught mid-change).
+    fn carrier_words(bad_bit: Option<u32>, bad_share: f64) -> Vec<u8> {
+        let fmt = LanePreset::I7Q7.format();
+        let mut rng = 0x1234_5678_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut out = Vec::new();
+        let mut phase = 0.0f64;
+        for n in 0..200_000 {
+            // 0.3 MHz offset plus a 1 MHz deviation tone at 16 MS/s.
+            phase += std::f64::consts::TAU * (0.3e6 + 1.0e6 * (n as f64 * 0.02).sin()) / 16e6;
+            let a = 100.0; // 10-bit ADC units: about 12.5 steps of 8
+            let mut w = fmt.encode((a * phase.cos()) as i32, (a * phase.sin()) as i32);
+            if let Some(b) = bad_bit {
+                if next() < bad_share {
+                    w ^= 1 << b;
+                }
+            }
+            out.extend_from_slice(&(w as u16).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn jump_share_separates_clean_and_bad_lanes() {
+        let fmt = LanePreset::I7Q7.format();
+        let clean = jump_share(&carrier_words(None, 0.0), &fmt);
+        // Word bit 12 is I6 (weight 8 steps): flipped on 20 % of samples.
+        let bad = jump_share(&carrier_words(Some(12), 0.2), &fmt);
+        assert!(clean < 0.002, "clean {clean}");
+        assert!(bad > 0.05, "bad {bad}");
+        assert!(jump_share(&[0u8; 100], &fmt).is_nan());
+    }
 }

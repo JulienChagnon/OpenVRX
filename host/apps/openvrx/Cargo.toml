@@ -15,6 +15,7 @@ openvrx-hw = { path = "../../crates/openvrx-hw" }
 openvrx-dsp = { path = "../../crates/openvrx-dsp" }
 openvrx-video = { path = "../../crates/openvrx-video" }
 openvrx-format = { path = "../../crates/openvrx-format" }
+openvrx-filter = { path = "../../crates/openvrx-filter" }
 eframe = "0.37"
 egui = "0.37"
 egui-wgpu = "0.37"
@@ -28,3 +29,7 @@ crossbeam-channel = "0.5"
 pollster = "1"
 png = "0.18"
 log = "0.4"
+
+[dev-dependencies]
+# The test plugin linked in, for the plugin preset's tests.
+openvrx-filter = { path = "../../crates/openvrx-filter", features = ["fixture"] }

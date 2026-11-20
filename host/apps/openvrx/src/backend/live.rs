@@ -8,6 +8,8 @@
 //! [DSP thread per receiver]  RxDsp::push_bytes -> LineRecord -> views
 //!                            \-> RawBlock copy -> recorder (when on)
 //! [video thread per view]    VideoPipeline::push_line -> FrameProducer
+//!                            (plugin preset: whole fields through LiveFilter)
+//! [filter worker per plugin] openvrx-filter: the plugin's calls
 //! [recorder thread]          RecordingWriter::write_block
 //! [backend thread]           commands, C5 events, gain loop, status
 //! ```
@@ -28,6 +30,7 @@ use crate::source::{
 use openvrx_core::clock::now_ns;
 use openvrx_core::{LanePreset, LineRecord, RawBlock, RxId, VideoStandard};
 use openvrx_dsp::{RxDsp, RxDspConfig, RxEvent, RxStats};
+use openvrx_filter::{FilterReport, LiveFilter, Phase as PluginPhase, PluginInfo};
 use openvrx_format::{Event, EventKind, ReceiverInfo, RecordingSource, RecordingWriter, Sidecar, WriterOptions};
 use openvrx_hw::c5::{find_c5_ports, C5Client, C5Event, C5Settings, ClientConfig, PortConnector, PortSelector};
 use openvrx_hw::control::{GainConfig, GainLoop, GainTable};
@@ -101,14 +104,23 @@ pub fn dsp_config(r: &ReceiverSettings, standard: Option<VideoStandard>) -> RxDs
 
 /// Video pipeline configuration for the app's video settings.
 pub fn video_config(v: &VideoSettings, standard: VideoStandard) -> VideoConfig {
-    let mut cfg = VideoConfig::preset(v.effective_preset().pipeline_name(), standard)
-        .unwrap_or_else(|| VideoConfig::raw(standard));
+    video_config_with(v, standard, None)
+}
+
+/// [`video_config`] with the running filter plugin's wishes: under the
+/// plugin preset its info names the pipeline, and its geometry overrides
+/// the steady OSD setting.
+pub fn video_config_with(v: &VideoSettings, standard: VideoStandard, plugin: Option<&PluginInfo>) -> VideoConfig {
+    let preset = v.effective_preset();
+    let plugin = plugin.filter(|_| preset.uses_plugin());
+    let name = plugin.map_or(preset.pipeline_name(), |i| i.pipeline.as_str());
+    let mut cfg = VideoConfig::preset(name, standard).unwrap_or_else(|| VideoConfig::raw(standard));
     cfg.combiner.mode = match v.diversity {
         DiversityMode::Select => CombineMode::Select,
         DiversityMode::Blend => CombineMode::Blend,
         DiversityMode::SampleRepair => CombineMode::Repair,
     };
-    if v.steady_osd {
+    if plugin.map_or(v.steady_osd, |i| i.geometry.steady(v.steady_osd)) {
         cfg.deinterlace = DeinterlaceMethod::LineDouble;
     }
     cfg.streaming = true;
@@ -406,6 +418,18 @@ struct VideoHealth {
     /// Pipeline rebuilds by the health check.
     rebuilds: AtomicU64,
     last_rebuild_ns: AtomicU64,
+    /// Bumped by the backend where the picture's history breaks (retune,
+    /// receiver reset): the filter plugin starts its history afresh.
+    breaks: AtomicU64,
+    /// The filter plugin's state for the OSD (plugin preset), else None.
+    filter: Mutex<Option<FilterReport>>,
+}
+
+/// Tells the views fed by `rx` that their picture history breaks here.
+fn note_break(views: &[Option<LiveView>], rx: RxId) {
+    for v in views.iter().flatten().filter(|v| v.rxs.contains(&rx)) {
+        v.health.breaks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Lost lines per field above which a second counts as unhealthy, and the
@@ -492,6 +516,75 @@ impl HealthCheck {
     }
 }
 
+/// The plugin preset of one view, on its video thread. Until the plugin is
+/// ready (and after it fails) the view streams rows as usual from the
+/// preset's default pipeline; once it is ready the pipeline follows the
+/// plugin's info and rows are held until their field is complete, which
+/// then goes to the plugin and is published whole: the plugin's picture
+/// if it came within the deadline, else the field itself.
+struct ViewPlugin {
+    filter: LiveFilter,
+    /// The info the pipeline is configured for (Some while ready).
+    applied: Option<Arc<PluginInfo>>,
+    failure_logged: bool,
+}
+
+impl ViewPlugin {
+    /// Starts, keeps or drops the plugin to match the settings.
+    fn sync(slot: &mut Option<ViewPlugin>, v: &VideoSettings) {
+        match v.plugin() {
+            Some((path, config)) => match slot {
+                Some(vp) if vp.filter.is(path, &config) => vp.filter.set_deadline_ms(v.plugin_deadline_ms),
+                _ => {
+                    log::info!("filter plugin {}: loading", path.display());
+                    *slot = Some(ViewPlugin {
+                        filter: LiveFilter::start(path, &config, v.plugin_deadline_ms),
+                        applied: None,
+                        failure_logged: false,
+                    });
+                }
+            },
+            None => *slot = None,
+        }
+    }
+
+    /// Follows the plugin's phase at a field end: true when the pipeline
+    /// must be reconfigured (the plugin became ready, or stopped).
+    fn poll(&mut self) -> bool {
+        match self.filter.phase() {
+            PluginPhase::Ready(info) => {
+                if self.applied.is_some() {
+                    return false;
+                }
+                log::info!("filter plugin ready: {}", info.json);
+                self.applied = Some(info);
+                true
+            }
+            PluginPhase::Loading => false,
+            PluginPhase::Failed(e) => {
+                if !self.failure_logged {
+                    log::warn!("filter plugin off, plain picture: {e}");
+                    self.failure_logged = true;
+                }
+                self.applied.take().is_some()
+            }
+            PluginPhase::Closed => self.applied.take().is_some(),
+        }
+    }
+}
+
+/// The OSD report for the plugin preset (None under other presets).
+fn plugin_report(plugin: &Option<ViewPlugin>, v: &VideoSettings) -> Option<FilterReport> {
+    match plugin {
+        Some(vp) => Some(vp.filter.report()),
+        None if v.effective_preset().uses_plugin() => Some(FilterReport::failed(
+            Path::new("none"),
+            "no plugin library set (video.plugin_path, or --plugin)",
+        )),
+        None => None,
+    }
+}
+
 fn video_loop(
     lines: crossbeam_channel::Receiver<LineRecord>,
     settings: Arc<Mutex<VideoSettings>>,
@@ -503,6 +596,17 @@ fn video_loop(
     let mut pipe: Option<(VideoStandard, VideoPipeline)> = None;
     let mut check = HealthCheck::new();
     let (mut catchups, mut catchup_logged_ns) = (0u64, 0u64);
+    let mut plugin: Option<ViewPlugin> = None;
+    ViewPlugin::sync(&mut plugin, &current);
+    *health.filter.lock().unwrap_or_else(|e| e.into_inner()) = plugin_report(&plugin, &current);
+    let mut breaks_seen = health.breaks.load(Ordering::Relaxed);
+    // Lines whose rows wait for the end of their field (plugin ready).
+    let mut held_lines = 0u32;
+    let mark_break = |plugin: &mut Option<ViewPlugin>| {
+        if let Some(vp) = plugin.as_mut() {
+            vp.filter.mark_break();
+        }
+    };
     while !stop.load(Ordering::Relaxed) {
         // Fields short of lines cost this thread about twice a full one
         // (colour and repair still run over the lost lines), so once it
@@ -526,6 +630,7 @@ fn video_loop(
                 catchup_logged_ns = now;
             }
             pipe = None;
+            mark_break(&mut plugin);
             continue;
         }
         let line = match lines.recv_timeout(Duration::from_millis(100)) {
@@ -533,46 +638,101 @@ fn video_loop(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        {
+        let changed = {
             let s = settings.lock().unwrap_or_else(|e| e.into_inner());
-            if *s != current {
+            let changed = *s != current;
+            if changed {
                 current = s.clone();
-                if let Some((std, p)) = pipe.as_mut() {
-                    p.set_config(&video_config(&current, *std));
-                }
             }
+            changed
+        };
+        if changed {
+            ViewPlugin::sync(&mut plugin, &current);
+            mark_break(&mut plugin);
+            let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
+            if let Some((std, p)) = pipe.as_mut() {
+                p.set_config(&video_config_with(&current, *std, info.as_deref()));
+            }
+            *health.filter.lock().unwrap_or_else(|e| e.into_inner()) = plugin_report(&plugin, &current);
         }
         let standard = current.standard.fixed().unwrap_or(line.standard);
         if line.standard != standard {
             continue;
         }
+        let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
         if pipe.as_ref().is_none_or(|(s, _)| *s != standard) {
-            pipe = Some((standard, VideoPipeline::new(&video_config(&current, standard))));
+            pipe = Some((standard, VideoPipeline::new(&video_config_with(&current, standard, info.as_deref()))));
             check = HealthCheck::new();
+            mark_break(&mut plugin);
         }
         let Some((_, p)) = pipe.as_mut() else {
             continue;
         };
         let stamp = line.host_ns;
         let out = p.push_line(line);
-        if let Some(rows) = out.updated_rows {
-            let f = p.current_frame();
-            let field_done = rows.end + 1 >= f.height;
-            producer.publish(
-                f,
-                RowUpdate {
-                    rows,
-                    lines: 1,
-                    field_done,
-                    frame_done: out.frames_done > 0,
-                    newest_line_ns: stamp,
-                },
-            );
-            if field_done && check.field_done(p, &health) {
-                // The display keeps its texture; the new pipeline rewrites
-                // every row as its lines arrive.
-                *p = VideoPipeline::new(&video_config(&current, standard));
+        let Some(rows) = out.updated_rows else {
+            continue;
+        };
+        let frame_done = out.frames_done > 0;
+        let f = p.current_frame();
+        let field_done = rows.end + 1 >= f.height;
+        match plugin.as_mut() {
+            // Plugin ready: rows wait for their field, which is published
+            // whole, filtered when the plugin made it in time.
+            Some(vp) if vp.applied.is_some() => {
+                held_lines = held_lines.saturating_add(1);
+                if field_done {
+                    if health.breaks.load(Ordering::Relaxed) != breaks_seen {
+                        breaks_seen = health.breaks.load(Ordering::Relaxed);
+                        vp.filter.mark_break();
+                    }
+                    let steady = p.config().deinterlace == DeinterlaceMethod::LineDouble;
+                    let shown = vp.filter.field(f, steady);
+                    producer.publish(
+                        shown.unwrap_or(f),
+                        RowUpdate {
+                            rows: 0..f.height,
+                            lines: std::mem::take(&mut held_lines),
+                            field_done: true,
+                            frame_done,
+                            newest_line_ns: stamp,
+                        },
+                    );
+                }
             }
+            _ => {
+                held_lines = 0;
+                producer.publish(
+                    f,
+                    RowUpdate {
+                        rows,
+                        lines: 1,
+                        field_done,
+                        frame_done,
+                        newest_line_ns: stamp,
+                    },
+                );
+            }
+        }
+        if !field_done {
+            continue;
+        }
+        if let Some(vp) = plugin.as_mut() {
+            if vp.poll() {
+                // Ready (or stopped): from the next field the pipeline
+                // makes what the plugin asked for.
+                let info = vp.applied.clone();
+                vp.filter.mark_break();
+                p.set_config(&video_config_with(&current, standard, info.as_deref()));
+            }
+            *health.filter.lock().unwrap_or_else(|e| e.into_inner()) = plugin_report(&plugin, &current);
+        }
+        if check.field_done(p, &health) {
+            // The display keeps its texture; the new pipeline rewrites
+            // every row as its lines arrive.
+            let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
+            *p = VideoPipeline::new(&video_config_with(&current, standard, info.as_deref()));
+            mark_break(&mut plugin);
         }
     }
 }
@@ -996,6 +1156,7 @@ fn handle(ctx: &BackendContext, st: &mut State, cmd: AppCommand) {
             match r.receiver.calibrate() {
                 Ok(rep) => {
                     let _ = r.dsp.cmd.send(DspCmd::Event(RxEvent::Reset));
+                    note_break(&st.views, rx);
                     let level = if rep.success {
                         MessageLevel::Info
                     } else {
@@ -1134,6 +1295,9 @@ fn configure(ctx: &BackendContext, st: &mut State, rx: RxId, config: ReceiverSet
             mhz: config.freq_mhz,
             offset_khz: 0,
         }));
+    }
+    if old.lanes != config.lanes || old.divider != config.divider || old.freq_mhz != config.freq_mhz {
+        note_break(&st.views, rx);
     }
     if old.gain != config.gain {
         let _ = r.dsp.cmd.send(DspCmd::Event(RxEvent::GainChanged {
@@ -1302,6 +1466,7 @@ fn tick(ctx: &BackendContext, st: &mut State, now: u64) {
                 ReceiverEvent::C5(C5Event::Connected { .. }) => r.connected = true,
                 ReceiverEvent::C5(C5Event::Boot { reason, .. }) => {
                     let _ = r.dsp.cmd.send(DspCmd::Event(RxEvent::Reset));
+                    note_break(&st.views, r.rx);
                     ctx.message(MessageLevel::Warning, format!("rx{}: C5 reset ({reason})", r.rx));
                 }
                 ReceiverEvent::C5(C5Event::StatePushed { errors, .. }) if !errors.is_empty() => {
@@ -1388,8 +1553,11 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
         if rebuilds > 0 && since < 10_000_000_000 {
             view_warnings.push(format!("video rows lost: pipeline reset ({rebuilds}x)"));
         }
+        let filter = view.health.filter.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        view_warnings.extend(filter.as_ref().and_then(|f| f.warning()));
         view.status.publish(|s| {
             s.dropped_lines = lost;
+            s.filter = filter.as_ref().map(|f| f.osd_line()).unwrap_or_default();
             s.warnings = view_warnings;
             s.label = freq.map_or_else(|| "LIVE".into(), crate::channels::label);
             s.standard = best.and_then(|b| b.standard);
@@ -1455,6 +1623,7 @@ mod tests {
             diversity: DiversityMode::Select,
             cleanup: true,
             steady_osd: false,
+            ..VideoSettings::default()
         };
         let q = video_config(&v, VideoStandard::Ntsc);
         assert_eq!(q.combiner.mode, CombineMode::Select);
@@ -1532,5 +1701,142 @@ mod tests {
         };
         assert_eq!(rx_status(3, &console, 64, None, None).freq_mhz, 5658);
         assert!((s.sample_rate_hz - 240e6 / 18.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn plugin_pipeline_follows_its_info() {
+        let mut v = VideoSettings {
+            preset: VideoPreset::Plugin,
+            steady_osd: false,
+            ..VideoSettings::default()
+        };
+        let info = |pipeline: &str, geometry: &str| {
+            openvrx_filter::PluginInfo::parse(&format!(r#"{{"pipeline":"{pipeline}","geometry":"{geometry}"}}"#), "t")
+                .unwrap()
+        };
+        // Until the plugin is ready: raw, the steady OSD setting.
+        let c = video_config_with(&v, VideoStandard::Ntsc, None);
+        assert_eq!((c.deinterlace, c.repair_enabled), (DeinterlaceMethod::Bob, false));
+        // Its pipeline and geometry once ready.
+        let c = video_config_with(&v, VideoStandard::Ntsc, Some(&info("low_latency", "steady")));
+        assert_eq!((c.deinterlace, c.repair_enabled), (DeinterlaceMethod::LineDouble, true));
+        v.steady_osd = true;
+        let c = video_config_with(&v, VideoStandard::Ntsc, Some(&info("raw", "fields")));
+        assert_eq!(c.deinterlace, DeinterlaceMethod::Bob);
+        let c = video_config_with(&v, VideoStandard::Ntsc, Some(&info("raw", "any")));
+        assert_eq!(c.deinterlace, DeinterlaceMethod::LineDouble);
+        // Another preset ignores a plugin's info.
+        v.preset = VideoPreset::Quality;
+        assert_eq!(
+            video_config_with(&v, VideoStandard::Pal, Some(&info("raw", "fields"))),
+            video_config(&v, VideoStandard::Pal)
+        );
+    }
+
+    /// Encoded NTSC fields through the real video thread with the plugin
+    /// preset: once the (in-process) test plugin is ready, every field is
+    /// published whole, as the plugin wrote it, with its metadata.
+    fn run_plugin_view(config: serde_json::Value, deadline_ms: f32, fields: u64) -> (Vec<[f32; 8]>, FilterReport) {
+        use crate::source::UploadStaging;
+        use openvrx_video::encoder::{CompositeEncoder, EncoderConfig};
+        use openvrx_video::testgen::{color_bars, field_info, image_to_field};
+        let path = "/openvrx-test/probe-filter.so";
+        openvrx_filter::register_static(path, &openvrx_filter::fixture::TABLE);
+        let std = VideoStandard::Ntsc;
+        let p = std.params();
+        let enc = CompositeEncoder::new(std, EncoderConfig::default());
+        let pic = color_bars(p.active_width(), p.frame_height(), 0.75);
+        let settings = Arc::new(Mutex::new(VideoSettings {
+            preset: VideoPreset::Plugin,
+            plugin_path: Some(path.into()),
+            plugin_config: config,
+            plugin_deadline_ms: deadline_ms,
+            ..VideoSettings::default()
+        }));
+        let ex = FrameExchange::new();
+        let (tx, rx) = crossbeam_channel::bounded(LINE_QUEUE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(VideoHealth::default());
+        let thread = {
+            let (producer, stop, health) = (ex.producer(), Arc::clone(&stop), Arc::clone(&health));
+            std::thread::spawn(move || video_loop(rx, settings, producer, stop, health))
+        };
+        let mut st = UploadStaging::default();
+        let mut probes = Vec::new();
+        for seq in 0..fields {
+            let (par, fi) = field_info(seq);
+            let f = image_to_field(&pic, std, par, seq);
+            for rec in enc.encode_field(&f, fi, (seq as f64 * 1e9 / p.field_hz) as u64 + 1) {
+                tx.send(rec).unwrap();
+            }
+            // Let the video thread finish the field (and the plugin load).
+            let t0 = std::time::Instant::now();
+            while !tx.is_empty() && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            if ex.take(&mut st).is_some() {
+                let y: Vec<f32> = st.y[..8].iter().map(|v| v.to_f32()).collect();
+                // The probe writes the picture size into samples 6 and 7.
+                if y[6] == p.active_width() as f32 && y[7] == p.frame_height() as f32 {
+                    probes.push(y.try_into().unwrap());
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        drop(tx);
+        thread.join().unwrap();
+        let report = health.filter.lock().unwrap().clone().expect("a plugin report");
+        (probes, report)
+    }
+
+    #[test]
+    fn plugin_preset_shows_whole_filtered_fields() {
+        let (probes, report) = run_plugin_view(serde_json::json!({"mode": "probe"}), 40.0, 14);
+        assert_eq!(report.phase, openvrx_filter::ReportPhase::Ready, "{report:?}");
+        assert!(probes.len() >= 5, "{} filtered fields seen: {report:?}", probes.len());
+        let steady = openvrx_filter::abi::OPENVRX_FIELD_STEADY_OSD as f32;
+        let disc = openvrx_filter::abi::OPENVRX_FIELD_DISCONTINUITY as f32;
+        // Consecutive indices; line-doubled (steady OSD is the default);
+        // the first field starts the history; parities alternate.
+        assert_eq!(probes[0][1], steady + disc, "{probes:?}");
+        for w in probes.windows(2) {
+            assert_eq!(w[1][0], w[0][0] + 1.0, "{probes:?}");
+            assert_eq!(w[1][1], steady, "{probes:?}");
+            assert_ne!(w[1][2], w[0][2], "{probes:?}");
+        }
+        assert_eq!(report.late, 0);
+        assert!(report.shown >= probes.len() as u64);
+        assert!(report.osd_line().contains("ms p50/p99"), "{}", report.osd_line());
+    }
+
+    #[test]
+    fn slow_plugin_falls_back_to_plain_fields() {
+        let (probes, report) = run_plugin_view(serde_json::json!({"mode": "probe", "sleep_ms": 25}), 1.0, 10);
+        assert!(probes.is_empty(), "no field can make a 1 ms deadline: {probes:?}");
+        assert_eq!(report.shown, 0);
+        assert!(report.late > 0 && report.late == report.fields, "{report:?}");
+    }
+
+    #[test]
+    fn plugin_preset_without_a_library_says_so() {
+        let mut v = VideoSettings {
+            preset: VideoPreset::Plugin,
+            ..VideoSettings::default()
+        };
+        let r = plugin_report(&None, &v).unwrap();
+        assert!(r.warning().unwrap().contains("no plugin library set"));
+        v.preset = VideoPreset::Raw;
+        assert!(plugin_report(&None, &v).is_none());
+        // A library that does not load: failed, with the reason.
+        v.preset = VideoPreset::Plugin;
+        v.plugin_path = Some("/nonexistent/libnothing.so".into());
+        let mut slot = None;
+        ViewPlugin::sync(&mut slot, &v);
+        let vp = slot.as_mut().unwrap();
+        vp.filter.wait_ready(Duration::from_secs(5));
+        assert!(!vp.poll());
+        let r = plugin_report(&slot, &v).unwrap();
+        assert!(r.warning().unwrap().contains("cannot load"), "{r:?}");
     }
 }

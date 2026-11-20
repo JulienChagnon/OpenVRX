@@ -112,6 +112,8 @@ pub struct SourceStatus {
     pub field_rate_hz: f32,
     /// Deinterlacer and filters producing the picture.
     pub pipeline: String,
+    /// The filter plugin's state and timing (`plugin` preset), else empty.
+    pub filter: String,
     /// Pipeline-side drops (lines or fields thrown away to keep up).
     pub dropped_lines: u64,
     pub warnings: Vec<String>,

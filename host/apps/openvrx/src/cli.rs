@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Command line.
 
-use crate::settings::{AppSettings, ControlMode, PresentModeSetting, ViewLayout, ViewSource, DIVIDERS, VIEW_SLOTS};
+use crate::settings::{
+    AppSettings, ControlMode, PresentModeSetting, VideoPreset, ViewLayout, ViewSource, DIVIDERS, VIEW_SLOTS,
+};
 use clap::{Parser, ValueEnum};
 use openvrx_core::{LanePreset, RxId};
 use std::path::PathBuf;
@@ -101,6 +103,17 @@ pub struct Args {
     /// the C5 saved (the app cannot read it).
     #[arg(long, value_name = "MHZ", value_parser = clap::value_parser!(u32).range(5000..=6100))]
     pub mhz: Option<u32>,
+    /// Filter plugin library (openvrx-filter ABI): selects the `plugin`
+    /// video preset with cleanup on and saves the path (video.plugin_path).
+    #[arg(long, value_name = "LIBRARY")]
+    pub plugin: Option<PathBuf>,
+    /// Text for the plugin's create(), usually JSON (video.plugin_config).
+    #[arg(long, value_name = "TEXT")]
+    pub plugin_config: Option<String>,
+    /// How long a field waits for the plugin before it is shown plain
+    /// (video.plugin_deadline_ms, default 6).
+    #[arg(long, value_name = "MS")]
+    pub plugin_deadline_ms: Option<f32>,
 }
 
 fn parse_lanes(s: &str) -> Result<LanePreset, String> {
@@ -142,6 +155,17 @@ impl Args {
                 LayoutArg::Two => ViewLayout::Dual,
                 LayoutArg::Four => ViewLayout::Quad,
             };
+        }
+        if let Some(p) = &self.plugin {
+            s.video.plugin_path = Some(p.clone());
+            s.video.preset = VideoPreset::Plugin;
+            s.video.cleanup = true;
+        }
+        if let Some(c) = &self.plugin_config {
+            s.video.plugin_config = serde_json::Value::String(c.clone());
+        }
+        if let Some(ms) = self.plugin_deadline_ms {
+            s.video.plugin_deadline_ms = ms;
         }
         for r in &mut s.receivers {
             if let Some(c) = self.control {
@@ -222,5 +246,20 @@ mod tests {
         assert!(Args::try_parse_from(["openvrx", "--clk", "7"]).is_err());
         assert!(Args::try_parse_from(["openvrx", "--lanes", "9x9"]).is_err());
         assert_eq!(ReceiverSettings::default().control, ControlMode::Fx2Only);
+
+        let p = Args::try_parse_from([
+            "openvrx",
+            "--plugin",
+            "/opt/f/libf.so",
+            "--plugin-config",
+            r#"{"threads":2}"#,
+            "--plugin-deadline-ms",
+            "9",
+        ])
+        .unwrap();
+        s.video.cleanup = false;
+        p.apply(&mut s);
+        assert_eq!(s.video.plugin().unwrap(), (std::path::Path::new("/opt/f/libf.so"), r#"{"threads":2}"#.to_string()));
+        assert_eq!(s.video.plugin_deadline_ms, 9.0);
     }
 }

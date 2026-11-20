@@ -11,6 +11,7 @@ pub enum Action {
     Osd,
     Record,
     Cleanup,
+    Preset,
     SteadyOsd,
     Hd3,
     Layout,
@@ -36,6 +37,7 @@ pub const BINDINGS: &[(Key, bool, Action, &str)] = &[
     (Key::O, false, Action::Osd, "OSD on/off (C/N bars stay while cleanup is on)"),
     (Key::R, false, Action::Record, "Start or stop raw recording"),
     (Key::Space, false, Action::Cleanup, "Cleanup on/off (raw view)"),
+    (Key::F, false, Action::Preset, "Video preset: raw / low latency / balanced / quality / learned / plugin"),
     (Key::I, false, Action::SteadyOsd, "Steady OSD: fields line-doubled like goggles (off: true interlace rows)"),
     (Key::H, false, Action::Hd3, "HD3 goggle mode (5:3 output, goggle-safe OSD)"),
     (Key::V, false, Action::Layout, "1 / 2 / 4 views"),
@@ -49,7 +51,7 @@ pub const BINDINGS: &[(Key, bool, Action, &str)] = &[
     (Key::OpenBracket, false, Action::ChannelDown, "Channel down (all receivers)"),
     (Key::CloseBracket, false, Action::ChannelUp, "Channel up (all receivers)"),
     (Key::F5, false, Action::ResetStats, "Reset latency statistics"),
-    (Key::Escape, false, Action::Escape, "Close help and panels, leave fullscreen"),
+    (Key::Escape, false, Action::Escape, "Menu: every action with its key, band and channel (closes help and panels first)"),
     (Key::Q, true, Action::Quit, "Quit"),
 ];
 

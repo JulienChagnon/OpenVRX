@@ -10,6 +10,7 @@ mod gpu;
 mod keys;
 mod layout;
 mod live_filter;
+mod menu;
 mod osd;
 mod panels;
 mod present;
