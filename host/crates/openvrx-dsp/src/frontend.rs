@@ -64,6 +64,9 @@ pub struct FrontEnd {
     fs: f64,
     has_mag: bool,
     clip_level: f32,
+    /// Squared quantiser step of the carried bits (C/N cap, see `cn::quant_cap`), 0 without
+    /// magnitude.
+    step2: f64,
     dc_cfg: DcConfig,
     iq_cfg: IqConfig,
     glitch_cfg: GlitchConfig,
@@ -111,6 +114,7 @@ impl FrontEnd {
             fs,
             has_mag,
             clip_level: full_scale - step,
+            step2: if has_mag { step as f64 * step as f64 } else { 0.0 },
             dc_cfg: dc,
             iq_cfg: iq,
             glitch_cfg: glitch,
@@ -273,6 +277,10 @@ impl FrontEnd {
             self.pwr_avg += 0.05 * (p - self.pwr_avg);
         }
         self.win.env.merge(&acc);
+        // Not capped by the quantiser (cn::quant_cap), unlike the stats and the line quality: this
+        // steers the adaptive channel filter, and an honest low reading near the quantiser floor
+        // narrows it to its floor, which on bright pictures puts peak white on the filter's skirt
+        // and adds black clicks. The floor's damage is handled by the mask instead.
         let c = acc.cn_linear();
         self.block_cn = c;
         if self.glitch_cfg.enabled
@@ -316,7 +324,7 @@ impl FrontEnd {
             q_dc: if self.has_mag { self.dc_q as f32 } else { 0.0 },
             clip_pct: (100.0 * w.clips as f64 / n) as f32,
             power_db: (10.0 * w.env.mean().max(1e-12).log10()) as f32,
-            cn_db: if self.has_mag { w.env.cn_db() } else { f32::NAN },
+            cn_db: if self.has_mag { w.env.cn_db_q(self.step2) } else { f32::NAN },
             iq_gain_db: gain_db as f32,
             iq_phase_deg: phase_deg as f32,
             glitch_ppm: if w.glitch_n > 0 {

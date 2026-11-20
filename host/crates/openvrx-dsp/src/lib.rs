@@ -622,6 +622,9 @@ impl RxDsp {
             if cfg.video_lpf.enabled { cfg.video_lpf.cutoff_hz as f64 } else { 0.5 * fs },
         );
         tbc.set_has_magnitude(has_mag);
+        if has_mag {
+            tbc.set_quant_step(step_i);
+        }
         let d_video = lpf.delay();
         let back = Back {
             rx,

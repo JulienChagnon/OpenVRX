@@ -197,6 +197,9 @@ pub struct Tbc {
     /// Standard deviation of the last timing innovation (input samples).
     innov_sd: f64,
     has_mag: bool,
+    /// Squared quantiser step of the lanes in envelope units (C/N cap and floor test,
+    /// `cn::quant_cap`), 0 when unknown.
+    step2: f64,
     /// Context of the latest `run` (for lines coasted through a gap).
     last_ctx: Option<LineCtx>,
     /// Lines coasted through a gap, emitted with the next `run`.
@@ -352,6 +355,7 @@ impl Tbc {
             scratch: Vec::new(),
             innov_sd: 1.0,
             has_mag: true,
+            step2: 0.0,
             last_ctx: None,
             pending_out: Vec::new(),
         }
@@ -361,6 +365,14 @@ impl Tbc {
     /// no-carrier test is skipped.
     pub fn set_has_magnitude(&mut self, has_mag: bool) {
         self.has_mag = has_mag;
+    }
+
+    /// Quantiser step of the carried I/Q bits, in the envelope's units (10-bit ADC units for
+    /// the lanes). Readings are then capped by what the quantiser can deliver, and a segment or
+    /// line whose power sits at the quantiser floor counts as carrier lost
+    /// (`cn::quant_cap`, `cn::at_floor`). 0 (the default) disables both.
+    pub fn set_quant_step(&mut self, step: f32) {
+        self.step2 = if step > 0.0 { step as f64 * step as f64 } else { 0.0 };
     }
 
     pub fn standard(&self) -> Option<VideoStandard> {
@@ -1196,6 +1208,9 @@ impl Tbc {
 
     /// Grades the damage of each segment of the line by its envelope C/N:
     /// 0 at or above `segment_clean_db`, rising linearly to `NOISY` at 0 dB.
+    /// A segment at the quantiser floor is `SEVERE` (carrier lost: what the
+    /// discriminator makes of it is flat grey and streaks), which the repair
+    /// conceals and the diversity combiner all but ignores.
     /// Returns the envelope statistics of the whole line.
     fn grade_segments(&self, dmg: &mut [u8], lo: usize, hi: usize, t0_local: f64, step: f64) -> EnvAcc {
         let grade = self.has_mag && self.cfg.segment_us > 0.0;
@@ -1212,9 +1227,13 @@ impl Tbc {
                 a = b;
                 continue;
             }
-            let cn = acc.cn_db();
+            let cn = acc.cn_db_q(self.step2);
             if cn < clean {
-                let g = ((clean - cn.max(0.0)) / clean * damage::NOISY as f32) as u8;
+                let g = if acc.at_floor(self.step2) {
+                    damage::SEVERE
+                } else {
+                    ((clean - cn.max(0.0)) / clean * damage::NOISY as f32) as u8
+                };
                 // Grid samples whose input position falls in [a, b).
                 let k0 = (((a as f64 - t0_local) / step).ceil().max(0.0)) as usize;
                 let k1 = ((((b as f64) - t0_local) / step).ceil().max(0.0) as usize).min(dmg.len());
@@ -1336,8 +1355,12 @@ impl Tbc {
             (acc, clipped, silent)
         };
         let ratio = acc.ratio();
-        let cn_db = if !self.has_mag || silent { f32::NAN } else { acc.cn_db() };
-        let no_carrier = self.has_mag && ratio.is_finite() && ratio < 1.1;
+        let cn_db = if !self.has_mag || silent { f32::NAN } else { acc.cn_db_q(self.step2) };
+        // No carrier: an envelope like Gaussian noise, or a line whose power sits at the lanes'
+        // quantiser floor (a deep fade on coarse lanes, where the quantised envelope looks
+        // constant instead).
+        let no_carrier =
+            self.has_mag && !silent && ((ratio.is_finite() && ratio < 1.1) || acc.at_floor(self.step2));
         if clipped {
             flags.insert(LineFlags::CLIPPED);
         }

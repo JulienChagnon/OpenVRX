@@ -25,6 +25,11 @@
 //! openvrx-cli timeline REC [--window S] [--demod polar|lut|ls|pll|ekf]
 //!                                             the whole recording in S-second rows (default 0.5):
 //!                                             lock, C/N, clipping, relocks, damaged share, USB gaps
+//! openvrx-cli lines REC OUT.csv [--demod polar|lut|ls|pll|ekf]
+//!                                             one CSV row per line from the DSP: input sample
+//!                                             position, field and line, quality (C/N, noise on the
+//!                                             porch and tip, clicks, power, weight, flags) and the
+//!                                             damaged and severe shares of its mask
 //! ```
 //! REC is any file of a recording (`NAME.openvrx.json`, `NAME.rx0.bin`) or its base path.
 
@@ -47,7 +52,7 @@ fn main() {
     let (cmd, rec) = match (args.first(), args.get(1)) {
         (Some(c), Some(r)) => (c.as_str(), r.as_str()),
         _ => {
-            eprintln!("usage: openvrx-cli inspect|decode|record|score|timeline ... (see the source header)");
+            eprintln!("usage: openvrx-cli inspect|decode|record|score|timeline|lines ... (see the source header)");
             std::process::exit(2);
         }
     };
@@ -70,6 +75,7 @@ fn main() {
         "record" => record(rec, &args[2..]),
         "score" => score(rec, &args[2..]),
         "timeline" => timeline(rec, &args[2..]),
+        "lines" => lines_csv(rec, &args[2..]),
         _ => Err(format!("unknown command {cmd}")),
     };
     if let Err(e) = result {
@@ -718,6 +724,66 @@ fn data_loss(rec: &Recording) -> DataLoss {
 /// window. The other columns come from the same DSP and video chain as
 /// `score`: lock and C/N and clipping as they stand at the window's end,
 /// relocks during it, and the damaged share of the frames finished in it.
+/// Per-line quality as CSV, to line up the DSP's view of each line with events in the raw
+/// samples (gain writes, clipping, fades) by input sample position.
+fn lines_csv(path: &str, args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    let out = args.first().filter(|a| !a.starts_with("--")).ok_or("lines needs an output CSV path")?;
+    let rec = Recording::open(path).map_err(|e| e.to_string())?;
+    let info = rec.receiver(0).map_err(|e| e.to_string())?.clone();
+    let cfg = RxDspConfig {
+        sample_format: info.sample_format.clone(),
+        standard: None,
+        demod: parse_demod(args, "--demod", openvrx_dsp::DemodKind::Polar)?,
+        ..RxDspConfig::default()
+    };
+    let mut dsp = RxDsp::new(0, cfg);
+    let mut r = rec.raw_reader(0).map_err(|e| e.to_string())?;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out).map_err(|e| e.to_string())?);
+    let io = |e: std::io::Error| e.to_string();
+    writeln!(w, "src_pos,field_seq,field_line,frame_line,flags,cn_db,noise_ire,clicks,power_db,weight,sync_score,damaged,severe")
+        .map_err(io)?;
+    let mut buf = vec![0u8; 1 << 18];
+    let mut lines: Vec<LineRecord> = Vec::new();
+    let mut count = 0u64;
+    loop {
+        let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        lines.clear();
+        dsp.push_bytes(&buf[..n], 0, &mut lines);
+        for l in &lines {
+            let len = l.damage.len().max(1) as f32;
+            let damaged = l.damage.iter().filter(|&&d| d != 0).count() as f32 / len;
+            let severe = l.damage.iter().filter(|&&d| d >= openvrx_core::damage::SEVERE).count() as f32 / len;
+            let q = &l.quality;
+            writeln!(
+                w,
+                "{:.1},{},{},{},{},{:.2},{:.3},{},{:.2},{:.4},{:.3},{:.4},{:.4}",
+                l.src_position,
+                l.field_seq,
+                l.field_line,
+                l.frame_line,
+                q.flags.0,
+                q.cn_db,
+                q.noise_ire,
+                q.clicks,
+                q.power_db,
+                q.weight,
+                q.sync_score,
+                damaged,
+                severe
+            )
+            .map_err(io)?;
+            count += 1;
+        }
+    }
+    w.flush().map_err(io)?;
+    println!("{count} lines written to {out}");
+    Ok(())
+}
+
 fn timeline(path: &str, args: &[String]) -> Result<(), String> {
     let window: f64 = opt_num(args, "--window", 0.5)?;
     if !(window > 0.0) {
