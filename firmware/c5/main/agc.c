@@ -86,7 +86,7 @@ static void agc_task(void *arg)
             openvrx_agc_acc_reset(&acc);
             for (unsigned k = 0; k < OPENVRX_AGC_FAST_READS; ++k) openvrx_agc_acc_add(&acc, &plan, GPIO.in.val);
             if (rf_config().gain != gain || rf_dc_epoch() != epoch) continue;
-            const unsigned next = openvrx_agc_fast(&s_ctl, now, gain, 0, openvrx_agc_clip_share(&acc));
+            const unsigned next = openvrx_agc_fast(&s_ctl, now, gain, 0, plan.bits, openvrx_agc_clip_share(&acc));
             if (next != gain) (void)rf_set_gain((uint8_t)next);
             continue;
         }

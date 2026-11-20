@@ -634,6 +634,9 @@ static void test_agc(void)
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.0f, 3.9f) == 50);
     // Weak but clipping (interference spikes): never raised.
     CHECK(openvrx_agc_next(50, 0, 77, 4, 0.10f, 2.0f) == 50);
+    // Overload read from the clipped share (the RMS is capped): 30 % is +2.0 dB, 2 indexes at the
+    // top stage, back to the target instead of a forced -6 dB.
+    CHECK(openvrx_agc_next(60, 0, 77, 4, 0.30f, 5.0f) == 58);
     // Limits.
     CHECK(openvrx_agc_next(1, 0, 77, 4, 1.0f, 7.0f) == 0);
     CHECK(openvrx_agc_next(76, 0, 77, 4, 0.0f, 0.5f) == 77);
@@ -1002,18 +1005,41 @@ typedef struct {
     unsigned gain;
     unsigned writes;       // gain changes
     unsigned clip_ticks;   // 5 ms ticks with 5 % or more clipped
-    int clear_ms;          // ms from the run's start to the first tick under 5 % (-1: none yet)
+    unsigned costly_ticks; // 5 ms ticks at or above the attack threshold (both axes start to clip together)
+    unsigned under_ticks;  // 5 ms ticks more than 3 dB under the gain target (under-range)
+    int clear_ms;          // ms from the run's start to the first tick under the attack threshold (-1: none yet)
 } fade_result_t;
 
 // Share of 5 ms ticks whose batch an interference burst saturates.
 static float s_burst_rate;
 
-// Runs `ms` of 5 ms ticks at sig_db from state r; fast = the new loop.
+// Which loop fade_run drives: the 100 ms loop alone, with the first fast attack
+// (10 % clipped, always 6 indexes), or with today's attack.
+typedef enum { LOOP_SLOW, LOOP_ATTACK_V1, LOOP_ATTACK } loop_t;
+
+// The fast attack as first built, kept as the reference the current one is compared with.
+static unsigned agc_fast_v1(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, float clip_share)
+{
+    if (clip_share < 0.10f) {
+        c->hot = 0;
+        return gain;
+    }
+    if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM) ++c->hot;
+    if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM || gain == 0) return gain;
+    if (c->attacked && (int32_t)(now_ms - c->last_attack_ms) < (int32_t)OPENVRX_AGC_ATTACK_GAP_MS) return gain;
+    c->attacked = true;
+    c->last_attack_ms = now_ms;
+    ++c->attacks;
+    return gain > 6 ? gain - 6 : 0;
+}
+
+// Runs `ms` of 5 ms ticks at sig_db from state r.
 static void fade_run(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, uint32_t *t, uint32_t ms, float sig_db,
-                     float db_per_index, bool fast)
+                     float db_per_index, loop_t loop)
 {
     static const int trim0[2] = {0, 0};
     const uint32_t start = *t;
+    const float under = 4.4f * powf(10.0f, -3.0f / 20.0f);   // 4-bit target RMS, -3 dB
     r->clear_ms = -1;
     for (uint32_t end = *t + ms; *t < end; *t += OPENVRX_AGC_FAST_MS) {
         fade_plant(p, sig_db, r->gain, db_per_index);
@@ -1023,15 +1049,18 @@ static void fade_run(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, uint
         if (*t % OPENVRX_AGC_PERIOD_MS == 0) {
             plant_measure_n(p, trim0, &acc, OPENVRX_AGC_READS);
             const float clip = openvrx_agc_clip_share(&acc), rms = openvrx_agc_rms_ac_steps(&acc);
-            next = fast ? openvrx_agc_slow(c, *t, r->gain, 0, 83, 4, clip, rms)
-                        : openvrx_agc_next(r->gain, 0, 83, 4, clip, rms);
+            next = loop != LOOP_SLOW ? openvrx_agc_slow(c, *t, r->gain, 0, 83, 4, clip, rms)
+                                     : openvrx_agc_next(r->gain, 0, 83, 4, clip, rms);
         } else {
             plant_measure_n(p, trim0, &acc, OPENVRX_AGC_FAST_READS);
-            if (fast) next = openvrx_agc_fast(c, *t, r->gain, 0, openvrx_agc_clip_share(&acc));
+            if (loop == LOOP_ATTACK) next = openvrx_agc_fast(c, *t, r->gain, 0, 4, openvrx_agc_clip_share(&acc));
+            if (loop == LOOP_ATTACK_V1) next = agc_fast_v1(c, *t, r->gain, openvrx_agc_clip_share(&acc));
         }
         if (openvrx_agc_clip_share(&acc) >= 0.05f) ++r->clip_ticks;
+        if (openvrx_agc_rms_ac_steps(&acc) < under) ++r->under_ticks;
+        if (openvrx_agc_clip_share(&acc) >= OPENVRX_AGC_ATTACK_CLIP) ++r->costly_ticks;
         else if (r->clear_ms < 0) r->clear_ms = (int)(*t - start);
-        if (getenv("AGC_TICKS") && fast && sig_db > 0.0f && *t < 4300)
+        if (getenv("AGC_TICKS") && loop == LOOP_ATTACK && sig_db > 0.0f && *t < 4300)
             printf("t %u gain %u clip %.3f rms %.2f next %u\n", *t, r->gain, (double)openvrx_agc_clip_share(&acc),
                    (double)openvrx_agc_rms_ac_steps(&acc), next);
         if (next != r->gain) {
@@ -1044,17 +1073,35 @@ static void fade_run(dc_plant_t *p, openvrx_agc_ctl_t *c, fade_result_t *r, uint
 static void test_agc_fades(void)
 {
     // Pure rules.
+    // Level from the clipped share (constant envelope, 4 bits: end code at 7 steps, target radius
+    // 0.55 x 8 x sqrt 2 = 6.22 steps): clipping starts at +1.0 dB, half the time per component at
+    // +4.0 dB (where both axes start to clip together), and 7 bits reads against its own target.
+    CHECK(fabsf(openvrx_agc_clip_over_db(4, 0.0f) - 1.02f) < 0.05f);
+    CHECK(fabsf(openvrx_agc_clip_over_db(4, 0.40f) - 2.87f) < 0.05f);
+    CHECK(fabsf(openvrx_agc_clip_over_db(4, 0.50f) - 4.03f) < 0.05f);
+    CHECK(fabsf(openvrx_agc_clip_over_db(4, 0.90f) - 17.1f) < 0.1f);
+    CHECK(openvrx_agc_clip_over_db(4, 1.0f) == openvrx_agc_clip_over_db(4, 0.97f));
+    CHECK(fabsf(openvrx_agc_clip_over_db(7, 0.40f) - 12.67f) < 0.05f);
+    CHECK(openvrx_agc_db_to_step(70, 4.03f) == 4 && openvrx_agc_db_to_step(40, 4.4f) == 4);
+
     openvrx_agc_ctl_t c;
     openvrx_agc_ctl_init(&c);
-    CHECK(openvrx_agc_fast(&c, 1000, 70, 0, 0.05f) == 70);                        // under the threshold
-    // Three hot batches in a row before the first attack.
-    CHECK(openvrx_agc_fast(&c, 1005, 70, 0, 0.50f) == 70);
-    CHECK(openvrx_agc_fast(&c, 1010, 70, 0, 0.50f) == 70);
-    CHECK(openvrx_agc_fast(&c, 1015, 70, 0, 0.50f) == 70 - OPENVRX_AGC_ATTACK_STEP);
-    CHECK(openvrx_agc_fast(&c, 1020, 64, 0, 0.50f) == 64);                        // within the gap
-    CHECK(openvrx_agc_fast(&c, 1025, 64, 0, 0.50f) == 64 - OPENVRX_AGC_ATTACK_STEP);
-    CHECK(openvrx_agc_fast(&c, 1100, 3, 0, 0.90f) == 0 && openvrx_agc_fast(&c, 1200, 0, 0, 0.90f) == 0);
-    CHECK(c.attacks == 3);
+    CHECK(openvrx_agc_fast(&c, 1000, 70, 0, 4, 0.05f) == 70);                     // under the threshold
+    // Mild clipping (one axis at a time, the carrier's phase kept): never an attack, however long.
+    for (unsigned k = 0; k < 20; ++k) CHECK(openvrx_agc_fast(&c, 1000 + 5u * k, 70, 0, 4, 0.35f) == 70);
+    CHECK(c.attacks == 0);
+    // Three hot batches in a row before the first attack, which removes half the implied overload
+    // (+4.0 dB at half the time clipped: 2 dB, 2 indexes at 0.93 dB per index).
+    CHECK(openvrx_agc_fast(&c, 1105, 70, 0, 4, 0.50f) == 70);
+    CHECK(openvrx_agc_fast(&c, 1110, 70, 0, 4, 0.50f) == 70);
+    CHECK(openvrx_agc_fast(&c, 1115, 70, 0, 4, 0.50f) == 68);
+    CHECK(openvrx_agc_fast(&c, 1120, 68, 0, 4, 0.50f) == 68);                     // within the gap
+    CHECK(openvrx_agc_fast(&c, 1125, 68, 0, 4, 0.50f) == 66);
+    // Deep overload (95 %: +23 dB, half of it 12 indexes): at most OPENVRX_AGC_ATTACK_STEP_MAX
+    // per attack, never under the floor.
+    CHECK(openvrx_agc_fast(&c, 1135, 66, 0, 4, 0.95f) == 66 - OPENVRX_AGC_ATTACK_STEP_MAX);
+    CHECK(openvrx_agc_fast(&c, 1200, 3, 0, 4, 0.90f) == 0 && openvrx_agc_fast(&c, 1300, 0, 0, 4, 0.90f) == 0);
+    CHECK(c.attacks == 4);
     // Interference bursts (board 2026-11-04, no VTX): hot batches that do not
     // last three in a row never attack.
     {
@@ -1062,7 +1109,7 @@ static void test_agc_fades(void)
         openvrx_agc_ctl_init(&b);
         static const float clips[] = {0.9f, 0.0f, 0.9f, 0.9f, 0.0f, 0.6f, 0.0f, 0.9f, 0.9f, 0.02f, 0.9f};
         for (unsigned k = 0; k < sizeof(clips) / sizeof(clips[0]); ++k)
-            CHECK(openvrx_agc_fast(&b, 2000 + 5u * k, 83, 0, clips[k]) == 83);
+            CHECK(openvrx_agc_fast(&b, 2000 + 5u * k, 83, 0, 4, clips[k]) == 83);
         CHECK(b.attacks == 0);
     }
     // Raise held off after an attack, lowering never.
@@ -1071,56 +1118,101 @@ static void test_agc_fades(void)
     CHECK(openvrx_agc_slow(&c, 1200 + OPENVRX_AGC_RAISE_HOLD_MS, 50, 0, 83, 4, 0.0f, 1.0f) > 50);
     // Wrap-safe: an attack just before the uint32 ms wrap still holds raises after it.
     openvrx_agc_ctl_init(&c);
-    (void)openvrx_agc_fast(&c, 0xFFFFFFE6u, 70, 0, 0.5f);
-    (void)openvrx_agc_fast(&c, 0xFFFFFFEBu, 70, 0, 0.5f);
-    CHECK(openvrx_agc_fast(&c, 0xFFFFFFF0u, 70, 0, 0.5f) < 70);
+    (void)openvrx_agc_fast(&c, 0xFFFFFFE6u, 70, 0, 4, 0.5f);
+    (void)openvrx_agc_fast(&c, 0xFFFFFFEBu, 70, 0, 4, 0.5f);
+    CHECK(openvrx_agc_fast(&c, 0xFFFFFFF0u, 70, 0, 4, 0.5f) < 70);
     CHECK(openvrx_agc_slow(&c, 0x00000010u, 50, 0, 83, 4, 0.0f, 1.0f) == 50);
 
     // Simulated fade recovery: settle weak (-20 dB), then +25 dB at once.
     static const float dpi[2] = {0.93f, 2.0f};   // dB per index: the measured top stage, and much steeper
     for (unsigned k = 0; k < 2; ++k) {
-        fade_result_t r_old = {.gain = 60}, r_new = {.gain = 60};
+        // Three copies of the same plant: the 100 ms loop alone (old), with the first attack (v1),
+        // with today's attack (new).
+        fade_result_t r_old = {.gain = 60}, r_v1 = {.gain = 60}, r_new = {.gain = 60};
+        openvrx_agc_ctl_t c_v1;
         dc_plant_t p;
         plant_init(&p, OPENVRX_PRESET_4X4TOP);
         uint32_t t = 0;
         openvrx_agc_ctl_init(&c);
-        fade_run(&p, &c, &r_old, &t, 4000, -20.0f, dpi[k], false);
+        openvrx_agc_ctl_init(&c_v1);
+        fade_run(&p, &c, &r_old, &t, 4000, -20.0f, dpi[k], LOOP_SLOW);
         t = 0;
-        fade_run(&p, &c, &r_new, &t, 4000, -20.0f, dpi[k], true);
+        fade_run(&p, &c_v1, &r_v1, &t, 4000, -20.0f, dpi[k], LOOP_ATTACK_V1);
+        t = 0;
+        fade_run(&p, &c, &r_new, &t, 4000, -20.0f, dpi[k], LOOP_ATTACK);
         if (getenv("AGC_TRACE"))
-            printf("settle -20 dB, %.1f dB/index: gain old %u new %u, writes old %u new %u, attacks %u\n",
-                   (double)dpi[k], r_old.gain, r_new.gain, r_old.writes, r_new.writes, c.attacks);
-        // Steady weak signal. At the measured dB per index the attack
-        // never fires. At 2 dB per index the old loop hunts (4 indexes = 8 dB
-        // steps against a 1.5 dB deadband: 40 writes in 4 s); the new one
-        // overshoots once, the attack catches it and the raise hold-off ends
-        // the hunting.
+            printf("settle -20 dB, %.1f dB/index: gain old %u v1 %u new %u, writes old %u v1 %u new %u, attacks "
+                   "v1 %u new %u\n",
+                   (double)dpi[k], r_old.gain, r_v1.gain, r_new.gain, r_old.writes, r_v1.writes, r_new.writes,
+                   c_v1.attacks, c.attacks);
+        // Steady weak signal. At the measured dB per index no attack fires. At 2 dB per index the
+        // 100 ms loop alone hunts (4 indexes = 8 dB steps against a 1.5 dB deadband: about 40
+        // writes in 4 s); an attack and the raise hold-off after it end the hunting.
         if (k == 0) CHECK(c.attacks == 0);
         else CHECK(r_new.writes * 4 <= r_old.writes);
         const unsigned settled_writes = r_new.writes;
-        r_old.writes = r_new.writes = r_old.clip_ticks = r_new.clip_ticks = 0;
-        uint32_t t_old = 4000, t_new = 4000;
-        fade_run(&p, &c, &r_old, &t_old, 1000, 5.0f, dpi[k], false);
-        fade_run(&p, &c, &r_new, &t_new, 1000, 5.0f, dpi[k], true);
-        const unsigned old_ms = r_old.clip_ticks * OPENVRX_AGC_FAST_MS, new_ms = r_new.clip_ticks * OPENVRX_AGC_FAST_MS;
+        r_old.writes = r_v1.writes = r_new.writes = 0;
+        r_old.clip_ticks = r_v1.clip_ticks = r_new.clip_ticks = 0;
+        r_old.costly_ticks = r_v1.costly_ticks = r_new.costly_ticks = 0;
+        r_old.under_ticks = r_v1.under_ticks = r_new.under_ticks = 0;
+        uint32_t t_old = 4000, t_v1 = 4000, t_new = 4000;
+        fade_run(&p, &c, &r_old, &t_old, 1000, 5.0f, dpi[k], LOOP_SLOW);
+        fade_run(&p, &c_v1, &r_v1, &t_v1, 1000, 5.0f, dpi[k], LOOP_ATTACK_V1);
+        fade_run(&p, &c, &r_new, &t_new, 1000, 5.0f, dpi[k], LOOP_ATTACK);
+        const unsigned old_ms = r_old.costly_ticks * OPENVRX_AGC_FAST_MS,
+                       new_ms = r_new.costly_ticks * OPENVRX_AGC_FAST_MS;
         if (getenv("AGC_TRACE"))
-            printf("fade +25 dB, %.1f dB/index: recovered old %d ms, new %d ms; clipped in 1 s old %u ms, "
-                   "new %u ms; writes old %u new %u (attacks %u, settle writes %u)\n",
-                   (double)dpi[k], r_old.clear_ms, r_new.clear_ms, old_ms, new_ms, r_old.writes, r_new.writes,
-                   c.attacks, settled_writes);
-        // Fade response (C5-4): 25 dB is 4 to 9 attacks 10 ms apart.
+            printf("fade +25 dB, %.1f dB/index: out of costly overload old %d v1 %d new %d ms; in 1 s: costly "
+                   "old %u v1 %u new %u ms, under -3 dB old %u v1 %u new %u ms, writes old %u v1 %u new %u "
+                   "(settle writes %u)\n",
+                   (double)dpi[k], r_old.clear_ms, r_v1.clear_ms, r_new.clear_ms, old_ms,
+                   r_v1.costly_ticks * OPENVRX_AGC_FAST_MS, new_ms, r_old.under_ticks * OPENVRX_AGC_FAST_MS,
+                   r_v1.under_ticks * OPENVRX_AGC_FAST_MS, r_new.under_ticks * OPENVRX_AGC_FAST_MS, r_old.writes,
+                   r_v1.writes, r_new.writes, settled_writes);
+        // Fade response (C5-4): out of the costly overload (both axes clipping together) within a
+        // few attacks 10 ms apart, at least 4 times faster than the 100 ms loop alone.
         CHECK(r_new.clear_ms >= 0 && r_new.clear_ms <= 60);
         CHECK(r_old.clear_ms < 0 || r_old.clear_ms >= 4 * r_new.clear_ms);
-        // Clipped time over the second, including any later overshoot of
-        // the 100 ms loop's raises when the dB per index is steeper than
-        // measured (C5-3; each overshoot costs the 10 ms confirmation plus
-        // the attack): at most a third of the old loop's.
+        // Costly time over the second, including any later overshoot of the 100 ms loop's raises
+        // when the dB per index is steeper than measured: at most a third of the loop alone.
         CHECK(new_ms * 3 <= old_ms);
+        // Sized attacks land near the target instead of 6 indexes at a time: no more under-range
+        // after the fade than the first attack left.
+        CHECK(r_new.under_ticks <= r_v1.under_ticks);
         CHECK(r_new.writes <= 15);
         // Then steady at the new level: no pumping (at most a few writes in 3 s).
         r_new.writes = 0;
-        fade_run(&p, &c, &r_new, &t_new, 3000, 5.0f, dpi[k], true);
+        fade_run(&p, &c, &r_new, &t_new, 3000, 5.0f, dpi[k], LOOP_ATTACK);
         CHECK(r_new.writes <= 4);
+    }
+
+    // A mild fade-up: settled on target, then +2.5 dB for 60 ms and back. One axis clips at a
+    // time and the carrier keeps its phase, so there is nothing to protect; the first attack
+    // (10 %, 6 indexes) still fired and left the level about 5 dB under the target for the
+    // 500 ms raise hold-off. Today's attack leaves it alone.
+    {
+        fade_result_t r_v1 = {.gain = 60}, r_new = {.gain = 60};
+        openvrx_agc_ctl_t c_v1;
+        dc_plant_t p;
+        plant_init(&p, OPENVRX_PRESET_4X4TOP);
+        openvrx_agc_ctl_init(&c);
+        openvrx_agc_ctl_init(&c_v1);
+        uint32_t t_v1 = 0, t_new = 0;
+        fade_run(&p, &c_v1, &r_v1, &t_v1, 3000, -5.0f, 0.93f, LOOP_ATTACK_V1);   // settle on target
+        fade_run(&p, &c, &r_new, &t_new, 3000, -5.0f, 0.93f, LOOP_ATTACK);
+        const unsigned a_v1 = c_v1.attacks, a_new = c.attacks;
+        r_v1.under_ticks = r_new.under_ticks = 0;
+        fade_run(&p, &c_v1, &r_v1, &t_v1, 60, -2.5f, 0.93f, LOOP_ATTACK_V1);
+        fade_run(&p, &c, &r_new, &t_new, 60, -2.5f, 0.93f, LOOP_ATTACK);
+        fade_run(&p, &c_v1, &r_v1, &t_v1, 600, -5.0f, 0.93f, LOOP_ATTACK_V1);
+        fade_run(&p, &c, &r_new, &t_new, 600, -5.0f, 0.93f, LOOP_ATTACK);
+        if (getenv("AGC_TRACE"))
+            printf("+2.5 dB for 60 ms: attacks v1 %u new %u, then under -3 dB v1 %u new %u ms of 660\n",
+                   c_v1.attacks - a_v1, c.attacks - a_new, r_v1.under_ticks * OPENVRX_AGC_FAST_MS,
+                   r_new.under_ticks * OPENVRX_AGC_FAST_MS);
+        CHECK(c.attacks == a_new);
+        CHECK(c_v1.attacks > a_v1);   // the case is real for the first attack
+        CHECK(r_new.under_ticks * 10 <= r_v1.under_ticks);
     }
 
     // Interference bursts on a weak steady signal (board: no VTX, the gain
@@ -1134,11 +1226,11 @@ static void test_agc_fades(void)
         plant_init(&p, OPENVRX_PRESET_4X4TOP);
         uint32_t t = 0;
         openvrx_agc_ctl_init(&c);
-        fade_run(&p, &c, &r, &t, 3000, -20.0f, 0.93f, true);   // settle without bursts
+        fade_run(&p, &c, &r, &t, 3000, -20.0f, 0.93f, LOOP_ATTACK);   // settle without bursts
         const unsigned settled = c.attacks;
         s_burst_rate = 0.02f;
         r.writes = 0;
-        fade_run(&p, &c, &r, &t, 5000, -20.0f, 0.93f, true);
+        fade_run(&p, &c, &r, &t, 5000, -20.0f, 0.93f, LOOP_ATTACK);
         if (getenv("AGC_TRACE"))
             printf("bursts on a weak signal: attacks %u, writes %u in 5 s, gain %u\n", c.attacks - settled, r.writes,
                    r.gain);
@@ -1146,7 +1238,7 @@ static void test_agc_fades(void)
         // Fade recovery still works with the bursts on.
         fade_result_t f = r;
         f.clip_ticks = 0;
-        fade_run(&p, &c, &f, &t, 1000, 5.0f, 0.93f, true);
+        fade_run(&p, &c, &f, &t, 1000, 5.0f, 0.93f, LOOP_ATTACK);
         CHECK(f.clear_ms >= 0 && f.clear_ms <= 80);
         s_burst_rate = 0.0f;
     }

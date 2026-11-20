@@ -105,14 +105,11 @@ unsigned openvrx_agc_next(unsigned gain, unsigned gain_min, unsigned gain_max, u
     if (bits < 2 || gain_min > gain_max) return gain;
     const float target = openvrx_agc_target_share(bits) * (float)(1u << (bits - 1));
     float err_db = 20.0f * log10f(fmaxf(rms_steps, 0.05f) / target);
-    if (clip_share >= OPENVRX_AGC_OVERLOAD_SHARE && err_db < 6.0f) err_db = 6.0f;
+    // Clipping caps the RMS: read the level from the clipped share instead.
+    if (clip_share >= OPENVRX_AGC_OVERLOAD_SHARE) err_db = fmaxf(err_db, openvrx_agc_clip_over_db(bits, clip_share));
     if (fabsf(err_db) < OPENVRX_AGC_DEADBAND_DB) return gain;
     if (err_db < 0.0f && clip_share >= OPENVRX_AGC_RAISE_MAX_CLIP) return gain;
-    // Slope at the current index: a step that crosses into the other stage
-    // is off by the slope difference only, and the next update corrects it.
-    const float db_per_index =
-        gain >= OPENVRX_AGC_TOP_STAGE_START ? OPENVRX_AGC_DB_PER_INDEX_TOP : OPENVRX_AGC_DB_PER_INDEX_LOW;
-    int step = (int)lroundf(err_db / db_per_index);
+    int step = openvrx_agc_db_to_step(gain, err_db);
     if (step > OPENVRX_AGC_MAX_STEP) step = OPENVRX_AGC_MAX_STEP;
     if (step < -OPENVRX_AGC_MAX_STEP) step = -OPENVRX_AGC_MAX_STEP;
     int next = (int)gain - step;   // too loud: lower index
@@ -126,7 +123,27 @@ void openvrx_agc_ctl_init(openvrx_agc_ctl_t *c) { memset(c, 0, sizeof(*c)); }
 // Milliseconds from a to b, wrap-safe (uint32 ms wraps after 49 days).
 static int32_t ms_since(uint32_t now, uint32_t then) { return (int32_t)(now - then); }
 
-unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min, float clip_share)
+float openvrx_agc_clip_over_db(unsigned bits, float clip_share)
+{
+    if (bits < 2) return 0.0f;
+    const float half = (float)(1u << (bits - 1));
+    const float clip = half - 1.0f;   // steps: the top code is v >= clip, the bottom one v < -clip
+    const float target_amp = openvrx_agc_target_share(bits) * half * 1.41421356f;   // carrier radius on target
+    const float s = clip_share < 0.0f ? 0.0f : clip_share > 0.97f ? 0.97f : clip_share;
+    return 20.0f * log10f(clip / (cosf(1.57079633f * s) * target_amp));
+}
+
+int openvrx_agc_db_to_step(unsigned gain, float over_db)
+{
+    // Slope at the current index: a step that crosses into the other stage
+    // is off by the slope difference only, and the next update corrects it.
+    const float db_per_index =
+        gain >= OPENVRX_AGC_TOP_STAGE_START ? OPENVRX_AGC_DB_PER_INDEX_TOP : OPENVRX_AGC_DB_PER_INDEX_LOW;
+    return (int)lroundf(over_db / db_per_index);
+}
+
+unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min, unsigned bits,
+                          float clip_share)
 {
     if (clip_share < OPENVRX_AGC_ATTACK_CLIP) {
         c->hot = 0;
@@ -135,7 +152,10 @@ unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, 
     if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM) ++c->hot;
     if (c->hot < OPENVRX_AGC_ATTACK_CONFIRM || gain <= gain_min) return gain;
     if (c->attacked && ms_since(now_ms, c->last_attack_ms) < (int32_t)OPENVRX_AGC_ATTACK_GAP_MS) return gain;
-    const unsigned next = gain > gain_min + OPENVRX_AGC_ATTACK_STEP ? gain - OPENVRX_AGC_ATTACK_STEP : gain_min;
+    int step = openvrx_agc_db_to_step(gain, OPENVRX_AGC_ATTACK_FRACTION * openvrx_agc_clip_over_db(bits, clip_share));
+    if (step < OPENVRX_AGC_ATTACK_STEP_MIN) step = OPENVRX_AGC_ATTACK_STEP_MIN;
+    if (step > OPENVRX_AGC_ATTACK_STEP_MAX) step = OPENVRX_AGC_ATTACK_STEP_MAX;
+    const unsigned next = gain > gain_min + (unsigned)step ? gain - (unsigned)step : gain_min;
     c->attacked = true;
     c->last_attack_ms = now_ms;
     ++c->attacks;

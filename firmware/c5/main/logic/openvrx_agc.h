@@ -42,7 +42,8 @@ float openvrx_agc_target_share(unsigned bits);
 // No change while the level is within this many dB of the target.
 #define OPENVRX_AGC_DEADBAND_DB 1.5f
 // Clipped share of component samples that counts as overload whatever the
-// RMS says (clipping caps the RMS near full scale).
+// RMS says (clipping caps the RMS near full scale). The level is then read
+// from the clipped share (openvrx_agc_clip_over_db).
 #define OPENVRX_AGC_OVERLOAD_SHARE 0.25f
 // Gain is only raised while fewer component samples than this clip.
 #define OPENVRX_AGC_RAISE_MAX_CLIP 0.05f
@@ -60,20 +61,29 @@ float openvrx_agc_target_share(unsigned bits);
 // a second and the 100 ms loop, at most 4 indexes a step, left 30 to 95 %
 // of the values clipped for seconds after a fade (2026-11-04 flights).
 // Every OPENVRX_AGC_FAST_MS a short batch of pad reads checks clipping;
-// at OPENVRX_AGC_ATTACK_CLIP or more the gain drops OPENVRX_AGC_ATTACK_STEP
-// indexes, again after OPENVRX_AGC_ATTACK_GAP_MS while it still clips. The
-// dB per index is measured on one board only, so the attack is closed-loop:
-// it measures after every step instead of computing one. Raising stays with the 100 ms loop, held off
-// for OPENVRX_AGC_RAISE_HOLD_MS after an attack so it does not pump back
-// into the clipping. C5VRX found the picture follows how often the gain
-// is written (about 7 ms of picture per write), so attacks are few and
-// large rather than many and small.
+// at OPENVRX_AGC_ATTACK_CLIP or more the gain drops by part of the
+// overload the batch's clipped share implies (OPENVRX_AGC_ATTACK_FRACTION,
+// OPENVRX_AGC_ATTACK_STEP_MIN to _MAX indexes), again after
+// OPENVRX_AGC_ATTACK_GAP_MS while it still clips: the dB per index is
+// measured on one board only, so each step is checked by the next batch. Raising stays with the 100 ms loop, held off for
+// OPENVRX_AGC_RAISE_HOLD_MS after an attack so it does not pump back into
+// the clipping. A gain write blanks the lanes for a few microseconds (the
+// radio output drops to zero while the row is rewritten).
 #define OPENVRX_AGC_FAST_MS 5u
 #define OPENVRX_AGC_FAST_READS 256u
-// 10 %: at the loop's target the FM envelope sits near 0.78 of full scale
-// and clips almost nothing; interference bursts on the board read 2-6 %.
-// At 20 % the attack stopped with 5-20 % left for the next 100 ms update.
-#define OPENVRX_AGC_ATTACK_CLIP 0.10f
+// The attack is for overload that costs picture. An FM carrier keeps its
+// phase while only one axis clips: the clipped axis is wrong but the angle
+// moves little, and the demodulated video barely changes. The phase is lost
+// once both axes clip together (the constellation's corners), which starts
+// at a carrier radius of sqrt(2) times the clip level: about +4 dB over the
+// 4-bit target, where each component clips half the time. Lighter clipping
+// is cheaper than the under-range a large drop leaves behind (and the
+// raise hold-off keeps it there). So the attack starts at 40 % (a carrier
+// about +2.9 dB over the target on 4 bits) and drops the gain by the
+// overload the clipped share implies (openvrx_agc_clip_over_db), landing
+// near the target rather than well under it. Interference bursts on the
+// board read 2-6 % of a 4096-read measurement.
+#define OPENVRX_AGC_ATTACK_CLIP 0.40f
 // Consecutive hot batches before the first attack. Board 2026-11-04 with a
 // single hot batch: about 2 attacks a second with no VTX at all (gain
 // dragged 83 -> 65 and back): short interference bursts (most likely
@@ -82,7 +92,17 @@ float openvrx_agc_target_share(unsigned bits);
 // a packet; a fade recovery clips for hundreds of ms. Once confirmed, the
 // attack repeats every OPENVRX_AGC_ATTACK_GAP_MS while the clipping lasts.
 #define OPENVRX_AGC_ATTACK_CONFIRM 3u
-#define OPENVRX_AGC_ATTACK_STEP 6
+// Share of the implied overload one attack removes. The next batch measures
+// again _GAP_MS later, so an attack need not get there in one step, and a
+// computed step scales any error in the dB per index: at a half, 20 dB of
+// overload takes about three attacks at the measured slope, and a board
+// twice as steep as the table would land on the target in one.
+#define OPENVRX_AGC_ATTACK_FRACTION 0.5f
+// Attack size bounds, indexes. The clipped share stops telling levels apart
+// far above the clip level (it tends to 1), so one attack is at most
+// _MAX and a deeper fade-up takes a few attacks _GAP_MS apart.
+#define OPENVRX_AGC_ATTACK_STEP_MIN 2
+#define OPENVRX_AGC_ATTACK_STEP_MAX 12
 #define OPENVRX_AGC_ATTACK_GAP_MS 10u
 #define OPENVRX_AGC_RAISE_HOLD_MS 500u
 
@@ -95,8 +115,20 @@ typedef struct {
 } openvrx_agc_ctl_t;
 
 void openvrx_agc_ctl_init(openvrx_agc_ctl_t *c);
-// Fast check at now_ms on a short batch: the gain to set (== gain: none).
-unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min, float clip_share);
+// Fast check at now_ms on a short batch of a `bits`-per-component layout:
+// the gain to set (== gain: none).
+unsigned openvrx_agc_fast(openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min, unsigned bits,
+                          float clip_share);
+// Level in dB against the gain target (openvrx_agc_target_share) of a
+// constant-envelope carrier whose components sit at an end code a share
+// `clip_share` of the time. A component of a circle of radius A passes the
+// end code (2^(bits-1) - 1 steps) a share (2/pi) acos(clip / A) of the
+// time, so A = clip / cos(pi share / 2). The share is clamped to 0.97
+// (about +27 dB over the clip level); at 0 it gives the level where
+// clipping starts. Noise on the carrier makes it read a little high.
+float openvrx_agc_clip_over_db(unsigned bits, float clip_share);
+// Index step that removes `over_db` at `gain` (the measured dB per index).
+int openvrx_agc_db_to_step(unsigned gain, float over_db);
 // 100 ms update: openvrx_agc_next with raises held off after an attack.
 unsigned openvrx_agc_slow(const openvrx_agc_ctl_t *c, uint32_t now_ms, unsigned gain, unsigned gain_min,
                           unsigned gain_max, unsigned bits, float clip_share, float rms_steps);
